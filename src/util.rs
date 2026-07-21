@@ -90,23 +90,49 @@ fn config_path() -> Option<std::path::PathBuf> {
     Some(std::path::Path::new(&appdata).join("Claudometer").join("settings.json"))
 }
 
-pub fn load_poll_secs() -> u32 {
-    let default = 60;
-    let Some(p) = config_path() else { return default };
-    let Ok(raw) = std::fs::read_to_string(p) else { return default };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { return default };
-    v.get("poll_secs")
-        .and_then(|x| x.as_u64())
-        .map(|x| (x as u32).clamp(30, 300))
-        .unwrap_or(default)
+fn read_config() -> serde_json::Value {
+    config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}))
 }
 
-pub fn save_poll_secs(secs: u32) {
+fn write_config_field(key: &str, value: serde_json::Value) {
     let Some(p) = config_path() else { return };
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(p, format!("{{\n  \"poll_secs\": {secs}\n}}\n"));
+    let mut cfg = read_config();
+    cfg[key] = value;
+    if let Ok(s) = serde_json::to_string_pretty(&cfg) {
+        let _ = std::fs::write(p, s + "\n");
+    }
+}
+
+pub fn load_poll_secs() -> u32 {
+    read_config()
+        .get("poll_secs")
+        .and_then(|x| x.as_u64())
+        .map(|x| (x as u32).clamp(30, 300))
+        .unwrap_or(60)
+}
+
+pub fn save_poll_secs(secs: u32) {
+    write_config_field("poll_secs", secs.into());
+}
+
+/// Codex section toggle — defaults on; section still only shows when a
+/// Codex sign-in actually exists on disk.
+pub fn show_codex() -> bool {
+    read_config()
+        .get("show_codex")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(true)
+}
+
+pub fn set_show_codex(on: bool) {
+    write_config_field("show_codex", on.into());
 }
 
 // ---------- Caps-LED status hook toggle ----------

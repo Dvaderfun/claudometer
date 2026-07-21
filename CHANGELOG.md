@@ -2,6 +2,17 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [SemVer](https://semver.org/).
 
+## [0.3.0] — 2026-07-21
+
+### Added
+- **Codex (OpenAI) usage** as a second flyout section: 5-hour session + weekly bars from the same `wham/usage` endpoint the Codex CLI polls. Auto-detected from `~/.codex/auth.json` (or `CODEX_HOME`) — zero configuration; installs without Codex look exactly like before. Strictly read-only: the OAuth token is never refreshed (rotation would invalidate the Codex CLI session).
+- Per-provider resilience: independent last-good snapshots, 429 cooldowns, and error notes — a Codex failure degrades to one dim line in its section, never touching Claude data (and vice versa).
+- "Show Codex usage" toggle in settings; tray tooltip gains a Codex line.
+
+### Changed
+- Plan name ("Max", "Plus") moved from the footer to each section header.
+- Settings footer now lists both data sources.
+
 ## [0.2.0] — 2026-07-21
 
 ### Changed

@@ -5,6 +5,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod api;
+mod codex;
 mod gfx;
 mod trayicon;
 mod util;
@@ -54,13 +55,65 @@ static PREV_ICON: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_MSG: AtomicU32 = AtomicU32::new(0);
 static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
 static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
-static FETCHING: AtomicBool = AtomicBool::new(false);
-static STATE: Mutex<Option<api::FetchOutcome>> = Mutex::new(None);
-static LAST_GOOD: Mutex<Option<api::UsageSnapshot>> = Mutex::new(None);
-static LAST_FETCH: Mutex<Option<Instant>> = Mutex::new(None);
-/// Retry-After honored exactly: no requests before this instant
-static COOLDOWN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 static POLL_SECS: AtomicU32 = AtomicU32::new(60);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    Claude = 0,
+    Codex = 1,
+}
+
+/// Per-provider fetch state; both providers share the resilience rules
+/// (stale data beats errors, Retry-After honored exactly, 3 s debounce).
+struct Slot {
+    state: Mutex<Option<api::FetchOutcome>>,
+    last_good: Mutex<Option<api::UsageSnapshot>>,
+    last_fetch: Mutex<Option<Instant>>,
+    /// Retry-After honored exactly: no requests before this instant
+    cooldown_until: Mutex<Option<Instant>>,
+    fetching: AtomicBool,
+}
+
+impl Slot {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+            last_good: Mutex::new(None),
+            last_fetch: Mutex::new(None),
+            cooldown_until: Mutex::new(None),
+            fetching: AtomicBool::new(false),
+        }
+    }
+}
+
+static SLOTS: [Slot; 2] = [Slot::new(), Slot::new()];
+
+fn slot(p: Provider) -> &'static Slot {
+    &SLOTS[p as usize]
+}
+
+fn any_fetching() -> bool {
+    SLOTS.iter().any(|s| s.fetching.load(Ordering::SeqCst))
+}
+
+/// Codex section is live: toggle on AND a ChatGPT-login auth file on disk.
+fn codex_active() -> bool {
+    util::show_codex() && codex::available()
+}
+
+/// Snapshot to display for a provider (fresh, or stale on error) plus the
+/// current error message when the last fetch failed.
+fn effective(p: Provider) -> (Option<api::UsageSnapshot>, Option<String>) {
+    let s = slot(p);
+    let state = s.state.lock().unwrap();
+    match &*state {
+        Some(api::FetchOutcome::Ok(snap)) => (Some(snap.clone()), None),
+        Some(api::FetchOutcome::Err { msg, .. }) => {
+            (s.last_good.lock().unwrap().clone(), Some(msg.clone()))
+        }
+        None => (s.last_good.lock().unwrap().clone(), None),
+    }
+}
 
 struct Ui {
     fly: Option<gfx::Surface>,
@@ -167,7 +220,7 @@ fn main() -> Result<()> {
         POLL_SECS.store(util::load_poll_secs(), Ordering::SeqCst);
         SetTimer(main, TIMER_POLL, POLL_SECS.load(Ordering::SeqCst) * 1000, None);
         // TIMER_TICK runs only while the flyout is visible (started in show_flyout)
-        spawn_fetch();
+        spawn_fetch_all();
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {
@@ -210,7 +263,7 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_POLL => {
-                spawn_fetch();
+                spawn_fetch_all();
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_TICK => {
@@ -273,7 +326,7 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 } else if vk == VK_RETURN.0 || vk == VK_SPACE.0 {
                     match UI.with(|ui| ui.borrow().fly_focus) {
                         0 => {
-                            spawn_fetch();
+                            spawn_fetch_all();
                             render_flyout_current();
                         }
                         1 => {
@@ -320,7 +373,7 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (x, y) = mouse_dip(hwnd, lparam);
                 match fly_hit(x, y) {
                     gfx::FlyHover::Refresh => {
-                        spawn_fetch();
+                        spawn_fetch_all();
                         render_flyout_current(); // spinner starts immediately
                     }
                     gfx::FlyHover::Gear => {
@@ -380,10 +433,10 @@ extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 if hit >= 0 {
                     UI.with(|ui| ui.borrow_mut().set_focus = hit); // focus follows click
                 }
-                if hit == 2 {
+                if hit == 3 {
                     // pill click selects the interval directly
                     let cards = gfx::settings_rects();
-                    let pills = gfx::interval_pills(&cards[2]);
+                    let pills = gfx::interval_pills(&cards[3]);
                     if let Some(i) = pills.iter().position(|r| contains(r, x, y)) {
                         apply_interval(gfx::INTERVALS[i].0);
                     }
@@ -412,7 +465,7 @@ extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     });
                     render_settings(hwnd);
                 } else if vk == VK_LEFT.0 || vk == VK_RIGHT.0 {
-                    if UI.with(|ui| ui.borrow().set_focus) == 2 {
+                    if UI.with(|ui| ui.borrow().set_focus) == 3 {
                         let dir = if vk == VK_LEFT.0 { -1 } else { 1 };
                         step_interval(dir);
                         render_settings(hwnd);
@@ -504,13 +557,21 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
         0 => util::set_caps_led_enabled(!util::caps_led_enabled()),
         1 => util::set_autostart(!util::autostart_enabled()),
         2 => {
+            let on = !util::show_codex();
+            util::set_show_codex(on);
+            if on {
+                spawn_fetch(Provider::Codex);
+            }
+            update_tray(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
+        }
+        3 => {
             // keyboard activate on the interval card: cycle to the next option
             let cur = POLL_SECS.load(Ordering::SeqCst);
             let idx = gfx::INTERVALS.iter().position(|(s, _)| *s == cur).unwrap_or(1);
             apply_interval(gfx::INTERVALS[(idx + 1) % gfx::INTERVALS.len()].0);
         }
-        3 => spawn_fetch(),
-        4 => {
+        4 => spawn_fetch_all(),
+        5 => {
             let _ = DestroyWindow(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
             return;
         }
@@ -591,23 +652,77 @@ unsafe fn apply_flyout_theme(h: HWND) {
 }
 
 /// Last good snapshot survives transient errors (429, network blips):
-/// the flyout and tray keep showing stale data; the error view only appears
-/// when nothing was ever fetched. The footer note carries the error.
-fn current_view() -> (gfx::View, Option<String>) {
-    let state = STATE.lock().unwrap();
-    let fallback = || LAST_GOOD.lock().unwrap().clone().map(gfx::View::Data);
-    match &*state {
-        None => (fallback().unwrap_or(gfx::View::Loading), None),
-        Some(api::FetchOutcome::Ok(s)) => (gfx::View::Data(s.clone()), None),
-        Some(api::FetchOutcome::Err { msg, .. }) => match fallback() {
-            Some(v) => {
-                let head = msg.lines().next().unwrap_or("couldn't update");
-                let head = head.trim_end_matches('.');
-                (v, Some(head.to_string()))
-            }
-            None => (gfx::View::Error(msg.clone()), None),
-        },
+/// the flyout and tray keep showing stale data; the whole-flyout error view
+/// only appears when nothing was ever fetched from any provider. Per-provider
+/// failures degrade to a dim note line inside that provider's section.
+fn current_view() -> gfx::View {
+    let (c_snap, c_err) = effective(Provider::Claude);
+    let codex_on = codex_active();
+
+    // Claude-only path — identical to the single-provider behavior
+    if !codex_on {
+        return match (c_snap, c_err) {
+            (None, None) => gfx::View::Loading,
+            (None, Some(msg)) => gfx::View::Error(msg),
+            (Some(s), err) => gfx::View::Data(gfx::FlyoutData {
+                fetched_unix: Some(s.fetched_unix),
+                note: err.as_deref().map(err_head),
+                sections: vec![section("Claude", s)],
+            }),
+        };
     }
+
+    let (x_snap, x_err) = effective(Provider::Codex);
+    if c_snap.is_none() && c_err.is_none() && x_snap.is_none() && x_err.is_none() {
+        return gfx::View::Loading;
+    }
+
+    let mut sections = Vec::new();
+    let mut notes = Vec::new();
+    let mut fetched: Option<i64> = None;
+    for (title, snap, err) in [("Claude", c_snap, c_err), ("Codex", x_snap, x_err)] {
+        match (snap, err) {
+            (Some(s), err) => {
+                fetched = fetched.max(Some(s.fetched_unix));
+                if err.is_some() {
+                    notes.push(format!("{title}: {}", err.as_deref().map(err_head).unwrap_or_default()));
+                }
+                sections.push(section(title, s));
+            }
+            (None, Some(msg)) => sections.push(gfx::Section {
+                title,
+                plan: String::new(),
+                body: gfx::SectionBody::Note(msg.lines().next().unwrap_or("Can't load usage").to_string()),
+            }),
+            (None, None) => sections.push(gfx::Section {
+                title,
+                plan: String::new(),
+                body: gfx::SectionBody::Note("Loading…".to_string()),
+            }),
+        }
+    }
+    gfx::View::Data(gfx::FlyoutData {
+        sections,
+        fetched_unix: fetched,
+        note: if notes.is_empty() { None } else { Some(notes.join(" · ")) },
+    })
+}
+
+fn section(title: &'static str, s: api::UsageSnapshot) -> gfx::Section {
+    gfx::Section {
+        title,
+        plan: s.plan,
+        body: gfx::SectionBody::Rows(s.rows),
+    }
+}
+
+/// First line, no trailing period — footer-note form of an error message.
+fn err_head(msg: &str) -> String {
+    msg.lines()
+        .next()
+        .unwrap_or("couldn't update")
+        .trim_end_matches('.')
+        .to_string()
 }
 
 unsafe fn toggle_flyout(x: i32, y: i32) {
@@ -628,17 +743,23 @@ unsafe fn show_flyout(cx: i32, cy: i32) {
         ui.fly_focus = -1;
     });
 
-    let stale = LAST_FETCH
-        .lock()
-        .unwrap()
-        .map(|t| t.elapsed().as_secs() > 15)
-        .unwrap_or(true);
-    if stale {
-        spawn_fetch();
+    let stale = |p: Provider| {
+        slot(p)
+            .last_fetch
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed().as_secs() > 15)
+            .unwrap_or(true)
+    };
+    if stale(Provider::Claude) {
+        spawn_fetch(Provider::Claude);
+    }
+    if codex_active() && stale(Provider::Codex) {
+        spawn_fetch(Provider::Codex);
     }
 
     let fh = flyout_hwnd();
-    let (view, note) = current_view();
+    let view = current_view();
 
     let pt = POINT { x: cx, y: cy };
     let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
@@ -669,24 +790,17 @@ unsafe fn show_flyout(cx: i32, cy: i32) {
     };
 
     let _ = SetWindowPos(fh, HWND_TOPMOST, x, y, w_px, h_px, SWP_NOACTIVATE);
-    render_flyout(fh, &view, note.as_deref(), w_px as u32, h_px as u32, dpi);
+    render_flyout(fh, &view, w_px as u32, h_px as u32, dpi);
     let _ = ShowWindow(fh, SW_SHOW);
     let _ = SetForegroundWindow(fh);
     // relative "Updated…" label tick — lives only while visible
     SetTimer(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _), TIMER_TICK, 30_000, None);
 }
 
-unsafe fn render_flyout(
-    fh: HWND,
-    view: &gfx::View,
-    note: Option<&str>,
-    w_px: u32,
-    h_px: u32,
-    dpi: f32,
-) {
+unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f32) {
     let dark = util::is_dark_theme();
     let accent = util::accent_rgb();
-    let fetching = FETCHING.load(Ordering::SeqCst);
+    let fetching = any_fetching();
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
         if ui.fly.is_none() {
@@ -695,7 +809,7 @@ unsafe fn render_flyout(
         let hover = ui.fly_hover;
         let focus = ui.fly_focus;
         if let Some(fx) = ui.fly.as_mut() {
-            let _ = fx.render_flyout(w_px, h_px, dpi, view, dark, accent, hover, focus, fetching, note);
+            let _ = fx.render_flyout(w_px, h_px, dpi, view, dark, accent, hover, focus, fetching);
         }
     });
 }
@@ -709,11 +823,10 @@ unsafe fn render_flyout_current() {
     let mut rc = RECT::default();
     let _ = GetClientRect(fh, &mut rc);
     let dpi = GetDpiForWindow(fh) as f32;
-    let (view, note) = current_view();
+    let view = current_view();
     render_flyout(
         fh,
         &view,
-        note.as_deref(),
         (rc.right - rc.left) as u32,
         (rc.bottom - rc.top) as u32,
         dpi,
@@ -819,6 +932,7 @@ unsafe fn render_settings(hwnd: HWND) {
         let st = gfx::SettingsView {
             caps_on: util::caps_led_enabled(),
             autostart: util::autostart_enabled(),
+            codex_on: util::show_codex(),
             poll_secs: POLL_SECS.load(Ordering::SeqCst),
             hover: ui.set_hover,
             focus: ui.set_focus,
@@ -873,20 +987,10 @@ unsafe fn update_tray(owner: HWND) {
     let dark = util::is_dark_theme();
     let accent = util::accent_rgb();
 
-    // same fallback logic as current_view: stale data beats an error icon
-    let effective: Option<api::FetchOutcome> = {
-        let state = STATE.lock().unwrap();
-        match &*state {
-            Some(api::FetchOutcome::Err { .. }) => match &*LAST_GOOD.lock().unwrap() {
-                Some(s) => Some(api::FetchOutcome::Ok(s.clone())),
-                None => state.clone(),
-            },
-            other => other.clone(),
-        }
-    };
-    let (style, tip) = match &effective {
-        None => (trayicon::Style::Loading, "Claude — loading usage…".to_string()),
-        Some(api::FetchOutcome::Ok(s)) => {
+    // ring + first tooltip line stay Claude's (stale data beats an error icon)
+    let (c_snap, c_err) = effective(Provider::Claude);
+    let (style, mut tip) = match (&c_snap, &c_err) {
+        (Some(s), _) => {
             let session = s.rows.iter().find(|r| r.kind == "session");
             let weekly = s.rows.iter().find(|r| r.kind == "weekly_all");
             let (frac, rgb, mut tip) = match session {
@@ -907,11 +1011,31 @@ unsafe fn update_tray(owner: HWND) {
             }
             (trayicon::Style::Ring { frac, rgb }, tip)
         }
-        Some(api::FetchOutcome::Err { msg, .. }) => (
+        (None, Some(msg)) => (
             trayicon::Style::Alert,
             format!("Claude — {}", msg.replace('\n', " ")),
         ),
+        (None, None) => (trayicon::Style::Loading, "Claude — loading usage…".to_string()),
     };
+
+    if codex_active() {
+        match effective(Provider::Codex) {
+            (Some(s), _) => {
+                let mut line = "Codex".to_string();
+                if let Some(row) = s.rows.iter().find(|r| r.kind == "session") {
+                    line.push_str(&format!(" · Session {:.0}%", row.percent));
+                }
+                if let Some(row) = s.rows.iter().find(|r| r.kind == "weekly_all") {
+                    line.push_str(&format!(" · Week {:.0}%", row.percent));
+                }
+                tip.push_str(&format!("\n{line}"));
+            }
+            (None, Some(msg)) => {
+                tip.push_str(&format!("\nCodex — {}", err_head(&msg)));
+            }
+            (None, None) => {}
+        }
+    }
 
     let icon = trayicon::build(&style, dark).unwrap_or_default();
     let mut nid = base_nid(owner);
@@ -958,7 +1082,7 @@ unsafe fn show_menu(owner: HWND, x: i32, y: i32) {
     let _ = DestroyMenu(menu);
 
     match cmd.0 as usize {
-        IDM_REFRESH => spawn_fetch(),
+        IDM_REFRESH => spawn_fetch_all(),
         IDM_SETTINGS => open_settings(),
         IDM_AUTOSTART => util::set_autostart(!auto),
         IDM_QUIT => {
@@ -970,40 +1094,53 @@ unsafe fn show_menu(owner: HWND, x: i32, y: i32) {
 
 // ---------- fetch ----------
 
-fn spawn_fetch() {
+/// Refresh every live provider (Claude always, Codex when active).
+fn spawn_fetch_all() {
+    spawn_fetch(Provider::Claude);
+    if codex_active() {
+        spawn_fetch(Provider::Codex);
+    }
+}
+
+fn spawn_fetch(p: Provider) {
+    let s = slot(p);
     // Retry-After from a 429 is honored exactly — no requests inside the window
-    if let Some(until) = *COOLDOWN_UNTIL.lock().unwrap() {
+    if let Some(until) = *s.cooldown_until.lock().unwrap() {
         if Instant::now() < until {
             return;
         }
     }
     // debounce: manual refresh spam turns into API 429s
-    if let Some(t) = *LAST_FETCH.lock().unwrap() {
+    if let Some(t) = *s.last_fetch.lock().unwrap() {
         if t.elapsed().as_secs() < 3 {
             return;
         }
     }
-    if FETCHING.swap(true, Ordering::SeqCst) {
+    if s.fetching.swap(true, Ordering::SeqCst) {
         return;
     }
-    std::thread::spawn(|| {
-        let out = api::fetch();
+    std::thread::spawn(move || {
+        let out = match p {
+            Provider::Claude => api::fetch(),
+            Provider::Codex => codex::fetch(),
+        };
+        let s = slot(p);
         match &out {
-            api::FetchOutcome::Ok(s) => {
-                *LAST_GOOD.lock().unwrap() = Some(s.clone());
-                *COOLDOWN_UNTIL.lock().unwrap() = None;
+            api::FetchOutcome::Ok(snap) => {
+                *s.last_good.lock().unwrap() = Some(snap.clone());
+                *s.cooldown_until.lock().unwrap() = None;
             }
             api::FetchOutcome::Err { retry_after, .. } => {
                 if let Some(secs) = retry_after {
                     let capped = (*secs).min(300);
-                    *COOLDOWN_UNTIL.lock().unwrap() =
+                    *s.cooldown_until.lock().unwrap() =
                         Some(Instant::now() + std::time::Duration::from_secs(capped));
                 }
             }
         }
-        *STATE.lock().unwrap() = Some(out);
-        *LAST_FETCH.lock().unwrap() = Some(Instant::now());
-        FETCHING.store(false, Ordering::SeqCst);
+        *s.state.lock().unwrap() = Some(out);
+        *s.last_fetch.lock().unwrap() = Some(Instant::now());
+        s.fetching.store(false, Ordering::SeqCst);
         let h = MAIN_HWND.load(Ordering::SeqCst);
         if h != 0 {
             unsafe {

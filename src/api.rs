@@ -1,4 +1,6 @@
 //! Fetches usage limits from the same endpoint Claude Code's `/usage` uses.
+//! Also home of the provider-agnostic display model (`UsageSnapshot`,
+//! `LimitRow`, `FetchOutcome`) shared with `codex.rs`.
 //! Read-only: never refreshes or rewrites the OAuth token (refresh rotation
 //! could invalidate the Claude Code session).
 
@@ -102,9 +104,9 @@ pub fn fetch() -> FetchOutcome {
     }
 }
 
-type FetchErr = (String, Option<u64>);
+pub(crate) type FetchErr = (String, Option<u64>);
 
-fn plain(msg: impl Into<String>) -> FetchErr {
+pub(crate) fn plain(msg: impl Into<String>) -> FetchErr {
     (msg.into(), None)
 }
 
@@ -222,10 +224,10 @@ fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
     }
 
     let plan = match creds.oauth.subscription_type.as_deref() {
-        Some("max") => "Max plan".to_string(),
-        Some("pro") => "Pro plan".to_string(),
-        Some("team") => "Team plan".to_string(),
-        Some(other) => format!("{} plan", prettify(other)),
+        Some("max") => "Max".to_string(),
+        Some("pro") => "Pro".to_string(),
+        Some("team") => "Team".to_string(),
+        Some(other) => prettify(other),
         None => String::new(),
     };
 
@@ -246,7 +248,7 @@ pub fn fmt_unix_hhmm(unix: i64) -> String {
     format!("{:02}:{:02}", local.hour(), local.minute())
 }
 
-fn prettify(s: &str) -> String {
+pub(crate) fn prettify(s: &str) -> String {
     let mut out = s.replace('_', " ");
     if let Some(first) = out.get_mut(0..1) {
         first.make_ascii_uppercase();
@@ -263,6 +265,18 @@ fn fmt_reset(iso: &str) -> String {
     let Ok(dt) = OffsetDateTime::parse(iso, &Rfc3339) else {
         return String::new();
     };
+    fmt_reset_dt(dt)
+}
+
+/// Same formatting for unix-seconds reset stamps (Codex API shape).
+pub(crate) fn fmt_reset_unix(unix: i64) -> String {
+    let Ok(dt) = OffsetDateTime::from_unix_timestamp(unix) else {
+        return String::new();
+    };
+    fmt_reset_dt(dt)
+}
+
+fn fmt_reset_dt(dt: OffsetDateTime) -> String {
     let local = dt.to_offset(local_offset());
     let today = OffsetDateTime::now_utc().to_offset(local_offset()).date();
     if local.date() == today {

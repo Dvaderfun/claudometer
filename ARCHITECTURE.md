@@ -25,9 +25,10 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 
 | File | Owns |
 |---|---|
-| `main.rs` | windows, wndprocs, tray, menu, timers, fetch orchestration, hit-testing, keyboard nav, all statics |
+| `main.rs` | windows, wndprocs, tray, menu, timers, per-provider fetch orchestration (`SLOTS`), hit-testing, keyboard nav, all statics |
 | `gfx.rs` | `Surface` (D3D/DXGI/DComp/D2D stack), all drawing, layout constants, Fluent palette, brush/format caches |
-| `api.rs` | credentials read, usage fetch, response parsing → display-ready `UsageSnapshot`, time formatting |
+| `api.rs` | Claude credentials read + usage fetch; shared display model (`UsageSnapshot`, `LimitRow`, `FetchOutcome`), time formatting |
+| `codex.rs` | Codex (OpenAI) credentials read + usage fetch → same `UsageSnapshot` |
 | `trayicon.rs` | CPU-rasterized ring/alert HICON (premultiplied DIB, no fonts) |
 | `util.rs` | theme/accent detection, autostart registry, poll-interval config, caps-LED toggle, dark menus, acrylic |
 
@@ -43,27 +44,35 @@ Key decisions, with reasons:
 - **Flyout material — accent-policy acrylic** (`ACCENT_ENABLE_ACRYLICBLURBEHIND`, undocumented): `DWMWA_SYSTEMBACKDROP_TYPE = DWMSBT_TRANSIENTWINDOW` renders only its opaque fallback on borderless DComp popups (observed on build 28020, even with frame extension). Settings window is a titled window, where `DWMSBT_MAINWINDOW` (Mica) works through the documented path.
 - **Tray icon on CPU** (`trayicon.rs`): 16–24 px ring with per-pixel AA math into a premultiplied DIB → `CreateIconIndirect`. No D2D needed for 256 pixels; no font dependency for the alert glyph.
 
-## Data layer (`api.rs`)
+## Data layer (`api.rs` + `codex.rs`)
 
-`fetch()` (worker thread, ~1/min):
+Two independent providers, one worker thread each per poll (~1/min), both producing the same display-ready `UsageSnapshot`:
+
+**Claude** (`api.rs::fetch`):
 
 1. Read `%USERPROFILE%\.claude\.credentials.json` — **read-only, never refreshed** (refresh rotation would kill the user's Claude Code session). Expired → friendly error.
 2. `GET api.anthropic.com/api/oauth/usage`, Bearer token, `anthropic-beta: oauth-2025-04-20`, via ureq + native-tls (schannel — OS cert store, no C deps). **Unofficial endpoint** — parsing is defensive, every field optional.
 3. Prefer the `limits[]` array (kind/percent/severity/resets_at/scope); fall back to legacy `five_hour`/`seven_day`; append `extra_usage` if enabled.
-4. Produce display-ready `UsageSnapshot` (labels, formatted reset times, unix fetch stamp).
 
-Resilience rules (in `main.rs`):
+**Codex** (`codex.rs::fetch`):
 
-- `LAST_GOOD` snapshot survives failed fetches — UI shows stale data + footer note; the error view exists only for the never-fetched case.
-- 429 `Retry-After` honored exactly (capped 300 s) via `COOLDOWN_UNTIL`; no extra client backoff on top (the poll interval is the floor).
-- 3 s debounce on refresh; `FETCHING` flag dedupes concurrent spawns.
-- Fetch thread publishes via mutexed statics + `PostMessageW(WM_DATA_READY)` — UI mutations stay on the UI thread.
+1. Read `~/.codex/auth.json` (`CODEX_HOME` honored) — **read-only, never refreshed** (OpenAI rotates refresh tokens; an external refresh would invalidate the Codex CLI session). Expiry checked via the JWT `exp` claim (hand-rolled base64url, no verify). No file / no `tokens` (API-key-only install) → provider counts as absent and the section doesn't render at all.
+2. `GET chatgpt.com/backend-api/wham/usage` — the same **unofficial endpoint** the Codex CLI's TUI polls — with `Authorization: Bearer` + `chatgpt-account-id` headers.
+3. `rate_limit.primary_window`/`secondary_window` → rows; kind/label derived from `limit_window_seconds` (≤24 h → "Session (Nh)", 7 d → "Weekly"), **not** from window position — which window arrives as primary varies by plan. Severity is empty → percent thresholds color the bars.
+
+Resilience rules (in `main.rs`, per provider via `SLOTS`):
+
+- `last_good` snapshot survives failed fetches — UI shows stale data + footer note; a provider with no data degrades to a dim note line in its own section; the whole-flyout error view exists only for the nothing-ever-fetched case.
+- 429 `Retry-After` honored exactly (capped 300 s) via `cooldown_until`; no extra client backoff on top (the poll interval is the floor).
+- 3 s debounce on refresh; `fetching` flag dedupes concurrent spawns.
+- Fetch threads publish via mutexed statics + `PostMessageW(WM_DATA_READY)` — UI mutations stay on the UI thread.
+- Codex enablement (`codex_active`) = settings toggle AND auth file present — checked per poll, so signing in/out of Codex shows/hides the section without restart.
 
 ## State
 
-- Cross-thread: `STATE`, `LAST_GOOD`, `LAST_FETCH`, `COOLDOWN_UNTIL` (mutexes); `FETCHING`, `POLL_SECS`, hwnds (atomics).
+- Cross-thread: `SLOTS[2]` (per-provider `state`, `last_good`, `last_fetch`, `cooldown_until` mutexes + `fetching` atomic); `POLL_SECS`, hwnds (atomics).
 - UI-thread only: `UI` thread_local — surfaces, hover, keyboard focus, mouse-tracking flags.
-- Persistent: `%APPDATA%\Claudometer\settings.json` (poll interval), HKCU Run key (autostart), `~/.claude/hooks/caps-led.disabled` (LED kill switch).
+- Persistent: `%APPDATA%\Claudometer\settings.json` (poll interval, Codex toggle), HKCU Run key (autostart), `~/.claude/hooks/caps-led.disabled` (LED kill switch).
 
 ## Known gaps
 

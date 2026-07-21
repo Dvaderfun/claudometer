@@ -21,14 +21,38 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
-use crate::api::UsageSnapshot;
+use crate::api::LimitRow;
 use crate::util;
+
+/// One provider block in the flyout: header (name + plan) and either limit
+/// rows or a single dim status line (loading / per-provider error).
+#[derive(Clone)]
+pub struct Section {
+    pub title: &'static str,
+    pub plan: String,
+    pub body: SectionBody,
+}
+
+#[derive(Clone)]
+pub enum SectionBody {
+    Rows(Vec<LimitRow>),
+    Note(String),
+}
+
+#[derive(Clone)]
+pub struct FlyoutData {
+    pub sections: Vec<Section>,
+    /// most recent successful fetch across sections; None = nothing fetched yet
+    pub fetched_unix: Option<i64>,
+    /// footer note (stale-data errors), e.g. "Codex: rate limited"
+    pub note: Option<String>,
+}
 
 #[derive(Clone)]
 pub enum View {
     Loading,
     Error(String),
-    Data(UsageSnapshot),
+    Data(FlyoutData),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -41,6 +65,7 @@ pub enum FlyHover {
 pub struct SettingsView {
     pub caps_on: bool,
     pub autostart: bool,
+    pub codex_on: bool,
     pub poll_secs: u32,
     pub hover: i32, // card index, -1 = none
     pub focus: i32, // keyboard focus card index, -1 = none
@@ -62,6 +87,8 @@ const ROW_GAP: f32 = 16.0;
 const FOOTER_GAP_ABOVE: f32 = 12.0;
 const FOOTER_GAP_BELOW: f32 = 8.0;
 const ROW_BLOCK: f32 = LABEL_H + GAP + BAR_H + GAP + CAPTION_H;
+/// breathing room above and below the divider between provider sections
+const SEC_GAP: f32 = 16.0;
 
 const SIZE_BODY: f32 = 14.0;
 const SIZE_CAPTION: f32 = 12.0;
@@ -70,19 +97,27 @@ const BTN: f32 = 28.0; // header icon button
 
 pub fn flyout_height(view: &View) -> f32 {
     match view {
-        View::Data(s) => {
-            let n = s.rows.len().max(1) as f32;
-            PAD + TITLE_H
-                + SECTION_GAP
-                + n * ROW_BLOCK
-                + (n - 1.0) * ROW_GAP
-                + FOOTER_GAP_ABOVE
-                + 1.0
-                + FOOTER_GAP_BELOW
-                + CAPTION_H
-                + PAD
+        View::Data(d) => {
+            let mut h = PAD;
+            for (i, sec) in d.sections.iter().enumerate() {
+                if i > 0 {
+                    h += SEC_GAP + 1.0 + SEC_GAP;
+                }
+                h += TITLE_H + SECTION_GAP + section_body_h(&sec.body);
+            }
+            h + FOOTER_GAP_ABOVE + 1.0 + FOOTER_GAP_BELOW + CAPTION_H + PAD
         }
         _ => 120.0,
+    }
+}
+
+fn section_body_h(body: &SectionBody) -> f32 {
+    match body {
+        SectionBody::Rows(rows) => {
+            let n = rows.len().max(1) as f32;
+            n * ROW_BLOCK + (n - 1.0) * ROW_GAP
+        }
+        SectionBody::Note(_) => CAPTION_H,
     }
 }
 
@@ -100,7 +135,7 @@ pub const SET_W: f32 = 400.0;
 const SET_PAD: f32 = 24.0;
 const CARD_H: f32 = 56.0;
 const CARD_GAP: f32 = 4.0;
-pub const N_CARDS: usize = 5;
+pub const N_CARDS: usize = 6;
 
 pub fn settings_height() -> f32 {
     let cards = N_CARDS as f32 * CARD_H + (N_CARDS as f32 - 1.0) * CARD_GAP;
@@ -352,7 +387,6 @@ impl Surface {
         hover: FlyHover,
         focus: i32,
         fetching: bool,
-        note: Option<&str>,
     ) -> Result<()> {
         self.ensure_size(w_px.max(8), h_px.max(8), dpi)?;
         self.ensure_brushes(dark, accent)?;
@@ -370,7 +404,7 @@ impl Surface {
                     let rest = lines.next();
                     self.draw_message(w_dip, head, rest)?
                 }
-                View::Data(snap) => self.draw_data(w_dip, snap, note)?,
+                View::Data(d) => self.draw_data(w_dip, d)?,
             }
 
             self.draw_header_buttons(hover, focus, fetching)?;
@@ -409,46 +443,73 @@ impl Surface {
         Ok(())
     }
 
-    fn draw_data(&self, w: f32, snap: &UsageSnapshot, note: Option<&str>) -> Result<()> {
+    fn draw_data(&self, w: f32, d: &FlyoutData) -> Result<()> {
         let b = self.cache();
 
-        self.text("Claude", &self.fmt_body_sb, rect(PAD, PAD, w - PAD, PAD + TITLE_H), &b.text, false)?;
-
-        let mut y = PAD + TITLE_H + SECTION_GAP;
-        for (i, row) in snap.rows.iter().enumerate() {
-            if i > 0 {
-                y += ROW_GAP;
-            }
-            let fill = self.sev_brush(&row.severity, row.percent);
-
-            self.text(&row.label, &self.fmt_body, rect(PAD, y, w - PAD - 56.0, y + LABEL_H), &b.text, false)?;
-            let pct_str = format!("{:.0}%", row.percent);
-            self.text(&pct_str, &self.fmt_body_sb, rect(w - PAD - 56.0, y, w - PAD, y + LABEL_H), &b.text, true)?;
-
-            let bar_y = y + LABEL_H + GAP;
-            let bar_w = w - 2.0 * PAD;
-            self.rounded(rect(PAD, bar_y, PAD + bar_w, bar_y + BAR_H), BAR_H / 2.0, &b.track)?;
-            let frac = (row.percent / 100.0).clamp(0.0, 1.0) as f32;
-            if frac > 0.005 {
-                let fw = (bar_w * frac).max(BAR_H);
-                self.rounded(rect(PAD, bar_y, PAD + fw, bar_y + BAR_H), BAR_H / 2.0, fill)?;
+        let mut y = PAD;
+        for (si, sec) in d.sections.iter().enumerate() {
+            if si > 0 {
+                y += SEC_GAP;
+                self.fill(rect(PAD, y, w - PAD, y + 1.0), &b.divider);
+                y += 1.0 + SEC_GAP;
             }
 
-            if !row.reset_text.is_empty() {
-                let cap_y = bar_y + BAR_H + GAP;
-                self.text(&row.reset_text, &self.fmt_caption, rect(PAD, cap_y, w - PAD, cap_y + CAPTION_H), &b.dim, false)?;
+            // header: provider name left, plan right — the first section's
+            // header shares its row with the refresh/gear buttons
+            let plan_right = if si == 0 { fly_btns().0.left - GAP } else { w - PAD };
+            self.text(sec.title, &self.fmt_body_sb, rect(PAD, y, plan_right, y + TITLE_H), &b.text, false)?;
+            if !sec.plan.is_empty() {
+                self.text(&sec.plan, &self.fmt_caption, rect(PAD, y + 2.0, plan_right, y + 2.0 + CAPTION_H), &b.dim, true)?;
             }
-            y += ROW_BLOCK;
+            y += TITLE_H + SECTION_GAP;
+
+            match &sec.body {
+                SectionBody::Rows(rows) => {
+                    for (i, row) in rows.iter().enumerate() {
+                        if i > 0 {
+                            y += ROW_GAP;
+                        }
+                        let fill = self.sev_brush(&row.severity, row.percent);
+
+                        self.text(&row.label, &self.fmt_body, rect(PAD, y, w - PAD - 56.0, y + LABEL_H), &b.text, false)?;
+                        let pct_str = format!("{:.0}%", row.percent);
+                        self.text(&pct_str, &self.fmt_body_sb, rect(w - PAD - 56.0, y, w - PAD, y + LABEL_H), &b.text, true)?;
+
+                        let bar_y = y + LABEL_H + GAP;
+                        let bar_w = w - 2.0 * PAD;
+                        self.rounded(rect(PAD, bar_y, PAD + bar_w, bar_y + BAR_H), BAR_H / 2.0, &b.track)?;
+                        let frac = (row.percent / 100.0).clamp(0.0, 1.0) as f32;
+                        if frac > 0.005 {
+                            let fw = (bar_w * frac).max(BAR_H);
+                            self.rounded(rect(PAD, bar_y, PAD + fw, bar_y + BAR_H), BAR_H / 2.0, fill)?;
+                        }
+
+                        if !row.reset_text.is_empty() {
+                            let cap_y = bar_y + BAR_H + GAP;
+                            self.text(&row.reset_text, &self.fmt_caption, rect(PAD, cap_y, w - PAD, cap_y + CAPTION_H), &b.dim, false)?;
+                        }
+                        y += ROW_BLOCK;
+                    }
+                }
+                SectionBody::Note(msg) => {
+                    self.text(msg, &self.fmt_caption, rect(PAD, y, w - PAD, y + CAPTION_H), &b.dim, false)?;
+                    y += CAPTION_H;
+                }
+            }
         }
 
         let div_y = y + FOOTER_GAP_ABOVE;
         self.fill(rect(PAD, div_y, w - PAD, div_y + 1.0), &b.divider);
         let foot_y = div_y + 1.0 + FOOTER_GAP_BELOW;
-        let mut footer = format!("Updated {}", relative_time(snap.fetched_unix));
-        if let Some(n) = note {
-            footer.push_str(&format!(" · {n}"));
-        } else if !snap.plan.is_empty() {
-            footer.push_str(&format!(" · {}", snap.plan));
+        let mut footer = match d.fetched_unix {
+            Some(u) => format!("Updated {}", relative_time(u)),
+            None => String::new(),
+        };
+        if let Some(n) = &d.note {
+            if !footer.is_empty() {
+                footer.push_str(" · ");
+            }
+            footer.push_str(n);
         }
         self.text(&footer, &self.fmt_caption, rect(PAD, foot_y, w - PAD, foot_y + CAPTION_H), &b.dim, false)?;
         Ok(())
@@ -483,6 +544,7 @@ impl Surface {
             let labels = [
                 "Caps Lock light shows Claude status",
                 "Start with Windows",
+                "Show Codex usage",
                 "Auto-refresh",
                 "Refresh usage now",
                 "Quit Claudometer",
@@ -499,16 +561,17 @@ impl Surface {
                 };
                 self.dc.DrawRoundedRectangle(&rr, &b.card_stroke, 1.0, None);
 
-                let label_right = if i == 2 { card.right - 200.0 } else { card.right - 120.0 };
+                let label_right = if i == 3 { card.right - 200.0 } else { card.right - 120.0 };
                 self.text_v(labels[i], &self.fmt_body, rect(card.left + 16.0, card.top, label_right, card.bottom), &b.text)?;
 
                 let cy = (card.top + card.bottom) / 2.0;
                 match i {
                     0 => self.toggle(card.right - 16.0, cy, st.caps_on)?,
                     1 => self.toggle(card.right - 16.0, cy, st.autostart)?,
-                    2 => self.interval_row(card, st.poll_secs)?,
-                    3 => self.button(card.right - 16.0, cy, "Refresh")?,
-                    4 => self.button(card.right - 16.0, cy, "Quit")?,
+                    2 => self.toggle(card.right - 16.0, cy, st.codex_on)?,
+                    3 => self.interval_row(card, st.poll_secs)?,
+                    4 => self.button(card.right - 16.0, cy, "Refresh")?,
+                    5 => self.button(card.right - 16.0, cy, "Quit")?,
                     _ => {}
                 }
 
@@ -520,7 +583,7 @@ impl Surface {
             let b = self.cache();
             let foot_y = cards[N_CARDS - 1].bottom + 12.0;
             self.text(
-                &format!("Claudometer {} · data from api.anthropic.com", env!("CARGO_PKG_VERSION")),
+                &format!("Claudometer {} · api.anthropic.com · chatgpt.com", env!("CARGO_PKG_VERSION")),
                 &self.fmt_caption,
                 rect(SET_PAD, foot_y, SET_W - SET_PAD, foot_y + CAPTION_H),
                 &b.dim,

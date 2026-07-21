@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Claudometer — Claude usage limits in the Windows 11 tray. Native Win32 Rust, no webview. See `ARCHITECTURE.md` for the full design; this file is the working knowledge for a session.
+Claudometer — Claude + Codex usage limits in the Windows 11 tray. Native Win32 Rust, no webview. See `ARCHITECTURE.md` for the full design; this file is the working knowledge for a session.
 
 ## Commands
 
@@ -19,7 +19,7 @@ cargo clippy --release         # CI gates on -D warnings — keep zero warnings
 Drive the flyout programmatically: find the hidden window by class `Claudometer.Main` (EnumWindows by pid — `FindWindowW` is flaky), then
 `PostMessageW(hwnd, 0x8001 /* WM_APP+1 */, coords, 0x400 /* NIN_SELECT */)` toggles the flyout. Measure RAM with `(Get-Process claudometer).PrivateMemorySize64`.
 
-Expected budgets: **~3 MB fresh, ~7 MB flyout open, ~5.5 MB after close, ~0.02% avg CPU, GDI count stable (~10)**. A regression here is a bug.
+Expected budgets: **~3 MB fresh, ~9 MB flyout open (two sections), ~7 MB after close, ~0.02% avg CPU, GDI count stable (~18 once settings was opened)**. A regression here is a bug.
 
 ## Hard-won gotchas (do not re-learn these)
 
@@ -27,7 +27,8 @@ Expected budgets: **~3 MB fresh, ~7 MB flyout open, ~5.5 MB after close, ~0.02% 
 - **D3D device must stay `D3D_DRIVER_TYPE_WARP`.** Hardware device = ~40 MB of driver user-mode heaps that survive device release. WARP renders the ~330px surface in microseconds; DWM still composes on GPU. Measured: 57 MB vs 7 MB.
 - **Flyout acrylic = undocumented accent policy** (`SetWindowCompositionAttribute`, `util::apply_acrylic`). `DWMWA_SYSTEMBACKDROP_TYPE` renders only its opaque fallback on borderless `WS_EX_NOREDIRECTIONBITMAP` popups — don't "modernize" back to it without testing on real hardware.
 - **`LoadIconW` id-1 pointer:** clippy suggests `std::ptr::dangling::<u16>()` — that's address 2, wrong resource id. The `#[allow]` there is load-bearing.
-- **Never refresh the OAuth token.** `api.rs` reads `~/.claude/.credentials.json` strictly read-only. Refresh-token rotation would invalidate the user's Claude Code session. Expired = tell user to open Claude Code.
+- **Never refresh either OAuth token.** `api.rs` reads `~/.claude/.credentials.json`, `codex.rs` reads `~/.codex/auth.json` — both strictly read-only. Refresh-token rotation would invalidate the user's Claude Code / Codex CLI session. Expired = tell user to open Claude Code / Codex.
+- **Codex windows aren't positional.** `wham/usage` may deliver the weekly (168 h) window as `primary_window`; kind/label must derive from `limit_window_seconds`, never from primary/secondary position.
 - Tray icon must be re-added on the `TaskbarCreated` broadcast (explorer restart) — already handled, keep it.
 
 ## Conventions

@@ -1,8 +1,8 @@
 [package]
 name = "claudometer"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Claude usage limits in the Windows 11 tray — native Win32 + Direct2D"
+description = "Claude + Codex usage limits in the Windows 11 tray — native Win32 + Direct2D"
 license = "MIT"
 repository = "https://github.com/Dvaderfun/claudometer"
 
