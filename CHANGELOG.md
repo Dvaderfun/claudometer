@@ -2,6 +2,11 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [SemVer](https://semver.org/).
 
+## [0.5.1] — 2026-07-21
+
+### Fixed
+- 75% alert re-fired on every poll while a window stayed over the threshold: the API recomputes an in-flight window's `resets_at` (observed drifting ±1 min between polls) and exact-epoch dedup saw each drift as a new window. Epochs within 30 minutes now count as the same window instance.
+
 ## [0.5.0] — 2026-07-21
 
 ### Added
