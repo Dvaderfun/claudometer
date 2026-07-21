@@ -1,10 +1,13 @@
 [package]
 name = "claudometer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Claude usage limits in the Windows 11 tray — native Win32 + Direct2D"
 license = "MIT"
 repository = "https://github.com/Dvaderfun/claudometer"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 ureq = { version = "2.10", default-features = false, features = ["native-tls"] }

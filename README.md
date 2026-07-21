@@ -10,7 +10,11 @@ A tiny native Windows app that shows how much of your Claude session and weekly 
 - **Flyout on click** — every limit the API reports (session, weekly all-models, weekly per-model), each with a progress bar and its reset time. Acrylic blur, rounded corners, light/dark theme, your Windows accent color.
 - **Tooltip on hover** — quick numbers without clicking.
 - **Settings window** (Mica) — auto-refresh interval (30s / 1m / 2m / 5m), start with Windows, refresh, quit.
+- **Keyboard**: Tab cycles controls (visible focus ring), Space/Enter activates, ←/→ changes the refresh interval, Esc closes.
 - Survives Explorer restarts, per-monitor DPI aware, respects `Retry-After` on rate limits, keeps showing cached data through network blips.
+- Frugal by design: ~20 MB RAM when idle (GPU resources are released whenever the flyout closes), ~0.02% CPU.
+
+> Known gap: screen-reader (UI Automation) support is not implemented yet — the UI is fully keyboard-operable, but not announced to narrators.
 
 ## Install
 

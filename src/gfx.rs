@@ -1,7 +1,12 @@
-//! Rendering: D3D11 + DXGI composition swapchain (premultiplied alpha)
-//! + DirectComposition visual + Direct2D/DirectWrite content.
+//! Rendering: D3D11 + DXGI composition swapchain (premultiplied alpha) plus a
+//! DirectComposition visual carrying Direct2D/DirectWrite content.
+//!
 //! `Surface` is one alpha-composited window canvas — used by both the flyout
 //! and the settings window. DWM/accent-policy draws the material behind it.
+//!
+//! Resources are cached: one RT cast, text formats built once, solid brushes
+//! rebuilt only when (theme, accent) changes. Surfaces themselves are dropped
+//! by main.rs when their window hides — the GPU stack is the RAM cost.
 //!
 //! Visuals follow the Fluent type ramp and 4px spacing grid.
 
@@ -38,6 +43,7 @@ pub struct SettingsView {
     pub autostart: bool,
     pub poll_secs: u32,
     pub hover: i32, // card index, -1 = none
+    pub focus: i32, // keyboard focus card index, -1 = none
 }
 
 pub const INTERVALS: [(u32, &str); 4] = [(30, "30s"), (60, "1m"), (120, "2m"), (300, "5m")];
@@ -94,7 +100,7 @@ pub const SET_W: f32 = 400.0;
 const SET_PAD: f32 = 24.0;
 const CARD_H: f32 = 56.0;
 const CARD_GAP: f32 = 4.0;
-const N_CARDS: usize = 5;
+pub const N_CARDS: usize = 5;
 
 pub fn settings_height() -> f32 {
     let cards = N_CARDS as f32 * CARD_H + (N_CARDS as f32 - 1.0) * CARD_GAP;
@@ -126,16 +132,46 @@ pub fn interval_pills(card: &D2D_RECT_F) -> [D2D_RECT_F; 4] {
     out
 }
 
+// ---------- cached brushes ----------
+
+struct BrushCache {
+    key: (bool, (u8, u8, u8)),
+    text: ID2D1SolidColorBrush,
+    dim: ID2D1SolidColorBrush,
+    track: ID2D1SolidColorBrush,
+    divider: ID2D1SolidColorBrush,
+    stroke: ID2D1SolidColorBrush,
+    card_bg: ID2D1SolidColorBrush,
+    card_hover: ID2D1SolidColorBrush,
+    card_stroke: ID2D1SolidColorBrush,
+    control_fill: ID2D1SolidColorBrush,
+    control_hover: ID2D1SolidColorBrush,
+    control_stroke: ID2D1SolidColorBrush,
+    strong_stroke: ID2D1SolidColorBrush,
+    accent: ID2D1SolidColorBrush,
+    amber: ID2D1SolidColorBrush,
+    red: ID2D1SolidColorBrush,
+    white: ID2D1SolidColorBrush,
+}
+
+const AMBER: (u8, u8, u8) = (255, 185, 0);
+const RED: (u8, u8, u8) = (232, 17, 35);
+
 // ---------- gfx stack ----------
 
 pub struct Surface {
     swap: IDXGISwapChain1,
     dc: ID2D1DeviceContext,
-    dwrite: IDWriteFactory,
+    rt: ID2D1RenderTarget,
     _dcomp: IDCompositionDevice,
     _target: IDCompositionTarget,
     _visual: IDCompositionVisual,
     target_bmp: Option<ID2D1Bitmap1>,
+    fmt_body: IDWriteTextFormat,
+    fmt_body_sb: IDWriteTextFormat,
+    fmt_caption: IDWriteTextFormat,
+    fmt_glyph: IDWriteTextFormat,
+    brushes: Option<BrushCache>,
     w: u32,
     h: u32,
 }
@@ -143,10 +179,14 @@ pub struct Surface {
 impl Surface {
     pub fn new(hwnd: HWND) -> Result<Self> {
         unsafe {
+            // WARP, not hardware: the HW driver's user-mode heaps cost ~40 MB
+            // private and survive device release. WARP rasterizes our tiny
+            // ~330px surface on CPU in microseconds, DWM still composes the
+            // result on the GPU, and private RAM stays low.
             let mut d3d: Option<ID3D11Device> = None;
             D3D11CreateDevice(
                 None,
-                D3D_DRIVER_TYPE_HARDWARE,
+                D3D_DRIVER_TYPE_WARP,
                 HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 None,
@@ -177,6 +217,7 @@ impl Surface {
             let d2df: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let d2ddev = d2df.CreateDevice(&dxgi_dev)?;
             let dc = d2ddev.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+            let rt: ID2D1RenderTarget = dc.cast()?; // single QI, reused for brush creation
 
             let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_dev)?;
             let target = dcomp.CreateTargetForHwnd(hwnd, true)?;
@@ -186,15 +227,35 @@ impl Surface {
             dcomp.Commit()?;
 
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let mk = |family: PCWSTR, size: f32, weight: DWRITE_FONT_WEIGHT| -> Result<IDWriteTextFormat> {
+                dwrite.CreateTextFormat(
+                    family,
+                    None,
+                    weight,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    size,
+                    w!("en-us"),
+                )
+            };
+            let fmt_body = mk(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_NORMAL)?;
+            let fmt_body_sb = mk(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+            let fmt_caption = mk(w!("Segoe UI Variable Small"), SIZE_CAPTION, DWRITE_FONT_WEIGHT_NORMAL)?;
+            let fmt_glyph = mk(w!("Segoe Fluent Icons"), 13.0, DWRITE_FONT_WEIGHT_NORMAL)?;
 
             Ok(Self {
                 swap,
                 dc,
-                dwrite,
+                rt,
                 _dcomp: dcomp,
                 _target: target,
                 _visual: visual,
                 target_bmp: None,
+                fmt_body,
+                fmt_body_sb,
+                fmt_caption,
+                fmt_glyph,
+                brushes: None,
                 w: 0,
                 h: 0,
             })
@@ -232,6 +293,51 @@ impl Surface {
         }
     }
 
+    fn ensure_brushes(&mut self, dark: bool, accent: (u8, u8, u8)) -> Result<()> {
+        let key = (dark, accent);
+        if self.brushes.as_ref().map(|b| b.key) == Some(key) {
+            return Ok(());
+        }
+        let p = Palette::new(dark, accent);
+        let mk = |c: D2D1_COLOR_F| -> Result<ID2D1SolidColorBrush> {
+            unsafe { self.rt.CreateSolidColorBrush(&c, None) }
+        };
+        self.brushes = Some(BrushCache {
+            key,
+            text: mk(p.text)?,
+            dim: mk(p.dim)?,
+            track: mk(p.track)?,
+            divider: mk(p.divider)?,
+            stroke: mk(p.stroke)?,
+            card_bg: mk(p.card_bg)?,
+            card_hover: mk(p.card_hover)?,
+            card_stroke: mk(p.card_stroke)?,
+            control_fill: mk(p.control_fill)?,
+            control_hover: mk(p.control_hover)?,
+            control_stroke: mk(p.control_stroke)?,
+            strong_stroke: mk(p.strong_stroke)?,
+            accent: mk(col_rgb(accent, 1.0))?,
+            amber: mk(col_rgb(AMBER, 1.0))?,
+            red: mk(col_rgb(RED, 1.0))?,
+            white: mk(col(1.0, 1.0, 1.0, 1.0))?,
+        });
+        Ok(())
+    }
+
+    fn cache(&self) -> &BrushCache {
+        self.brushes.as_ref().expect("ensure_brushes called first")
+    }
+
+    /// severity → cached fill brush (accent / amber / red)
+    fn sev_brush<'a>(&'a self, severity: &str, percent: f64) -> &'a ID2D1SolidColorBrush {
+        let b = self.cache();
+        match util::severity_rgb(severity, percent, b.key.1) {
+            AMBER => &b.amber,
+            RED => &b.red,
+            _ => &b.accent,
+        }
+    }
+
     // ---------- flyout ----------
 
     #[allow(clippy::too_many_arguments)]
@@ -244,38 +350,38 @@ impl Surface {
         dark: bool,
         accent: (u8, u8, u8),
         hover: FlyHover,
+        focus: i32,
         fetching: bool,
         note: Option<&str>,
     ) -> Result<()> {
         self.ensure_size(w_px.max(8), h_px.max(8), dpi)?;
+        self.ensure_brushes(dark, accent)?;
         unsafe {
             self.dc.BeginDraw();
             self.dc.Clear(None);
 
             let w_dip = FLYOUT_W;
             let h_dip = h_px as f32 / (dpi / 96.0);
-            let pal = Palette::new(dark, accent);
             match view {
-                View::Loading => self.draw_message(&pal, w_dip, "Loading usage…", None)?,
+                View::Loading => self.draw_message(w_dip, "Loading usage…", None)?,
                 View::Error(msg) => {
                     let mut lines = msg.splitn(2, '\n');
                     let head = lines.next().unwrap_or("Can't load usage");
                     let rest = lines.next();
-                    self.draw_message(&pal, w_dip, head, rest)?
+                    self.draw_message(w_dip, head, rest)?
                 }
-                View::Data(snap) => self.draw_data(&pal, w_dip, snap, note)?,
+                View::Data(snap) => self.draw_data(w_dip, snap, note)?,
             }
 
-            self.draw_header_buttons(&pal, hover, fetching)?;
+            self.draw_header_buttons(hover, focus, fetching)?;
 
             // 1px flyout surface stroke inside the DWM rounded corners
-            let stroke = self.brush(pal.stroke)?;
             let rr = D2D1_ROUNDED_RECT {
                 rect: rect(0.5, 0.5, w_dip - 0.5, h_dip - 0.5),
                 radiusX: 7.5,
                 radiusY: 7.5,
             };
-            self.dc.DrawRoundedRectangle(&rr, &stroke, 1.0, None);
+            self.dc.DrawRoundedRectangle(&rr, &self.cache().stroke, 1.0, None);
 
             self.dc.EndDraw(None, None)?;
             self.swap.Present(1, DXGI_PRESENT(0)).ok()?;
@@ -283,83 +389,60 @@ impl Surface {
         Ok(())
     }
 
-    fn draw_header_buttons(&self, pal: &Palette, hover: FlyHover, fetching: bool) -> Result<()> {
+    fn draw_header_buttons(&self, hover: FlyHover, focus: i32, fetching: bool) -> Result<()> {
         let (r_refresh, r_gear) = fly_btns();
-        let hover_bg = self.brush(pal.control_hover)?;
+        let b = self.cache();
         if hover == FlyHover::Refresh {
-            self.rounded(r_refresh, 4.0, &hover_bg)?;
+            self.rounded(r_refresh, 4.0, &b.control_hover)?;
         }
         if hover == FlyHover::Gear {
-            self.rounded(r_gear, 4.0, &hover_bg)?;
+            self.rounded(r_gear, 4.0, &b.control_hover)?;
         }
-        let refresh_brush = self.brush(if fetching { pal.dim } else { pal.text })?;
-        let gear_brush = self.brush(pal.text)?;
-        self.glyph("\u{E72C}", r_refresh, &refresh_brush)?; // Refresh (dim = in flight)
-        self.glyph("\u{E713}", r_gear, &gear_brush)?; // Settings
+        let refresh_brush = if fetching { &b.dim } else { &b.text };
+        self.glyph("\u{E72C}", r_refresh, refresh_brush)?; // Refresh (dim = in flight)
+        self.glyph("\u{E713}", r_gear, &b.text)?; // Settings
+        match focus {
+            0 => self.focus_ring(r_refresh, 4.0)?,
+            1 => self.focus_ring(r_gear, 4.0)?,
+            _ => {}
+        }
         Ok(())
     }
 
-    fn glyph(&self, s: &str, r: D2D_RECT_F, brush: &ID2D1SolidColorBrush) -> Result<()> {
-        unsafe {
-            let f = self.fmt(w!("Segoe Fluent Icons"), 13.0, DWRITE_FONT_WEIGHT_NORMAL)?;
-            f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            let wide: Vec<u16> = s.encode_utf16().collect();
-            self.dc.DrawText(
-                &wide,
-                &f,
-                &r,
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-            Ok(())
-        }
-    }
+    fn draw_data(&self, w: f32, snap: &UsageSnapshot, note: Option<&str>) -> Result<()> {
+        let b = self.cache();
 
-    fn draw_data(&self, pal: &Palette, w: f32, snap: &UsageSnapshot, note: Option<&str>) -> Result<()> {
-        let text = self.brush(pal.text)?;
-        let dim = self.brush(pal.dim)?;
-        let track = self.brush(pal.track)?;
-        let divider = self.brush(pal.divider)?;
-
-        let title_fmt = self.fmt(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
-        let caption_fmt = self.fmt(w!("Segoe UI Variable Small"), SIZE_CAPTION, DWRITE_FONT_WEIGHT_NORMAL)?;
-        self.text("Claude", &title_fmt, rect(PAD, PAD, w - PAD, PAD + TITLE_H), &text, false)?;
-
-        let label_fmt = self.fmt(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_NORMAL)?;
-        let pct_fmt = self.fmt(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+        self.text("Claude", &self.fmt_body_sb, rect(PAD, PAD, w - PAD, PAD + TITLE_H), &b.text, false)?;
 
         let mut y = PAD + TITLE_H + SECTION_GAP;
         for (i, row) in snap.rows.iter().enumerate() {
             if i > 0 {
                 y += ROW_GAP;
             }
-            let fill_rgb = util::severity_rgb(&row.severity, row.percent, pal.accent_rgb);
-            let fill = self.brush(col_rgb(fill_rgb, 1.0))?;
+            let fill = self.sev_brush(&row.severity, row.percent);
 
-            self.text(&row.label, &label_fmt, rect(PAD, y, w - PAD - 56.0, y + LABEL_H), &text, false)?;
+            self.text(&row.label, &self.fmt_body, rect(PAD, y, w - PAD - 56.0, y + LABEL_H), &b.text, false)?;
             let pct_str = format!("{:.0}%", row.percent);
-            self.text(&pct_str, &pct_fmt, rect(w - PAD - 56.0, y, w - PAD, y + LABEL_H), &text, true)?;
+            self.text(&pct_str, &self.fmt_body_sb, rect(w - PAD - 56.0, y, w - PAD, y + LABEL_H), &b.text, true)?;
 
             let bar_y = y + LABEL_H + GAP;
             let bar_w = w - 2.0 * PAD;
-            self.rounded(rect(PAD, bar_y, PAD + bar_w, bar_y + BAR_H), BAR_H / 2.0, &track)?;
+            self.rounded(rect(PAD, bar_y, PAD + bar_w, bar_y + BAR_H), BAR_H / 2.0, &b.track)?;
             let frac = (row.percent / 100.0).clamp(0.0, 1.0) as f32;
             if frac > 0.005 {
                 let fw = (bar_w * frac).max(BAR_H);
-                self.rounded(rect(PAD, bar_y, PAD + fw, bar_y + BAR_H), BAR_H / 2.0, &fill)?;
+                self.rounded(rect(PAD, bar_y, PAD + fw, bar_y + BAR_H), BAR_H / 2.0, fill)?;
             }
 
             if !row.reset_text.is_empty() {
                 let cap_y = bar_y + BAR_H + GAP;
-                self.text(&row.reset_text, &caption_fmt, rect(PAD, cap_y, w - PAD, cap_y + CAPTION_H), &dim, false)?;
+                self.text(&row.reset_text, &self.fmt_caption, rect(PAD, cap_y, w - PAD, cap_y + CAPTION_H), &b.dim, false)?;
             }
             y += ROW_BLOCK;
         }
 
         let div_y = y + FOOTER_GAP_ABOVE;
-        self.fill(rect(PAD, div_y, w - PAD, div_y + 1.0), &divider);
+        self.fill(rect(PAD, div_y, w - PAD, div_y + 1.0), &b.divider);
         let foot_y = div_y + 1.0 + FOOTER_GAP_BELOW;
         let mut footer = format!("Updated {}", relative_time(snap.fetched_unix));
         if let Some(n) = note {
@@ -367,18 +450,15 @@ impl Surface {
         } else if !snap.plan.is_empty() {
             footer.push_str(&format!(" · {}", snap.plan));
         }
-        self.text(&footer, &caption_fmt, rect(PAD, foot_y, w - PAD, foot_y + CAPTION_H), &dim, false)?;
+        self.text(&footer, &self.fmt_caption, rect(PAD, foot_y, w - PAD, foot_y + CAPTION_H), &b.dim, false)?;
         Ok(())
     }
 
-    fn draw_message(&self, pal: &Palette, w: f32, head: &str, body: Option<&str>) -> Result<()> {
-        let text = self.brush(pal.text)?;
-        let dim = self.brush(pal.dim)?;
-        let h_fmt = self.fmt(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
-        let b_fmt = self.fmt(w!("Segoe UI Variable Small"), SIZE_CAPTION, DWRITE_FONT_WEIGHT_NORMAL)?;
-        self.text(head, &h_fmt, rect(PAD, PAD + 8.0, w - PAD, PAD + 28.0), &text, false)?;
-        if let Some(b) = body {
-            self.text(b, &b_fmt, rect(PAD, PAD + 36.0, w - PAD, 108.0), &dim, false)?;
+    fn draw_message(&self, w: f32, head: &str, body: Option<&str>) -> Result<()> {
+        let b = self.cache();
+        self.text(head, &self.fmt_body_sb, rect(PAD, PAD + 8.0, w - PAD, PAD + 28.0), &b.text, false)?;
+        if let Some(t) = body {
+            self.text(t, &self.fmt_caption, rect(PAD, PAD + 36.0, w - PAD, 108.0), &b.dim, false)?;
         }
         Ok(())
     }
@@ -395,17 +475,10 @@ impl Surface {
         accent: (u8, u8, u8),
     ) -> Result<()> {
         self.ensure_size(w_px.max(8), h_px.max(8), dpi)?;
+        self.ensure_brushes(dark, accent)?;
         unsafe {
             self.dc.BeginDraw();
             self.dc.Clear(None); // Mica shows through
-
-            let pal = Palette::new(dark, accent);
-            let text = self.brush(pal.text)?;
-            let dim = self.brush(pal.dim)?;
-            let card_stroke = self.brush(pal.card_stroke)?;
-
-            let body_fmt = self.fmt(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_NORMAL)?;
-            let caption_fmt = self.fmt(w!("Segoe UI Variable Small"), SIZE_CAPTION, DWRITE_FONT_WEIGHT_NORMAL)?;
 
             let labels = [
                 "Caps Lock light shows Claude status",
@@ -416,39 +489,41 @@ impl Surface {
             ];
             let cards = settings_rects();
             for (i, card) in cards.iter().enumerate() {
-                let bg = self.brush(if st.hover == i as i32 {
-                    pal.card_hover
-                } else {
-                    pal.card_bg
-                })?;
-                self.rounded(*card, 4.0, &bg)?;
+                let b = self.cache();
+                let bg = if st.hover == i as i32 { &b.card_hover } else { &b.card_bg };
+                self.rounded(*card, 4.0, bg)?;
                 let rr = D2D1_ROUNDED_RECT {
                     rect: rect(card.left + 0.5, card.top + 0.5, card.right - 0.5, card.bottom - 0.5),
                     radiusX: 3.5,
                     radiusY: 3.5,
                 };
-                self.dc.DrawRoundedRectangle(&rr, &card_stroke, 1.0, None);
+                self.dc.DrawRoundedRectangle(&rr, &b.card_stroke, 1.0, None);
 
                 let label_right = if i == 2 { card.right - 200.0 } else { card.right - 120.0 };
-                self.text_v(labels[i], &body_fmt, rect(card.left + 16.0, card.top, label_right, card.bottom), &text)?;
+                self.text_v(labels[i], &self.fmt_body, rect(card.left + 16.0, card.top, label_right, card.bottom), &b.text)?;
 
                 let cy = (card.top + card.bottom) / 2.0;
                 match i {
-                    0 => self.toggle(card.right - 16.0, cy, st.caps_on, &pal)?,
-                    1 => self.toggle(card.right - 16.0, cy, st.autostart, &pal)?,
-                    2 => self.interval_row(card, st.poll_secs, &pal)?,
-                    3 => self.button(card.right - 16.0, cy, "Refresh", &pal)?,
-                    4 => self.button(card.right - 16.0, cy, "Quit", &pal)?,
+                    0 => self.toggle(card.right - 16.0, cy, st.caps_on)?,
+                    1 => self.toggle(card.right - 16.0, cy, st.autostart)?,
+                    2 => self.interval_row(card, st.poll_secs)?,
+                    3 => self.button(card.right - 16.0, cy, "Refresh")?,
+                    4 => self.button(card.right - 16.0, cy, "Quit")?,
                     _ => {}
+                }
+
+                if st.focus == i as i32 {
+                    self.focus_ring(*card, 4.0)?;
                 }
             }
 
+            let b = self.cache();
             let foot_y = cards[N_CARDS - 1].bottom + 12.0;
             self.text(
                 &format!("Claudometer {} · data from api.anthropic.com", env!("CARGO_PKG_VERSION")),
-                &caption_fmt,
+                &self.fmt_caption,
                 rect(SET_PAD, foot_y, SET_W - SET_PAD, foot_y + CAPTION_H),
-                &dim,
+                &b.dim,
                 false,
             )?;
 
@@ -459,40 +534,34 @@ impl Surface {
     }
 
     /// Segmented interval pills (SelectorBar-style), selected = accent
-    fn interval_row(&self, card: &D2D_RECT_F, poll_secs: u32, pal: &Palette) -> Result<()> {
+    fn interval_row(&self, card: &D2D_RECT_F, poll_secs: u32) -> Result<()> {
         unsafe {
             let pills = interval_pills(card);
-            let f = self.fmt(w!("Segoe UI Variable Small"), SIZE_CAPTION, DWRITE_FONT_WEIGHT_NORMAL)?;
+            let b = self.cache();
+            let f = &self.fmt_caption;
             f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             for (i, pill) in pills.iter().enumerate() {
                 let (secs, label) = INTERVALS[i];
                 let selected = secs == poll_secs;
                 if selected {
-                    let bg = self.brush(col_rgb(pal.accent_rgb, 1.0))?;
-                    self.rounded(*pill, 12.0, &bg)?;
+                    self.rounded(*pill, 12.0, &b.accent)?;
                 } else {
-                    let bg = self.brush(pal.control_fill)?;
-                    self.rounded(*pill, 12.0, &bg)?;
-                    let stroke = self.brush(pal.control_stroke)?;
+                    self.rounded(*pill, 12.0, &b.control_fill)?;
                     let rr = D2D1_ROUNDED_RECT {
                         rect: rect(pill.left + 0.5, pill.top + 0.5, pill.right - 0.5, pill.bottom - 0.5),
                         radiusX: 11.5,
                         radiusY: 11.5,
                     };
-                    self.dc.DrawRoundedRectangle(&rr, &stroke, 1.0, None);
+                    self.dc.DrawRoundedRectangle(&rr, &b.control_stroke, 1.0, None);
                 }
-                let brush = if selected {
-                    self.brush(col(1.0, 1.0, 1.0, 1.0))? // TextOnAccent
-                } else {
-                    self.brush(pal.text)?
-                };
+                let brush = if selected { &b.white } else { &b.text };
                 let wide: Vec<u16> = label.encode_utf16().collect();
                 self.dc.DrawText(
                     &wide,
-                    &f,
+                    f,
                     pill,
-                    &brush,
+                    brush,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
@@ -502,61 +571,57 @@ impl Surface {
     }
 
     /// Fluent ToggleSwitch, right-aligned at (right_edge, cy)
-    fn toggle(&self, right_edge: f32, cy: f32, on: bool, pal: &Palette) -> Result<()> {
+    fn toggle(&self, right_edge: f32, cy: f32, on: bool) -> Result<()> {
         unsafe {
+            let b = self.cache();
             let w = 40.0;
             let h = 20.0;
             let r = rect(right_edge - w, cy - h / 2.0, right_edge, cy + h / 2.0);
             if on {
-                let fill = self.brush(col_rgb(pal.accent_rgb, 1.0))?;
-                self.rounded(r, h / 2.0, &fill)?;
-                let knob = self.brush(col(1.0, 1.0, 1.0, 1.0))?;
+                self.rounded(r, h / 2.0, &b.accent)?;
                 let e = D2D1_ELLIPSE {
                     point: D2D_POINT_2F { x: r.right - 10.0, y: cy },
                     radiusX: 7.0,
                     radiusY: 7.0,
                 };
-                self.dc.FillEllipse(&e, &knob);
+                self.dc.FillEllipse(&e, &b.white);
             } else {
-                let stroke = self.brush(pal.strong_stroke)?;
                 let rr = D2D1_ROUNDED_RECT { rect: r, radiusX: h / 2.0, radiusY: h / 2.0 };
-                self.dc.DrawRoundedRectangle(&rr, &stroke, 1.0, None);
+                self.dc.DrawRoundedRectangle(&rr, &b.strong_stroke, 1.0, None);
                 let e = D2D1_ELLIPSE {
                     point: D2D_POINT_2F { x: r.left + 10.0, y: cy },
                     radiusX: 6.0,
                     radiusY: 6.0,
                 };
-                self.dc.FillEllipse(&e, &stroke);
+                self.dc.FillEllipse(&e, &b.strong_stroke);
             }
             Ok(())
         }
     }
 
     /// Fluent standard button, right-aligned at (right_edge, cy)
-    fn button(&self, right_edge: f32, cy: f32, label: &str, pal: &Palette) -> Result<()> {
+    fn button(&self, right_edge: f32, cy: f32, label: &str) -> Result<()> {
         unsafe {
+            let b = self.cache();
             let w = 84.0;
             let h = 32.0;
             let r = rect(right_edge - w, cy - h / 2.0, right_edge, cy + h / 2.0);
-            let bg = self.brush(pal.control_fill)?;
-            self.rounded(r, 4.0, &bg)?;
-            let stroke = self.brush(pal.control_stroke)?;
+            self.rounded(r, 4.0, &b.control_fill)?;
             let rr = D2D1_ROUNDED_RECT {
                 rect: rect(r.left + 0.5, r.top + 0.5, r.right - 0.5, r.bottom - 0.5),
                 radiusX: 3.5,
                 radiusY: 3.5,
             };
-            self.dc.DrawRoundedRectangle(&rr, &stroke, 1.0, None);
-            let f = self.fmt(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_NORMAL)?;
+            self.dc.DrawRoundedRectangle(&rr, &b.control_stroke, 1.0, None);
+            let f = &self.fmt_body;
             f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            let brush = self.brush(pal.text)?;
             let wide: Vec<u16> = label.encode_utf16().collect();
             self.dc.DrawText(
                 &wide,
-                &f,
+                f,
                 &r,
-                &brush,
+                &b.text,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
@@ -566,24 +631,34 @@ impl Surface {
 
     // ---------- primitives ----------
 
-    fn brush(&self, c: D2D1_COLOR_F) -> Result<ID2D1SolidColorBrush> {
+    /// Keyboard focus visual: 2px accent outline just outside the target.
+    fn focus_ring(&self, r: D2D_RECT_F, radius: f32) -> Result<()> {
         unsafe {
-            let rt: ID2D1RenderTarget = self.dc.cast()?;
-            rt.CreateSolidColorBrush(&c, None)
+            let rr = D2D1_ROUNDED_RECT {
+                rect: rect(r.left - 3.0, r.top - 3.0, r.right + 3.0, r.bottom + 3.0),
+                radiusX: radius + 3.0,
+                radiusY: radius + 3.0,
+            };
+            self.dc.DrawRoundedRectangle(&rr, &self.cache().accent, 2.0, None);
+            Ok(())
         }
     }
 
-    fn fmt(&self, family: PCWSTR, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
+    fn glyph(&self, s: &str, r: D2D_RECT_F, brush: &ID2D1SolidColorBrush) -> Result<()> {
         unsafe {
-            self.dwrite.CreateTextFormat(
-                family,
-                None,
-                weight,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                size,
-                w!("en-us"),
-            )
+            let f = &self.fmt_glyph;
+            f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            let wide: Vec<u16> = s.encode_utf16().collect();
+            self.dc.DrawText(
+                &wide,
+                f,
+                &r,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+            Ok(())
         }
     }
 
@@ -667,11 +742,10 @@ struct Palette {
     control_hover: D2D1_COLOR_F,
     control_stroke: D2D1_COLOR_F,
     strong_stroke: D2D1_COLOR_F,
-    accent_rgb: (u8, u8, u8),
 }
 
 impl Palette {
-    fn new(dark: bool, accent: (u8, u8, u8)) -> Self {
+    fn new(dark: bool, _accent: (u8, u8, u8)) -> Self {
         if dark {
             Self {
                 text: col(1.0, 1.0, 1.0, 1.0),
@@ -686,7 +760,6 @@ impl Palette {
                 control_hover: col(1.0, 1.0, 1.0, 0.084),
                 control_stroke: col(1.0, 1.0, 1.0, 0.07),
                 strong_stroke: col(1.0, 1.0, 1.0, 0.544),
-                accent_rgb: accent,
             }
         } else {
             Self {
@@ -702,7 +775,6 @@ impl Palette {
                 control_hover: col(0.0, 0.0, 0.0, 0.037),
                 control_stroke: col(0.0, 0.0, 0.0, 0.058),
                 strong_stroke: col(0.0, 0.0, 0.0, 0.446),
-                accent_rgb: accent,
             }
         }
     }

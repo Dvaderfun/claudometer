@@ -24,7 +24,8 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
+    GetKeyState, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_LEFT, VK_RETURN,
+    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB,
 };
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -66,6 +67,8 @@ struct Ui {
     set: Option<gfx::Surface>,
     fly_hover: gfx::FlyHover,
     set_hover: i32,
+    fly_focus: i32, // keyboard focus: -1 none, 0 refresh, 1 gear
+    set_focus: i32, // keyboard focus card index, -1 none
     fly_tracking: bool,
     set_tracking: bool,
 }
@@ -77,6 +80,8 @@ thread_local! {
             set: None,
             fly_hover: gfx::FlyHover::None,
             set_hover: -1,
+            fly_focus: -1,
+            set_focus: -1,
             fly_tracking: false,
             set_tracking: false,
         })
@@ -141,13 +146,18 @@ fn main() -> Result<()> {
         FLYOUT_HWND.store(flyout.0 as isize, Ordering::SeqCst);
         style_flyout(flyout);
 
-        // settings window class (window created lazily)
+        // settings window class (window created lazily); icon = embedded resource id 1
+        // MAKEINTRESOURCE(1): the resource id is smuggled through the pointer
+        // value — clippy's `dangling::<u16>()` would be address 2, wrong id.
+        #[allow(clippy::manual_dangling_ptr)]
+        let app_icon = LoadIconW(hinst, PCWSTR(1usize as *const u16)).unwrap_or_default();
         let scls = w!("Claudometer.Settings");
         let swc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(settings_wndproc),
             hInstance: hinst,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hIcon: app_icon,
             lpszClassName: scls,
             ..Default::default()
         };
@@ -156,7 +166,7 @@ fn main() -> Result<()> {
         add_tray_icon(main);
         POLL_SECS.store(util::load_poll_secs(), Ordering::SeqCst);
         SetTimer(main, TIMER_POLL, POLL_SECS.load(Ordering::SeqCst) * 1000, None);
-        SetTimer(main, TIMER_TICK, 30_000, None);
+        // TIMER_TICK runs only while the flyout is visible (started in show_flyout)
         spawn_fetch();
 
         let mut msg = MSG::default();
@@ -208,16 +218,20 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 LRESULT(0)
             }
             WM_SETTINGCHANGE => {
-                update_tray(hwnd);
-                apply_flyout_theme(flyout_hwnd());
-                if IsWindowVisible(flyout_hwnd()).as_bool() {
-                    show_flyout(ANCHOR_X.load(Ordering::SeqCst), ANCHOR_Y.load(Ordering::SeqCst));
-                }
-                let sh = settings_hwnd();
-                if !sh.is_invalid() {
-                    apply_settings_theme(sh);
-                    if IsWindowVisible(sh).as_bool() {
-                        render_settings(sh);
+                // React only to theme/accent broadcasts — wallpaper changes and
+                // random SPI updates also land here and are noise.
+                if setting_change_is_theme(lparam) {
+                    update_tray(hwnd);
+                    apply_flyout_theme(flyout_hwnd());
+                    if IsWindowVisible(flyout_hwnd()).as_bool() {
+                        show_flyout(ANCHOR_X.load(Ordering::SeqCst), ANCHOR_Y.load(Ordering::SeqCst));
+                    }
+                    let sh = settings_hwnd();
+                    if !sh.is_invalid() {
+                        apply_settings_theme(sh);
+                        if IsWindowVisible(sh).as_bool() {
+                            render_settings(sh);
+                        }
                     }
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -242,12 +256,33 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         match msg {
             WM_ACTIVATE => {
                 if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    hide_flyout();
                 }
                 LRESULT(0)
             }
-            WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+            WM_KEYDOWN => {
+                let vk = wparam.0 as u16;
+                if vk == VK_ESCAPE.0 {
+                    hide_flyout();
+                } else if vk == VK_TAB.0 {
+                    UI.with(|ui| {
+                        let mut ui = ui.borrow_mut();
+                        ui.fly_focus = if ui.fly_focus == 0 { 1 } else { 0 };
+                    });
+                    render_flyout_current();
+                } else if vk == VK_RETURN.0 || vk == VK_SPACE.0 {
+                    match UI.with(|ui| ui.borrow().fly_focus) {
+                        0 => {
+                            spawn_fetch();
+                            render_flyout_current();
+                        }
+                        1 => {
+                            hide_flyout();
+                            open_settings();
+                        }
+                        _ => {}
+                    }
+                }
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
@@ -289,7 +324,7 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         render_flyout_current(); // spinner starts immediately
                     }
                     gfx::FlyHover::Gear => {
-                        let _ = ShowWindow(hwnd, SW_HIDE);
+                        hide_flyout();
                         open_settings();
                     }
                     gfx::FlyHover::None => {}
@@ -341,37 +376,57 @@ extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             }
             WM_LBUTTONUP => {
                 let (x, y) = mouse_dip(hwnd, lparam);
-                match settings_hit(x, y) {
-                    0 => util::set_caps_led_enabled(!util::caps_led_enabled()),
-                    1 => util::set_autostart(!util::autostart_enabled()),
-                    2 => {
-                        let cards = gfx::settings_rects();
-                        let pills = gfx::interval_pills(&cards[2]);
-                        if let Some(i) = pills.iter().position(|r| contains(r, x, y)) {
-                            let secs = gfx::INTERVALS[i].0;
-                            POLL_SECS.store(secs, Ordering::SeqCst);
-                            util::save_poll_secs(secs);
-                            let mh = HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _);
-                            let _ = KillTimer(mh, TIMER_POLL);
-                            SetTimer(mh, TIMER_POLL, secs * 1000, None);
-                        }
-                    }
-                    3 => spawn_fetch(),
-                    4 => {
-                        let _ = DestroyWindow(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
-                        return LRESULT(0);
-                    }
-                    _ => {}
+                let hit = settings_hit(x, y);
+                if hit >= 0 {
+                    UI.with(|ui| ui.borrow_mut().set_focus = hit); // focus follows click
                 }
-                render_settings(hwnd);
+                if hit == 2 {
+                    // pill click selects the interval directly
+                    let cards = gfx::settings_rects();
+                    let pills = gfx::interval_pills(&cards[2]);
+                    if let Some(i) = pills.iter().position(|r| contains(r, x, y)) {
+                        apply_interval(gfx::INTERVALS[i].0);
+                    }
+                    render_settings(hwnd);
+                } else if hit >= 0 {
+                    activate_settings_card(hwnd, hit as usize);
+                }
                 LRESULT(0)
             }
-            WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+            WM_KEYDOWN => {
+                let vk = wparam.0 as u16;
+                if vk == VK_ESCAPE.0 {
+                    hide_settings(hwnd);
+                } else if vk == VK_TAB.0 {
+                    let back = GetKeyState(VK_SHIFT.0 as i32) < 0;
+                    UI.with(|ui| {
+                        let mut ui = ui.borrow_mut();
+                        let n = gfx::N_CARDS as i32;
+                        ui.set_focus = if ui.set_focus < 0 {
+                            if back { n - 1 } else { 0 }
+                        } else if back {
+                            (ui.set_focus - 1 + n) % n
+                        } else {
+                            (ui.set_focus + 1) % n
+                        };
+                    });
+                    render_settings(hwnd);
+                } else if vk == VK_LEFT.0 || vk == VK_RIGHT.0 {
+                    if UI.with(|ui| ui.borrow().set_focus) == 2 {
+                        let dir = if vk == VK_LEFT.0 { -1 } else { 1 };
+                        step_interval(dir);
+                        render_settings(hwnd);
+                    }
+                } else if vk == VK_RETURN.0 || vk == VK_SPACE.0 {
+                    let f = UI.with(|ui| ui.borrow().set_focus);
+                    if f >= 0 {
+                        activate_settings_card(hwnd, f as usize);
+                    }
+                }
                 LRESULT(0)
             }
             WM_CLOSE => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+                hide_settings(hwnd);
                 LRESULT(0)
             }
             WM_DPICHANGED => {
@@ -395,6 +450,73 @@ extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
+}
+
+// ---------- visibility + resource lifecycle ----------
+
+unsafe fn setting_change_is_theme(lparam: LPARAM) -> bool {
+    let p = lparam.0 as *const u16;
+    if p.is_null() {
+        return false;
+    }
+    let mut len = 0usize;
+    while len < 64 && *p.add(len) != 0 {
+        len += 1;
+    }
+    let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+    s == "ImmersiveColorSet"
+}
+
+/// Hide the flyout AND drop its whole D3D/D2D/DComp stack — the GPU runtime
+/// costs ~40 MB private while resident. Recreated lazily on next show (~10ms).
+unsafe fn hide_flyout() {
+    let fh = flyout_hwnd();
+    let _ = ShowWindow(fh, SW_HIDE);
+    let _ = KillTimer(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _), TIMER_TICK);
+    UI.with(|ui| ui.borrow_mut().fly = None);
+}
+
+/// Same deal for the settings window.
+unsafe fn hide_settings(hwnd: HWND) {
+    let _ = ShowWindow(hwnd, SW_HIDE);
+    UI.with(|ui| ui.borrow_mut().set = None);
+}
+
+// ---------- settings actions (shared by mouse + keyboard) ----------
+
+unsafe fn apply_interval(secs: u32) {
+    POLL_SECS.store(secs, Ordering::SeqCst);
+    util::save_poll_secs(secs);
+    let mh = HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _);
+    let _ = KillTimer(mh, TIMER_POLL);
+    SetTimer(mh, TIMER_POLL, secs * 1000, None);
+}
+
+unsafe fn step_interval(dir: i32) {
+    let cur = POLL_SECS.load(Ordering::SeqCst);
+    let idx = gfx::INTERVALS.iter().position(|(s, _)| *s == cur).unwrap_or(1) as i32;
+    let next = (idx + dir).clamp(0, gfx::INTERVALS.len() as i32 - 1) as usize;
+    apply_interval(gfx::INTERVALS[next].0);
+}
+
+unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
+    match i {
+        0 => util::set_caps_led_enabled(!util::caps_led_enabled()),
+        1 => util::set_autostart(!util::autostart_enabled()),
+        2 => {
+            // keyboard activate on the interval card: cycle to the next option
+            let cur = POLL_SECS.load(Ordering::SeqCst);
+            let idx = gfx::INTERVALS.iter().position(|(s, _)| *s == cur).unwrap_or(1);
+            apply_interval(gfx::INTERVALS[(idx + 1) % gfx::INTERVALS.len()].0);
+        }
+        3 => spawn_fetch(),
+        4 => {
+            let _ = DestroyWindow(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
+            return;
+        }
+        _ => {}
+    }
+    render_settings(hwnd);
 }
 
 // ---------- hit testing ----------
@@ -491,7 +613,7 @@ fn current_view() -> (gfx::View, Option<String>) {
 unsafe fn toggle_flyout(x: i32, y: i32) {
     let fh = flyout_hwnd();
     if IsWindowVisible(fh).as_bool() {
-        let _ = ShowWindow(fh, SW_HIDE);
+        hide_flyout();
     } else {
         show_flyout(x, y);
     }
@@ -500,6 +622,11 @@ unsafe fn toggle_flyout(x: i32, y: i32) {
 unsafe fn show_flyout(cx: i32, cy: i32) {
     ANCHOR_X.store(cx, Ordering::SeqCst);
     ANCHOR_Y.store(cy, Ordering::SeqCst);
+    UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        ui.fly_hover = gfx::FlyHover::None;
+        ui.fly_focus = -1;
+    });
 
     let stale = LAST_FETCH
         .lock()
@@ -545,6 +672,8 @@ unsafe fn show_flyout(cx: i32, cy: i32) {
     render_flyout(fh, &view, note.as_deref(), w_px as u32, h_px as u32, dpi);
     let _ = ShowWindow(fh, SW_SHOW);
     let _ = SetForegroundWindow(fh);
+    // relative "Updated…" label tick — lives only while visible
+    SetTimer(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _), TIMER_TICK, 30_000, None);
 }
 
 unsafe fn render_flyout(
@@ -564,8 +693,9 @@ unsafe fn render_flyout(
             ui.fly = gfx::Surface::new(fh).ok();
         }
         let hover = ui.fly_hover;
+        let focus = ui.fly_focus;
         if let Some(fx) = ui.fly.as_mut() {
-            let _ = fx.render_flyout(w_px, h_px, dpi, view, dark, accent, hover, fetching, note);
+            let _ = fx.render_flyout(w_px, h_px, dpi, view, dark, accent, hover, focus, fetching, note);
         }
     });
 }
@@ -593,6 +723,7 @@ unsafe fn render_flyout_current() {
 // ---------- settings window ----------
 
 unsafe fn open_settings() {
+    UI.with(|ui| ui.borrow_mut().set_focus = -1);
     let existing = settings_hwnd();
     if !existing.is_invalid() {
         render_settings(existing);
@@ -690,6 +821,7 @@ unsafe fn render_settings(hwnd: HWND) {
             autostart: util::autostart_enabled(),
             poll_secs: POLL_SECS.load(Ordering::SeqCst),
             hover: ui.set_hover,
+            focus: ui.set_focus,
         };
         if let Some(sx) = ui.set.as_mut() {
             let _ = sx.render_settings(
