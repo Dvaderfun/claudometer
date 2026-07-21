@@ -19,7 +19,9 @@ cargo clippy --release         # CI gates on -D warnings — keep zero warnings
 Drive the flyout programmatically: find the hidden window by class `Claudometer.Main` (EnumWindows by pid — `FindWindowW` is flaky), then
 `PostMessageW(hwnd, 0x8001 /* WM_APP+1 */, coords, 0x400 /* NIN_SELECT */)` toggles the flyout. Measure RAM with `(Get-Process claudometer).PrivateMemorySize64`.
 
-Expected budgets: **~3 MB fresh, ~9 MB flyout open (two sections), ~7 MB after close, ~0.02% avg CPU, GDI count stable (~18 once settings was opened)**. A regression here is a bug.
+Toast alerts: `.\target\release\claudometer.exe --test-alert` fires the whole pipeline with fake data; read `%APPDATA%\Claudometer\alert-test.txt` ("ok" or the error). Delivered toasts are queryable from Windows PowerShell 5.1 (not pwsh): `[Windows.UI.Notifications.ToastNotificationManager]::History.GetHistory('Claudometer')` after loading the WinRT type.
+
+Expected budgets: **~3.5 MB fresh, ~9 MB flyout open (two sections), ~7–8.5 MB after close (updater's TLS session adds ~1), ~0.02% avg CPU, GDI count stable (~18 once settings was opened)**. A regression here is a bug.
 
 ## Hard-won gotchas (do not re-learn these)
 
@@ -30,6 +32,9 @@ Expected budgets: **~3 MB fresh, ~9 MB flyout open (two sections), ~7 MB after c
 - **Never refresh either OAuth token.** `api.rs` reads `~/.claude/.credentials.json`, `codex.rs` reads `~/.codex/auth.json` — both strictly read-only. Refresh-token rotation would invalidate the user's Claude Code / Codex CLI session. Expired = tell user to open Claude Code / Codex.
 - **Codex windows aren't positional.** `wham/usage` may deliver the weekly (168 h) window as `primary_window`; kind/label must derive from `limit_window_seconds`, never from primary/secondary position.
 - Tray icon must be re-added on the `TaskbarCreated` broadcast (explorer restart) — already handled, keep it.
+- **Toasts need the AUMID registry key AND a live `ToastNotification` object.** Unpackaged exes toast via `HKCU\Software\Classes\AppUserModelId\Claudometer` (`alerts::init`); the OS routes the `Activated` (click) event through the shown `ToastNotification` — `alerts.rs` keeps recent ones in a thread_local on purpose. `IconUri` must be a real file on disk (ico extracted to `%APPDATA%\Claudometer`), not an exe resource path.
+- Alert dedup is per window instance (`resets_unix`), persisted in settings.json — never key on the formatted `reset_text` ("resets 18:59" recurs daily) and never alert from stale/error-preserved snapshots.
+- **Updater swap relies on Windows allowing a *rename* of the running exe** (delete/overwrite are forbidden): exe → `.old`, new → exe, spawn `--swap-wait`, quit. `--swap-wait` waits on the single-instance mutex (WAIT_ABANDONED = old died = proceed) then deletes the `.old`. Downloaded exe is verified via VERSIONINFO == tag + `certutil -hashfile` vs the `.sha256` release asset — keep release.yml attaching that asset or hash verification silently stops.
 
 ## Conventions
 

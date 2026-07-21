@@ -2,6 +2,17 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [SemVer](https://semver.org/).
 
+## [0.5.0] — 2026-07-21
+
+### Added
+- **Native Windows 11 toast alerts at 75% usage** for every limit window (Claude session/weekly/per-model, Codex session/weekly). Real WinRT toasts via a registry-registered AUMID — no packaging: they persist in Action Center, respect Focus Assist / Do-not-disturb and the per-app switch in Windows notification settings, and show a native progress bar pinned at the worst limit. Clicking the toast opens the flyout at the tray icon.
+- One alert per window *instance*: dedup keys on the raw `resets_at` and is persisted, so neither 1-minute polling nor an app restart repeats an alert; the window rolling over re-arms it. Stale (error-preserved) data never alerts — only fresh fetches.
+- "Alert at 75% usage" toggle in settings (default on). Legacy balloon fallback only if the WinRT path errors; a user-disabled app notification setting is honored, not worked around.
+- `claudometer.exe --test-alert` — fires a fake alert end-to-end (registration → XML → Show), outcome written to `%APPDATA%\Claudometer\alert-test.txt`.
+- Settings cards got leading Segoe Fluent Icons glyphs (Windows 11 Settings row style).
+- **Built-in updater** (About card in settings): checks GitHub Releases once a day (and at launch) in the background; when a newer version exists the card flips to "Update vX.Y.Z available — Install" and the flyout gear gets a quiet accent dot. Install downloads next to the exe, verifies (PE magic, VERSIONINFO == tag, SHA256 via certutil against the release's `.sha256` asset), rename-swaps the running exe, and relaunches — with rollback on failure and "open the release page" as the universal fallback. No update toasts, no nagging, nothing happens without a click.
+- "GitHub" button on the About card opens the project page; release workflow now also attaches `claudometer.exe.sha256`.
+
 ## [0.3.0] — 2026-07-21
 
 ### Added

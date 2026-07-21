@@ -77,6 +77,9 @@ pub struct LimitRow {
     pub severity: String,
     /// e.g. "resets 18:59" / "resets Sat 19:59", empty when unknown
     pub reset_text: String,
+    /// raw reset stamp (unix seconds) — identifies the window *instance*,
+    /// which is what alert dedup keys on
+    pub resets_unix: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -171,39 +174,41 @@ fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
                 }
                 other => prettify(other),
             };
+            let reset_dt = l
+                .resets_at
+                .as_deref()
+                .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
             rows.push(LimitRow {
                 kind,
                 label,
                 percent: pct,
                 severity: l.severity.clone().unwrap_or_default(),
-                reset_text: l.resets_at.as_deref().map(fmt_reset).unwrap_or_default(),
+                reset_text: reset_dt.map(fmt_reset_dt).unwrap_or_default(),
+                resets_unix: reset_dt.map(|d| d.unix_timestamp()),
             });
         }
     }
 
     // Fallback for older response shapes without `limits`
     if rows.is_empty() {
-        if let Some(b) = &parsed.five_hour {
-            if let Some(u) = b.utilization {
-                rows.push(LimitRow {
-                    kind: "session".into(),
-                    label: "Session (5h)".into(),
-                    percent: u,
-                    severity: String::new(),
-                    reset_text: b.resets_at.as_deref().map(fmt_reset).unwrap_or_default(),
-                });
-            }
-        }
-        if let Some(b) = &parsed.seven_day {
-            if let Some(u) = b.utilization {
-                rows.push(LimitRow {
-                    kind: "weekly_all".into(),
-                    label: "Weekly · all models".into(),
-                    percent: u,
-                    severity: String::new(),
-                    reset_text: b.resets_at.as_deref().map(fmt_reset).unwrap_or_default(),
-                });
-            }
+        for (b, kind, label) in [
+            (&parsed.five_hour, "session", "Session (5h)"),
+            (&parsed.seven_day, "weekly_all", "Weekly · all models"),
+        ] {
+            let Some(b) = b else { continue };
+            let Some(u) = b.utilization else { continue };
+            let reset_dt = b
+                .resets_at
+                .as_deref()
+                .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
+            rows.push(LimitRow {
+                kind: kind.into(),
+                label: label.into(),
+                percent: u,
+                severity: String::new(),
+                reset_text: reset_dt.map(fmt_reset_dt).unwrap_or_default(),
+                resets_unix: reset_dt.map(|d| d.unix_timestamp()),
+            });
         }
     }
 
@@ -215,6 +220,7 @@ fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
                 percent: x.utilization.unwrap_or(0.0),
                 severity: String::new(),
                 reset_text: String::new(),
+                resets_unix: None,
             });
         }
     }
@@ -260,14 +266,6 @@ fn local_offset() -> UtcOffset {
     UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC)
 }
 
-/// "resets 18:59" if today (local), otherwise "resets Sat 19:59"
-fn fmt_reset(iso: &str) -> String {
-    let Ok(dt) = OffsetDateTime::parse(iso, &Rfc3339) else {
-        return String::new();
-    };
-    fmt_reset_dt(dt)
-}
-
 /// Same formatting for unix-seconds reset stamps (Codex API shape).
 pub(crate) fn fmt_reset_unix(unix: i64) -> String {
     let Ok(dt) = OffsetDateTime::from_unix_timestamp(unix) else {
@@ -276,6 +274,7 @@ pub(crate) fn fmt_reset_unix(unix: i64) -> String {
     fmt_reset_dt(dt)
 }
 
+/// "resets 18:59" if today (local), otherwise "resets Sat 19:59"
 fn fmt_reset_dt(dt: OffsetDateTime) -> String {
     let local = dt.to_offset(local_offset());
     let today = OffsetDateTime::now_utc().to_offset(local_offset()).date();

@@ -85,9 +85,13 @@ pub fn set_autostart(on: bool) {
 
 // ---------- app config (%APPDATA%\Claudometer\settings.json) ----------
 
-fn config_path() -> Option<std::path::PathBuf> {
+pub fn config_dir() -> Option<std::path::PathBuf> {
     let appdata = std::env::var("APPDATA").ok()?;
-    Some(std::path::Path::new(&appdata).join("Claudometer").join("settings.json"))
+    Some(std::path::Path::new(&appdata).join("Claudometer"))
+}
+
+fn config_path() -> Option<std::path::PathBuf> {
+    Some(config_dir()?.join("settings.json"))
 }
 
 fn read_config() -> serde_json::Value {
@@ -133,6 +137,36 @@ pub fn show_codex() -> bool {
 
 pub fn set_show_codex(on: bool) {
     write_config_field("show_codex", on.into());
+}
+
+/// Toast alerts when a limit window crosses the warn threshold — default on.
+pub fn alerts_enabled() -> bool {
+    read_config()
+        .get("alerts")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(true)
+}
+
+pub fn set_alerts_enabled(on: bool) {
+    write_config_field("alerts", on.into());
+}
+
+/// Alert dedup, persisted so a restart mid-window doesn't re-alert:
+/// map of limit key → `resets_at` epoch that already fired.
+pub fn load_alerted() -> std::collections::HashMap<String, i64> {
+    read_config()
+        .get("alerted")
+        .and_then(|v| v.as_object().cloned())
+        .map(|o| {
+            o.into_iter()
+                .filter_map(|(k, v)| Some((k, v.as_i64()?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn save_alerted(map: &std::collections::HashMap<String, i64>) {
+    write_config_field("alerted", serde_json::json!(map));
 }
 
 // ---------- Caps-LED status hook toggle ----------

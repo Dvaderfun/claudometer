@@ -1,6 +1,6 @@
 [package]
 name = "claudometer"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2021"
 description = "Claude + Codex usage limits in the Windows 11 tray — native Win32 + Direct2D"
 license = "MIT"
@@ -19,8 +19,11 @@ time = { version = "0.3", features = ["parsing", "formatting", "local-offset", "
 [dependencies.windows]
 version = "0.58"
 features = [
+    "Data_Xml_Dom",
+    "Foundation",
     "Foundation_Numerics",
     "UI",
+    "UI_Notifications",
     "UI_ViewManagement",
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
@@ -34,6 +37,7 @@ features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",

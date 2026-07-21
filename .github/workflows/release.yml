@@ -16,8 +16,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release
+      - name: Hash (verified by the in-app updater)
+        run: |
+          $h = (Get-FileHash target/release/claudometer.exe -Algorithm SHA256).Hash.ToLower()
+          "$h *claudometer.exe" | Out-File -Encoding ascii -NoNewline target/release/claudometer.exe.sha256
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/claudometer.exe
+          files: |
+            target/release/claudometer.exe
+            target/release/claudometer.exe.sha256
           generate_release_notes: true

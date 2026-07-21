@@ -66,6 +66,13 @@ pub struct SettingsView {
     pub caps_on: bool,
     pub autostart: bool,
     pub codex_on: bool,
+    pub alerts_on: bool,
+    /// About-card label ("Claudometer 0.4.0" / "Update v0.5.0 available" / …)
+    pub about: String,
+    /// About-card button text ("GitHub" / "Install" / "…")
+    pub about_btn: &'static str,
+    /// accent-tint the About icon when an update is ready
+    pub update_ready: bool,
     pub poll_secs: u32,
     pub hover: i32, // card index, -1 = none
     pub focus: i32, // keyboard focus card index, -1 = none
@@ -135,7 +142,9 @@ pub const SET_W: f32 = 400.0;
 const SET_PAD: f32 = 24.0;
 const CARD_H: f32 = 56.0;
 const CARD_GAP: f32 = 4.0;
-pub const N_CARDS: usize = 6;
+pub const N_CARDS: usize = 8;
+/// Card index of the auto-refresh interval row (pills, ←/→ keyboard handling).
+pub const CARD_INTERVAL: usize = 4;
 
 pub fn settings_height() -> f32 {
     let cards = N_CARDS as f32 * CARD_H + (N_CARDS as f32 - 1.0) * CARD_GAP;
@@ -206,6 +215,7 @@ pub struct Surface {
     fmt_body_sb: IDWriteTextFormat,
     fmt_caption: IDWriteTextFormat,
     fmt_glyph: IDWriteTextFormat,
+    fmt_glyph_lg: IDWriteTextFormat,
     brushes: Option<BrushCache>,
     w: u32,
     h: u32,
@@ -277,6 +287,7 @@ impl Surface {
             let fmt_body_sb = mk(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             let fmt_caption = mk(w!("Segoe UI Variable Small"), SIZE_CAPTION, DWRITE_FONT_WEIGHT_NORMAL)?;
             let fmt_glyph = mk(w!("Segoe Fluent Icons"), 13.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+            let fmt_glyph_lg = mk(w!("Segoe Fluent Icons"), 16.0, DWRITE_FONT_WEIGHT_NORMAL)?;
 
             Ok(Self {
                 swap,
@@ -290,6 +301,7 @@ impl Surface {
                 fmt_body_sb,
                 fmt_caption,
                 fmt_glyph,
+                fmt_glyph_lg,
                 brushes: None,
                 w: 0,
                 h: 0,
@@ -387,6 +399,7 @@ impl Surface {
         hover: FlyHover,
         focus: i32,
         fetching: bool,
+        update_dot: bool,
     ) -> Result<()> {
         self.ensure_size(w_px.max(8), h_px.max(8), dpi)?;
         self.ensure_brushes(dark, accent)?;
@@ -407,7 +420,7 @@ impl Surface {
                 View::Data(d) => self.draw_data(w_dip, d)?,
             }
 
-            self.draw_header_buttons(hover, focus, fetching)?;
+            self.draw_header_buttons(hover, focus, fetching, update_dot)?;
 
             // 1px flyout surface stroke inside the DWM rounded corners
             let rr = D2D1_ROUNDED_RECT {
@@ -423,7 +436,13 @@ impl Surface {
         Ok(())
     }
 
-    fn draw_header_buttons(&self, hover: FlyHover, focus: i32, fetching: bool) -> Result<()> {
+    fn draw_header_buttons(
+        &self,
+        hover: FlyHover,
+        focus: i32,
+        fetching: bool,
+        update_dot: bool,
+    ) -> Result<()> {
         let (r_refresh, r_gear) = fly_btns();
         let b = self.cache();
         if hover == FlyHover::Refresh {
@@ -435,6 +454,15 @@ impl Surface {
         let refresh_brush = if fetching { &b.dim } else { &b.text };
         self.glyph("\u{E72C}", r_refresh, refresh_brush)?; // Refresh (dim = in flight)
         self.glyph("\u{E713}", r_gear, &b.text)?; // Settings
+        if update_dot {
+            // an update waits behind the gear — quiet accent dot, no nag
+            let e = D2D1_ELLIPSE {
+                point: D2D_POINT_2F { x: r_gear.right - 5.0, y: r_gear.top + 5.0 },
+                radiusX: 3.0,
+                radiusY: 3.0,
+            };
+            unsafe { self.dc.FillEllipse(&e, &b.accent) };
+        }
         match focus {
             0 => self.focus_ring(r_refresh, 4.0)?,
             1 => self.focus_ring(r_gear, 4.0)?,
@@ -541,13 +569,22 @@ impl Surface {
             self.dc.BeginDraw();
             self.dc.Clear(None); // Mica shows through
 
-            let labels = [
+            let labels: [&str; N_CARDS] = [
                 "Caps Lock light shows Claude status",
                 "Start with Windows",
                 "Show Codex usage",
+                "Alert at 75% usage",
                 "Auto-refresh",
                 "Refresh usage now",
+                st.about.as_str(),
                 "Quit Claudometer",
+            ];
+            // Segoe Fluent Icons: keyboard, power, command prompt, bell
+            // (EA8F Ringer — E7ED is the *muted* bell), clock, refresh, info,
+            // cancel
+            let icons = [
+                "\u{E765}", "\u{E7E8}", "\u{E756}", "\u{EA8F}",
+                "\u{E823}", "\u{E72C}", "\u{E946}", "\u{E711}",
             ];
             let cards = settings_rects();
             for (i, card) in cards.iter().enumerate() {
@@ -561,17 +598,22 @@ impl Surface {
                 };
                 self.dc.DrawRoundedRectangle(&rr, &b.card_stroke, 1.0, None);
 
-                let label_right = if i == 3 { card.right - 200.0 } else { card.right - 120.0 };
-                self.text_v(labels[i], &self.fmt_body, rect(card.left + 16.0, card.top, label_right, card.bottom), &b.text)?;
+                let cy0 = (card.top + card.bottom) / 2.0;
+                let icon_brush = if i == 6 && st.update_ready { &b.accent } else { &b.text };
+                self.icon16(icons[i], rect(card.left + 16.0, cy0 - 10.0, card.left + 36.0, cy0 + 10.0), icon_brush)?;
+                let label_right = if i == CARD_INTERVAL { card.right - 200.0 } else { card.right - 120.0 };
+                self.text_v(labels[i], &self.fmt_body, rect(card.left + 48.0, card.top, label_right, card.bottom), &b.text)?;
 
                 let cy = (card.top + card.bottom) / 2.0;
                 match i {
                     0 => self.toggle(card.right - 16.0, cy, st.caps_on)?,
                     1 => self.toggle(card.right - 16.0, cy, st.autostart)?,
                     2 => self.toggle(card.right - 16.0, cy, st.codex_on)?,
-                    3 => self.interval_row(card, st.poll_secs)?,
-                    4 => self.button(card.right - 16.0, cy, "Refresh")?,
-                    5 => self.button(card.right - 16.0, cy, "Quit")?,
+                    3 => self.toggle(card.right - 16.0, cy, st.alerts_on)?,
+                    4 => self.interval_row(card, st.poll_secs)?,
+                    5 => self.button(card.right - 16.0, cy, "Refresh")?,
+                    6 => self.button(card.right - 16.0, cy, st.about_btn)?,
+                    7 => self.button(card.right - 16.0, cy, "Quit")?,
                     _ => {}
                 }
 
@@ -708,8 +750,22 @@ impl Surface {
     }
 
     fn glyph(&self, s: &str, r: D2D_RECT_F, brush: &ID2D1SolidColorBrush) -> Result<()> {
+        self.glyph_with(&self.fmt_glyph, s, r, brush)
+    }
+
+    /// 16px leading icon for settings cards (Win11 Settings row style).
+    fn icon16(&self, s: &str, r: D2D_RECT_F, brush: &ID2D1SolidColorBrush) -> Result<()> {
+        self.glyph_with(&self.fmt_glyph_lg, s, r, brush)
+    }
+
+    fn glyph_with(
+        &self,
+        f: &IDWriteTextFormat,
+        s: &str,
+        r: D2D_RECT_F,
+        brush: &ID2D1SolidColorBrush,
+    ) -> Result<()> {
         unsafe {
-            let f = &self.fmt_glyph;
             f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             let wide: Vec<u16> = s.encode_utf16().collect();

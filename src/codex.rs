@@ -178,6 +178,7 @@ fn push_row(rows: &mut Vec<LimitRow>, w: &Window, fallback_kind: &str) {
         percent: pct,
         severity: String::new(), // no severity field — percent thresholds apply
         reset_text: w.reset_at.map(fmt_reset_unix).unwrap_or_default(),
+        resets_unix: w.reset_at,
     });
 }
 

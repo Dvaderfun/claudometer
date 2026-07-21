@@ -4,10 +4,12 @@
 #![windows_subsystem = "windows"]
 #![allow(clippy::missing_safety_doc)]
 
+mod alerts;
 mod api;
 mod codex;
 mod gfx;
 mod trayicon;
+mod updater;
 mod util;
 
 use std::cell::RefCell;
@@ -21,7 +23,7 @@ use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -33,6 +35,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_DATA_READY: u32 = WM_APP + 2;
+/// toast clicked (posted from a WinRT threadpool thread by alerts.rs)
+pub(crate) const WM_TOAST_ACTIVATED: u32 = WM_APP + 3;
+/// updater state changed (wparam 0) / handover ready, quit now (wparam 1)
+pub(crate) const WM_UPDATE: u32 = WM_APP + 4;
 
 const IDM_REFRESH: usize = 1;
 const IDM_AUTOSTART: usize = 2;
@@ -48,7 +54,7 @@ const EVT_NIN_KEYSELECT: u32 = 0x401;
 // not exported by windows 0.58 either
 const MSG_MOUSELEAVE: u32 = 0x02A3;
 
-static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+pub(crate) static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 static FLYOUT_HWND: AtomicIsize = AtomicIsize::new(0);
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 static PREV_ICON: AtomicIsize = AtomicIsize::new(0);
@@ -146,12 +152,31 @@ fn main() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
-        let _mutex = CreateMutexW(None, true, w!("Local\\Claudometer.SingleInstance"))?;
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        // hidden verification hook: fire a fake 75% toast and exit
+        if std::env::args().any(|a| a == "--test-alert") {
+            alerts::init();
+            alerts::show_test();
+            std::thread::sleep(std::time::Duration::from_secs(2));
             return Ok(());
         }
 
+        let mutex = CreateMutexW(None, true, w!("Local\\Claudometer.SingleInstance"))?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            // normal double-launch: exit silently. `--swap-wait` = we're the
+            // fresh exe of an update handover — the old instance is exiting;
+            // its mutex signals abandoned once its process dies.
+            if !std::env::args().any(|a| a == "--swap-wait") {
+                return Ok(());
+            }
+            let w = WaitForSingleObject(mutex, 15_000);
+            if w != WAIT_OBJECT_0 && w != WAIT_ABANDONED {
+                return Ok(());
+            }
+        }
+        std::thread::spawn(updater::cleanup_old);
+
         util::enable_dark_context_menus();
+        alerts::init();
 
         let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
         TASKBAR_MSG.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::SeqCst);
@@ -221,6 +246,7 @@ fn main() -> Result<()> {
         SetTimer(main, TIMER_POLL, POLL_SECS.load(Ordering::SeqCst) * 1000, None);
         // TIMER_TICK runs only while the flyout is visible (started in show_flyout)
         spawn_fetch_all();
+        updater::maybe_check();
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {
@@ -257,13 +283,47 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             }
             WM_DATA_READY => {
                 update_tray(hwnd);
+                run_alert_checks();
                 if IsWindowVisible(flyout_hwnd()).as_bool() {
                     show_flyout(ANCHOR_X.load(Ordering::SeqCst), ANCHOR_Y.load(Ordering::SeqCst));
                 }
                 LRESULT(0)
             }
+            WM_TOAST_ACTIVATED => {
+                // toast clicked: open the flyout anchored at the tray icon
+                let id = NOTIFYICONIDENTIFIER {
+                    cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
+                    hWnd: hwnd,
+                    uID: TRAY_ID,
+                    ..Default::default()
+                };
+                let (x, y) = match Shell_NotifyIconGetRect(&id) {
+                    Ok(rc) => ((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2),
+                    Err(_) => {
+                        let mut pt = POINT::default();
+                        let _ = GetCursorPos(&mut pt);
+                        (pt.x, pt.y)
+                    }
+                };
+                show_flyout(x, y);
+                LRESULT(0)
+            }
+            WM_UPDATE => {
+                if wparam.0 == 1 {
+                    // new exe is spawned and waiting on the mutex — hand over
+                    let _ = DestroyWindow(hwnd);
+                } else {
+                    let sh = settings_hwnd();
+                    if !sh.is_invalid() && IsWindowVisible(sh).as_bool() {
+                        render_settings(sh);
+                    }
+                    render_flyout_current(); // gear dot
+                }
+                LRESULT(0)
+            }
             WM_TIMER if wparam.0 == TIMER_POLL => {
                 spawn_fetch_all();
+                updater::maybe_check(); // no-op unless 24h passed
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_TICK => {
@@ -433,10 +493,10 @@ extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 if hit >= 0 {
                     UI.with(|ui| ui.borrow_mut().set_focus = hit); // focus follows click
                 }
-                if hit == 3 {
+                if hit == gfx::CARD_INTERVAL as i32 {
                     // pill click selects the interval directly
                     let cards = gfx::settings_rects();
-                    let pills = gfx::interval_pills(&cards[3]);
+                    let pills = gfx::interval_pills(&cards[gfx::CARD_INTERVAL]);
                     if let Some(i) = pills.iter().position(|r| contains(r, x, y)) {
                         apply_interval(gfx::INTERVALS[i].0);
                     }
@@ -465,7 +525,7 @@ extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     });
                     render_settings(hwnd);
                 } else if vk == VK_LEFT.0 || vk == VK_RIGHT.0 {
-                    if UI.with(|ui| ui.borrow().set_focus) == 3 {
+                    if UI.with(|ui| ui.borrow().set_focus) == gfx::CARD_INTERVAL as i32 {
                         let dir = if vk == VK_LEFT.0 { -1 } else { 1 };
                         step_interval(dir);
                         render_settings(hwnd);
@@ -564,14 +624,23 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
             }
             update_tray(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
         }
-        3 => {
+        3 => util::set_alerts_enabled(!util::alerts_enabled()),
+        4 => {
             // keyboard activate on the interval card: cycle to the next option
             let cur = POLL_SECS.load(Ordering::SeqCst);
             let idx = gfx::INTERVALS.iter().position(|(s, _)| *s == cur).unwrap_or(1);
             apply_interval(gfx::INTERVALS[(idx + 1) % gfx::INTERVALS.len()].0);
         }
-        4 => spawn_fetch_all(),
-        5 => {
+        5 => spawn_fetch_all(),
+        6 => match updater::status() {
+            updater::Status::Available(_) => updater::install(),
+            updater::Status::Installing => {}
+            updater::Status::Failed(_, page) => {
+                updater::open_url(page.as_deref().unwrap_or(updater::REPO_URL));
+            }
+            updater::Status::UpToDate => updater::open_url(updater::REPO_URL),
+        },
+        7 => {
             let _ = DestroyWindow(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
             return;
         }
@@ -809,7 +878,10 @@ unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f
         let hover = ui.fly_hover;
         let focus = ui.fly_focus;
         if let Some(fx) = ui.fly.as_mut() {
-            let _ = fx.render_flyout(w_px, h_px, dpi, view, dark, accent, hover, focus, fetching);
+            let _ = fx.render_flyout(
+                w_px, h_px, dpi, view, dark, accent, hover, focus, fetching,
+                updater::has_update(),
+            );
         }
     });
 }
@@ -929,10 +1001,22 @@ unsafe fn render_settings(hwnd: HWND) {
         if ui.set.is_none() {
             ui.set = gfx::Surface::new(hwnd).ok();
         }
+        let (about, about_btn) = match updater::status() {
+            updater::Status::UpToDate => {
+                (concat!("Claudometer ", env!("CARGO_PKG_VERSION")).to_string(), "GitHub")
+            }
+            updater::Status::Available(r) => (format!("Update {} available", r.tag), "Install"),
+            updater::Status::Installing => ("Installing update…".to_string(), "…"),
+            updater::Status::Failed(msg, _) => (format!("Update failed — {msg}"), "GitHub"),
+        };
         let st = gfx::SettingsView {
             caps_on: util::caps_led_enabled(),
             autostart: util::autostart_enabled(),
             codex_on: util::show_codex(),
+            alerts_on: util::alerts_enabled(),
+            about,
+            about_btn,
+            update_ready: updater::has_update(),
             poll_secs: POLL_SECS.load(Ordering::SeqCst),
             hover: ui.set_hover,
             focus: ui.set_focus,
@@ -963,11 +1047,32 @@ unsafe fn base_nid(owner: HWND) -> NOTIFYICONDATAW {
     nid
 }
 
-fn set_tip(nid: &mut NOTIFYICONDATAW, s: &str) {
+fn set_wstr(dst: &mut [u16], s: &str) {
     let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
-    let n = wide.len().min(nid.szTip.len() - 1);
-    nid.szTip[..n].copy_from_slice(&wide[..n]);
-    nid.szTip[n] = 0;
+    let n = wide.len().min(dst.len() - 1);
+    dst[..n].copy_from_slice(&wide[..n]);
+    dst[n] = 0;
+}
+
+fn set_tip(nid: &mut NOTIFYICONDATAW, s: &str) {
+    set_wstr(&mut nid.szTip, s);
+}
+
+/// Legacy balloon fallback — only when the WinRT toast path errors out
+/// (still renders as a toast on Windows 11, just with fewer niceties).
+pub(crate) fn tray_balloon(title: &str, msg: &str) {
+    unsafe {
+        let h = MAIN_HWND.load(Ordering::SeqCst);
+        if h == 0 {
+            return;
+        }
+        let mut nid = base_nid(HWND(h as *mut _));
+        nid.uFlags = NIF_INFO | NIF_SHOWTIP;
+        nid.dwInfoFlags = NIIF_WARNING | NIIF_RESPECT_QUIET_TIME;
+        set_wstr(&mut nid.szInfoTitle, title);
+        set_wstr(&mut nid.szInfo, msg);
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
 }
 
 unsafe fn add_tray_icon(owner: HWND) {
@@ -1089,6 +1194,25 @@ unsafe fn show_menu(owner: HWND, x: i32, y: i32) {
             let _ = DestroyWindow(owner);
         }
         _ => {}
+    }
+}
+
+// ---------- alerts ----------
+
+/// After every fetch: hand *fresh* snapshots to the alert engine. Stale
+/// (error-preserved) data must never alert — only a just-succeeded fetch.
+fn run_alert_checks() {
+    let fresh = |p: Provider| match &*slot(p).state.lock().unwrap() {
+        Some(api::FetchOutcome::Ok(s)) => Some(s.clone()),
+        _ => None,
+    };
+    if let Some(s) = fresh(Provider::Claude) {
+        alerts::check("Claude", &s);
+    }
+    if codex_active() {
+        if let Some(s) = fresh(Provider::Codex) {
+            alerts::check("Codex", &s);
+        }
     }
 }
 

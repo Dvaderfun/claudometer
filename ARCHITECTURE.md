@@ -8,7 +8,9 @@ Single-process, single-UI-thread Win32 app. Three windows, one worker thread per
 ▼        ▼
 Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 │  WM_TRAY (WM_APP+1)  → toggle flyout / context menu
-│  WM_DATA_READY (+2)  → update tray, re-render visible flyout
+│  WM_DATA_READY (+2)  → update tray, alert check, re-render visible flyout
+│  WM_TOAST_ACTIVATED (+3) → open flyout at tray icon (posted by toast click)
+│  WM_UPDATE (+4)       → wparam 0: repaint update state · wparam 1: quit for handover
 │  TIMER_POLL          → spawn_fetch()          (30s–5m, user setting)
 │  TIMER_TICK          → repaint "Updated Xm ago" (only while flyout visible)
 │  WM_SETTINGCHANGE    → only if lParam == "ImmersiveColorSet"
@@ -30,6 +32,8 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `api.rs` | Claude credentials read + usage fetch; shared display model (`UsageSnapshot`, `LimitRow`, `FetchOutcome`), time formatting |
 | `codex.rs` | Codex (OpenAI) credentials read + usage fetch → same `UsageSnapshot` |
 | `trayicon.rs` | CPU-rasterized ring/alert HICON (premultiplied DIB, no fonts) |
+| `alerts.rs` | 75% toast alerts: WinRT toast pipeline, AUMID registration, per-window dedup |
+| `updater.rs` | GitHub-Releases self-update: daily check, verified download, rename-swap handover |
 | `util.rs` | theme/accent detection, autostart registry, poll-interval config, caps-LED toggle, dark menus, acrylic |
 
 ## Rendering (`gfx::Surface`)
@@ -68,11 +72,32 @@ Resilience rules (in `main.rs`, per provider via `SLOTS`):
 - Fetch threads publish via mutexed statics + `PostMessageW(WM_DATA_READY)` — UI mutations stay on the UI thread.
 - Codex enablement (`codex_active`) = settings toggle AND auth file present — checked per poll, so signing in/out of Codex shows/hides the section without restart.
 
+## Alerts (`alerts.rs`)
+
+One native toast per limit window that crosses **75%** (`WARN_AT`), evaluated on the UI thread on every `WM_DATA_READY` — but only from a *fresh* `FetchOutcome::Ok`; stale/error-preserved data never alerts.
+
+- **Real WinRT toasts, unpackaged**: `ToastNotificationManager::CreateToastNotifierWithId` against an AUMID registered under `HKCU\Software\Classes\AppUserModelId\Claudometer` (`DisplayName` + `IconUri` → ico extracted to `%APPDATA%\Claudometer`). Gets Action Center persistence, Focus Assist / DND suppression, and a per-app toggle in Windows notification settings — none of which legacy balloons provide. `SetCurrentProcessExplicitAppUserModelID` ties the process to the AUMID at startup.
+- **Dedup keyed on the window instance**: `provider.kind.label → resets_unix`. Percent climbing inside one window fires once; the window rolling over (new `resets_at`) re-arms. Persisted in settings.json (`alerted`) so restarts stay quiet mid-window.
+- Toast body: title + reset time + native `<progress>` bar pinned at the worst crossed limit. Click → `WM_TOAST_ACTIVATED` → flyout opens at the tray icon (`Shell_NotifyIconGetRect`). Shown `ToastNotification` objects are kept alive in a thread_local — the OS routes `Activated` through them.
+- `NotificationSetting::DisabledForApplication/User` is honored: no balloon resurrection. The `NIF_INFO` balloon fallback fires only when the WinRT path itself errors.
+- `claudometer.exe --test-alert` drives the whole pipeline with fake data; outcome written to `%APPDATA%\Claudometer\alert-test.txt` (exe has no console).
+
+## Updater (`updater.rs`)
+
+Passive, transparent, user-initiated. Check: `releases/latest` once per day and once at launch (worker thread, silent failures, drafts/prereleases and non-semver tags skipped). Surfaces: the settings About card ("Claudometer X.Y.Z · GitHub" → "Update vX.Y.Z available · Install") and an accent dot on the flyout gear. Deliberately **no** update toast — toasts are reserved for usage limits.
+
+Install (only on click), all failure paths falling back to opening the release page:
+
+1. Download the `claudometer.exe` asset to `claudometer.new.exe` **next to the current exe** (same volume → atomic renames; also proves the folder is writable).
+2. Verify: length sanity → `MZ` magic → VERSIONINFO version == release tag → SHA256 via `certutil` (ships with Windows, zero crypto deps) against the release's `.sha256` asset when present (release.yml attaches it since 0.5.0).
+3. The rename swap: running exe → `claudometer.old.exe`, new → `claudometer.exe` (Windows allows renaming a mapped exe, not deleting it), rollback if the second rename fails.
+4. Handover: spawn `claudometer.exe --swap-wait`, post `WM_UPDATE(1)`, old instance quits. The new instance sees the busy single-instance mutex, `WaitForSingleObject`s on it (abandoned-mutex on old-process death counts as acquired), then deletes the `.old`. Startup always tries the `.old` cleanup, covering crashed updates.
+
 ## State
 
 - Cross-thread: `SLOTS[2]` (per-provider `state`, `last_good`, `last_fetch`, `cooldown_until` mutexes + `fetching` atomic); `POLL_SECS`, hwnds (atomics).
 - UI-thread only: `UI` thread_local — surfaces, hover, keyboard focus, mouse-tracking flags.
-- Persistent: `%APPDATA%\Claudometer\settings.json` (poll interval, Codex toggle), HKCU Run key (autostart), `~/.claude/hooks/caps-led.disabled` (LED kill switch).
+- Persistent: `%APPDATA%\Claudometer\settings.json` (poll interval, Codex toggle, alerts toggle, `alerted` dedup map), `%APPDATA%\Claudometer\icon.ico` (toast icon), HKCU Run key (autostart), HKCU AppUserModelId key (toast registration), `~/.claude/hooks/caps-led.disabled` (LED kill switch).
 
 ## Known gaps
 
