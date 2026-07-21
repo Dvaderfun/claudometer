@@ -110,11 +110,24 @@ pub fn check(provider: &'static str, snap: &UsageSnapshot) {
     notify(provider, &crossed);
 }
 
+/// The API's `resets_at` for an in-flight window drifts by a minute or two
+/// between polls (observed: session flipping 20:09 ↔ 20:10). Epochs closer
+/// than this are the *same* window; a real rollover jumps hours (session)
+/// or days (weekly). The stored epoch is deliberately NOT updated on a
+/// within-slop match, so repeated small drifts can't creep past the slop.
+const EPOCH_SLOP: i64 = 30 * 60;
+
 /// Pure dedup decision: fire when over threshold AND this window instance
-/// (identified by its resets_at epoch) hasn't fired before. Marks on fire.
+/// (identified by its resets_at epoch, drift-tolerant) hasn't fired before.
+/// Marks on fire.
 fn should_fire(seen: &mut HashMap<String, i64>, key: &str, pct: f64, epoch: i64) -> bool {
-    if pct < WARN_AT || seen.get(key) == Some(&epoch) {
+    if pct < WARN_AT {
         return false;
+    }
+    if let Some(prev) = seen.get(key) {
+        if (epoch - prev).abs() <= EPOCH_SLOP {
+            return false;
+        }
     }
     seen.insert(key.to_string(), epoch);
     true
@@ -264,12 +277,27 @@ mod tests {
     #[test]
     fn fires_once_per_window_instance() {
         let mut seen = HashMap::new();
-        assert!(should_fire(&mut seen, "claude.session", 75.0, 100));
+        assert!(should_fire(&mut seen, "claude.session", 75.0, 100_000));
         // same window, climbing percent — stays quiet
-        assert!(!should_fire(&mut seen, "claude.session", 82.0, 100));
-        assert!(!should_fire(&mut seen, "claude.session", 99.0, 100));
-        // window rolled over (new resets_at) — fires again
-        assert!(should_fire(&mut seen, "claude.session", 76.0, 200));
+        assert!(!should_fire(&mut seen, "claude.session", 82.0, 100_000));
+        assert!(!should_fire(&mut seen, "claude.session", 99.0, 100_000));
+        // window rolled over (resets_at jumped 5h) — fires again
+        assert!(should_fire(&mut seen, "claude.session", 76.0, 118_000));
+    }
+
+    #[test]
+    fn resets_at_drift_does_not_refire() {
+        let mut seen = HashMap::new();
+        assert!(should_fire(&mut seen, "claude.session", 75.0, 100_000));
+        // the observed API behavior: resets_at oscillates by ±60 s per poll
+        assert!(!should_fire(&mut seen, "claude.session", 83.0, 100_060));
+        assert!(!should_fire(&mut seen, "claude.session", 83.0, 99_940));
+        assert!(!should_fire(&mut seen, "claude.session", 91.0, 100_060));
+        // anti-creep: stored epoch stays first-seen — repeated small drifts
+        // in one direction still count as the same window
+        assert!(!should_fire(&mut seen, "claude.session", 92.0, 101_500));
+        // a genuine rollover (hours away) fires
+        assert!(should_fire(&mut seen, "claude.session", 76.0, 100_000 + 5 * 3600));
     }
 
     #[test]
