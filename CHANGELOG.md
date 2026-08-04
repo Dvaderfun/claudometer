@@ -2,6 +2,19 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [SemVer](https://semver.org/).
 
+## [0.6.0] — 2026-08-04
+
+### Added
+- **Vibecode mode** — a toggle row in the flyout that keeps the machine working with the lid shut. It holds a `SetThreadExecutionState` wake lock (no idle sleep, no display timeout) and forces the active power scheme's lid-close action to *Do nothing* on both AC and DC. Turning it off restores the exact indices that were there before; they're saved to settings.json before the first override, so a crash or a kill doesn't strand the setting — quitting restores it too, and the mode itself is remembered and re-armed on the next launch. Keyboard: Tab to the row, Space/Enter to toggle. Machines with no lid setting just get the wake lock.
+
+## [0.5.2] — 2026-07-23
+
+### Fixed
+- Claude section could stay stale for many minutes (session bar frozen at an old value) while the footer still said "Updated just now". Root cause: the usage endpoint's burst limiter is shared with Claude Code's own polling, so a fixed 60 s poll phase can collide with it for many consecutive ticks — it answers 429 with `Retry-After: 0` ("fine again in a moment"), but the app waited a full poll interval and collided again. A rate-limited fetch now retries once after a 2–5 s jitter to de-phase; sustained 429s back off exponentially (120 s → 600 s), and an explicit server `Retry-After` is honored up to 15 min (was capped at 5).
+- Two-section footer timestamp now shows the *oldest* data on screen — a fresh Codex fetch no longer masks stale Claude rows.
+- Manual refresh (flyout button/Enter, tray menu, settings card) bypasses an active 429 cooldown instead of silently doing nothing.
+- Claude requests now identify themselves with a `claudometer/<version>` User-Agent, matching the Codex requests (was the ureq default).
+
 ## [0.5.1] — 2026-07-21
 
 ### Fixed

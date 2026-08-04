@@ -35,6 +35,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `alerts.rs` | 75% toast alerts: WinRT toast pipeline, AUMID registration, per-window dedup |
 | `updater.rs` | GitHub-Releases self-update: daily check, verified download, rename-swap handover |
 | `util.rs` | theme/accent detection, autostart registry, poll-interval config, caps-LED toggle, dark menus, acrylic |
+| `vibecode.rs` | Vibecode mode: wake lock + lid-close-action override, with save/restore of the user's original indices |
 
 ## Rendering (`gfx::Surface`)
 
@@ -82,6 +83,15 @@ One native toast per limit window that crosses **75%** (`WARN_AT`), evaluated on
 - `NotificationSetting::DisabledForApplication/User` is honored: no balloon resurrection. The `NIF_INFO` balloon fallback fires only when the WinRT path itself errors.
 - `claudometer.exe --test-alert` drives the whole pipeline with fake data; outcome written to `%APPDATA%\Claudometer\alert-test.txt` (exe has no console).
 
+## Vibecode mode (`vibecode.rs`)
+
+A flyout toggle row that keeps the machine working with the lid shut. Two switches, both reversible:
+
+- **Wake lock** — `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`. Per-*thread*, so it is armed and dropped on the UI thread only; it dies with the process, nothing to clean up.
+- **Lid-close action** — `PowerRead/WriteAC|DCValueIndex` on the active scheme (`SUB_BUTTONS` / lid-close-action GUIDs, both hand-declared: windows 0.58 exports neither under our features) set to index 0 = *Do nothing*, then `PowerSetActiveScheme` on the same scheme to push the change into the running policy. This one outlives the process, so the previous (AC, DC) pair is written to settings.json **before** the first override and restored verbatim on disable. Re-arming never overwrites a saved pair — that's what makes a crash recoverable.
+
+Lifecycle: quit restores the system state but keeps the preference (re-armed at next launch, saved indices intact); toggling off restores and clears the saved pair. A machine with no lid setting (desktop) fails the read, so only the wake lock applies.
+
 ## Updater (`updater.rs`)
 
 Passive, transparent, user-initiated. Check: `releases/latest` once per day and once at launch (worker thread, silent failures, drafts/prereleases and non-semver tags skipped). Surfaces: the settings About card ("Claudometer X.Y.Z · GitHub" → "Update vX.Y.Z available · Install") and an accent dot on the flyout gear. Deliberately **no** update toast — toasts are reserved for usage limits.
@@ -97,7 +107,7 @@ Install (only on click), all failure paths falling back to opening the release p
 
 - Cross-thread: `SLOTS[2]` (per-provider `state`, `last_good`, `last_fetch`, `cooldown_until` mutexes + `fetching` atomic); `POLL_SECS`, hwnds (atomics).
 - UI-thread only: `UI` thread_local — surfaces, hover, keyboard focus, mouse-tracking flags.
-- Persistent: `%APPDATA%\Claudometer\settings.json` (poll interval, Codex toggle, alerts toggle, `alerted` dedup map), `%APPDATA%\Claudometer\icon.ico` (toast icon), HKCU Run key (autostart), HKCU AppUserModelId key (toast registration), `~/.claude/hooks/caps-led.disabled` (LED kill switch).
+- Persistent: `%APPDATA%\Claudometer\settings.json` (poll interval, Codex toggle, alerts toggle, `alerted` dedup map, Vibecode flag + saved lid indices), `%APPDATA%\Claudometer\icon.ico` (toast icon), HKCU Run key (autostart), HKCU AppUserModelId key (toast registration), `~/.claude/hooks/caps-led.disabled` (LED kill switch).
 
 ## Known gaps
 

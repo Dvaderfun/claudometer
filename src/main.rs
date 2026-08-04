@@ -11,6 +11,7 @@ mod gfx;
 mod trayicon;
 mod updater;
 mod util;
+mod vibecode;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
@@ -70,13 +71,16 @@ enum Provider {
 }
 
 /// Per-provider fetch state; both providers share the resilience rules
-/// (stale data beats errors, Retry-After honored exactly, 3 s debounce).
+/// (stale data beats errors, 429 jittered-retry + backoff, 3 s debounce).
 struct Slot {
     state: Mutex<Option<api::FetchOutcome>>,
     last_good: Mutex<Option<api::UsageSnapshot>>,
     last_fetch: Mutex<Option<Instant>>,
-    /// Retry-After honored exactly: no requests before this instant
+    /// no *automatic* requests before this instant (server Retry-After, or
+    /// exponential backoff after sustained 429s) — manual refresh bypasses it
     cooldown_until: Mutex<Option<Instant>>,
+    /// consecutive rate-limited fetches — drives the 429 backoff
+    rl_streak: AtomicU32,
     fetching: AtomicBool,
 }
 
@@ -87,6 +91,7 @@ impl Slot {
             last_good: Mutex::new(None),
             last_fetch: Mutex::new(None),
             cooldown_until: Mutex::new(None),
+            rl_streak: AtomicU32::new(0),
             fetching: AtomicBool::new(false),
         }
     }
@@ -126,11 +131,17 @@ struct Ui {
     set: Option<gfx::Surface>,
     fly_hover: gfx::FlyHover,
     set_hover: i32,
-    fly_focus: i32, // keyboard focus: -1 none, 0 refresh, 1 gear
+    fly_focus: i32, // keyboard focus: -1 none, 0 refresh, 1 gear, 2 vibecode
     set_focus: i32, // keyboard focus card index, -1 none
     fly_tracking: bool,
     set_tracking: bool,
+    /// top of the Vibecode row in flyout DIP coords — cached at render time so
+    /// hit-testing on every mouse move doesn't rebuild the whole view
+    fly_vibe_top: f32,
 }
+
+/// Flyout keyboard focus targets (refresh, gear, Vibecode row).
+const FLY_FOCUS_N: i32 = 3;
 
 thread_local! {
     static UI: RefCell<Ui> = const {
@@ -143,6 +154,7 @@ thread_local! {
             set_focus: -1,
             fly_tracking: false,
             set_tracking: false,
+            fly_vibe_top: 0.0,
         })
     };
 }
@@ -242,10 +254,12 @@ fn main() -> Result<()> {
         RegisterClassExW(&swc);
 
         add_tray_icon(main);
+        // wake lock is per-thread — must be armed (and dropped) on this thread
+        vibecode::init();
         POLL_SECS.store(util::load_poll_secs(), Ordering::SeqCst);
         SetTimer(main, TIMER_POLL, POLL_SECS.load(Ordering::SeqCst) * 1000, None);
         // TIMER_TICK runs only while the flyout is visible (started in show_flyout)
-        spawn_fetch_all();
+        spawn_fetch_all(false);
         updater::maybe_check();
 
         let mut msg = MSG::default();
@@ -322,7 +336,7 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_POLL => {
-                spawn_fetch_all();
+                spawn_fetch_all(false);
                 updater::maybe_check(); // no-op unless 24h passed
                 LRESULT(0)
             }
@@ -350,6 +364,9 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_DESTROY => {
+                // put the lid-close action back before we go — the preference
+                // itself survives and re-arms on the next launch
+                vibecode::restore_for_exit();
                 remove_tray(hwnd);
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -378,20 +395,31 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if vk == VK_ESCAPE.0 {
                     hide_flyout();
                 } else if vk == VK_TAB.0 {
+                    let back = GetKeyState(VK_SHIFT.0 as i32) < 0;
                     UI.with(|ui| {
                         let mut ui = ui.borrow_mut();
-                        ui.fly_focus = if ui.fly_focus == 0 { 1 } else { 0 };
+                        ui.fly_focus = if ui.fly_focus < 0 {
+                            if back { FLY_FOCUS_N - 1 } else { 0 }
+                        } else if back {
+                            (ui.fly_focus - 1 + FLY_FOCUS_N) % FLY_FOCUS_N
+                        } else {
+                            (ui.fly_focus + 1) % FLY_FOCUS_N
+                        };
                     });
                     render_flyout_current();
                 } else if vk == VK_RETURN.0 || vk == VK_SPACE.0 {
                     match UI.with(|ui| ui.borrow().fly_focus) {
                         0 => {
-                            spawn_fetch_all();
+                            spawn_fetch_all(true);
                             render_flyout_current();
                         }
                         1 => {
                             hide_flyout();
                             open_settings();
+                        }
+                        2 => {
+                            vibecode::set(!vibecode::is_on());
+                            render_flyout_current();
                         }
                         _ => {}
                     }
@@ -433,12 +461,16 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (x, y) = mouse_dip(hwnd, lparam);
                 match fly_hit(x, y) {
                     gfx::FlyHover::Refresh => {
-                        spawn_fetch_all();
+                        spawn_fetch_all(true);
                         render_flyout_current(); // spinner starts immediately
                     }
                     gfx::FlyHover::Gear => {
                         hide_flyout();
                         open_settings();
+                    }
+                    gfx::FlyHover::Vibe => {
+                        vibecode::set(!vibecode::is_on());
+                        render_flyout_current();
                     }
                     gfx::FlyHover::None => {}
                 }
@@ -620,7 +652,7 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
             let on = !util::show_codex();
             util::set_show_codex(on);
             if on {
-                spawn_fetch(Provider::Codex);
+                spawn_fetch(Provider::Codex, true);
             }
             update_tray(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
         }
@@ -631,7 +663,7 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
             let idx = gfx::INTERVALS.iter().position(|(s, _)| *s == cur).unwrap_or(1);
             apply_interval(gfx::INTERVALS[(idx + 1) % gfx::INTERVALS.len()].0);
         }
-        5 => spawn_fetch_all(),
+        5 => spawn_fetch_all(true),
         6 => match updater::status() {
             updater::Status::Available(_) => updater::install(),
             updater::Status::Installing => {}
@@ -669,6 +701,8 @@ fn fly_hit(x: f32, y: f32) -> gfx::FlyHover {
         gfx::FlyHover::Refresh
     } else if contains(&gear, x, y) {
         gfx::FlyHover::Gear
+    } else if contains(&gfx::vibe_row_at(UI.with(|ui| ui.borrow().fly_vibe_top)), x, y) {
+        gfx::FlyHover::Vibe
     } else {
         gfx::FlyHover::None
     }
@@ -752,7 +786,9 @@ fn current_view() -> gfx::View {
     for (title, snap, err) in [("Claude", c_snap, c_err), ("Codex", x_snap, x_err)] {
         match (snap, err) {
             (Some(s), err) => {
-                fetched = fetched.max(Some(s.fetched_unix));
+                // footer shows the OLDEST data on screen — a fresh Codex fetch
+                // must not say "Updated just now" over stale Claude rows
+                fetched = Some(fetched.map_or(s.fetched_unix, |f| f.min(s.fetched_unix)));
                 if err.is_some() {
                     notes.push(format!("{title}: {}", err.as_deref().map(err_head).unwrap_or_default()));
                 }
@@ -821,10 +857,10 @@ unsafe fn show_flyout(cx: i32, cy: i32) {
             .unwrap_or(true)
     };
     if stale(Provider::Claude) {
-        spawn_fetch(Provider::Claude);
+        spawn_fetch(Provider::Claude, false);
     }
     if codex_active() && stale(Provider::Codex) {
-        spawn_fetch(Provider::Codex);
+        spawn_fetch(Provider::Codex, false);
     }
 
     let fh = flyout_hwnd();
@@ -870,17 +906,19 @@ unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f
     let dark = util::is_dark_theme();
     let accent = util::accent_rgb();
     let fetching = any_fetching();
+    let vibe_on = vibecode::is_on();
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
         if ui.fly.is_none() {
             ui.fly = gfx::Surface::new(fh).ok();
         }
+        ui.fly_vibe_top = gfx::vibe_row(view).top; // hit-test cache
         let hover = ui.fly_hover;
         let focus = ui.fly_focus;
         if let Some(fx) = ui.fly.as_mut() {
             let _ = fx.render_flyout(
                 w_px, h_px, dpi, view, dark, accent, hover, focus, fetching,
-                updater::has_update(),
+                updater::has_update(), vibe_on,
             );
         }
     });
@@ -1187,7 +1225,7 @@ unsafe fn show_menu(owner: HWND, x: i32, y: i32) {
     let _ = DestroyMenu(menu);
 
     match cmd.0 as usize {
-        IDM_REFRESH => spawn_fetch_all(),
+        IDM_REFRESH => spawn_fetch_all(true),
         IDM_SETTINGS => open_settings(),
         IDM_AUTOSTART => util::set_autostart(!auto),
         IDM_QUIT => {
@@ -1219,19 +1257,29 @@ fn run_alert_checks() {
 // ---------- fetch ----------
 
 /// Refresh every live provider (Claude always, Codex when active).
-fn spawn_fetch_all() {
-    spawn_fetch(Provider::Claude);
+/// `force` = user-initiated: bypasses an active 429 cooldown (one polite
+/// request on click beats a silent no-op).
+fn spawn_fetch_all(force: bool) {
+    spawn_fetch(Provider::Claude, force);
     if codex_active() {
-        spawn_fetch(Provider::Codex);
+        spawn_fetch(Provider::Codex, force);
     }
 }
 
-fn spawn_fetch(p: Provider) {
+/// Sub-second clock noise for retry jitter (no rand dependency).
+fn subsec_jitter() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()))
+}
+
+fn spawn_fetch(p: Provider, force: bool) {
     let s = slot(p);
-    // Retry-After from a 429 is honored exactly — no requests inside the window
-    if let Some(until) = *s.cooldown_until.lock().unwrap() {
-        if Instant::now() < until {
-            return;
+    if !force {
+        if let Some(until) = *s.cooldown_until.lock().unwrap() {
+            if Instant::now() < until {
+                return;
+            }
         }
     }
     // debounce: manual refresh spam turns into API 429s
@@ -1244,23 +1292,57 @@ fn spawn_fetch(p: Provider) {
         return;
     }
     std::thread::spawn(move || {
-        let out = match p {
+        let fetch_once = || match p {
             Provider::Claude => api::fetch(),
             Provider::Codex => codex::fetch(),
         };
+        let mut out = fetch_once();
+        // The usage endpoint's burst limiter is shared with Claude Code's own
+        // polling, and a fixed poll phase can collide with it for many ticks
+        // in a row (observed: 429 + `Retry-After: 0`, i.e. "fine again in a
+        // moment"). One short jittered retry de-phases us instead of showing
+        // stale data until the next tick.
+        if let api::FetchOutcome::Err {
+            rate_limited: true,
+            retry_after,
+            ..
+        } = &out
+        {
+            let ra = retry_after.unwrap_or(0);
+            if ra <= 5 {
+                let ms = (ra * 1000).max(2_000 + subsec_jitter() % 3_000);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                out = fetch_once();
+            }
+        }
         let s = slot(p);
         match &out {
             api::FetchOutcome::Ok(snap) => {
                 *s.last_good.lock().unwrap() = Some(snap.clone());
                 *s.cooldown_until.lock().unwrap() = None;
+                s.rl_streak.store(0, Ordering::SeqCst);
             }
-            api::FetchOutcome::Err { retry_after, .. } => {
-                if let Some(secs) = retry_after {
-                    let capped = (*secs).min(300);
+            api::FetchOutcome::Err {
+                rate_limited: true,
+                retry_after,
+                ..
+            } => {
+                let n = s.rl_streak.fetch_add(1, Ordering::SeqCst) + 1;
+                let secs = match retry_after {
+                    // explicit server wait — honored, capped at 15 min
+                    Some(ra) if *ra > 5 => (*ra).min(900),
+                    // burst 429s ride the normal poll for two rounds, then
+                    // back off 120s→240s→480s→600s: sustained throttling
+                    // gets rarer requests, not hammering
+                    _ if n >= 3 => (60u64 << (n - 2).min(4)).min(600),
+                    _ => 0,
+                };
+                if secs > 0 {
                     *s.cooldown_until.lock().unwrap() =
-                        Some(Instant::now() + std::time::Duration::from_secs(capped));
+                        Some(Instant::now() + std::time::Duration::from_secs(secs));
                 }
             }
+            api::FetchOutcome::Err { .. } => {}
         }
         *s.state.lock().unwrap() = Some(out);
         *s.last_fetch.lock().unwrap() = Some(Instant::now());

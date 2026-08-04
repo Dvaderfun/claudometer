@@ -72,7 +72,11 @@ struct Window {
 pub fn fetch() -> FetchOutcome {
     match fetch_inner() {
         Ok(s) => FetchOutcome::Ok(s),
-        Err((msg, retry_after)) => FetchOutcome::Err { msg, retry_after },
+        Err((msg, retry_after, rate_limited)) => FetchOutcome::Err {
+            msg,
+            retry_after,
+            rate_limited,
+        },
     }
 }
 
@@ -108,7 +112,7 @@ fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
                 let retry_after = resp
                     .header("retry-after")
                     .and_then(|v| v.trim().parse::<u64>().ok());
-                ("Rate limited by the API.".to_string(), retry_after)
+                ("Rate limited by the API.".to_string(), retry_after, true)
             }
             ureq::Error::Status(code, _) => plain(format!("OpenAI API error {code}.")),
             _ => plain("Network error."),

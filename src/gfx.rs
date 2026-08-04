@@ -60,6 +60,7 @@ pub enum FlyHover {
     None,
     Refresh,
     Gear,
+    Vibe,
 }
 
 pub struct SettingsView {
@@ -102,7 +103,14 @@ const SIZE_CAPTION: f32 = 12.0;
 
 const BTN: f32 = 28.0; // header icon button
 
-pub fn flyout_height(view: &View) -> f32 {
+/// Vibecode row: label + caption + toggle, on the settings-card grid.
+const VIBE_H: f32 = 44.0;
+const VIBE_GAP: f32 = 12.0;
+/// Bottom of the loading/error message block (head + wrapped body).
+const MSG_H: f32 = 108.0;
+
+/// Height of the view's own content — everything above the Vibecode row.
+fn content_h(view: &View) -> f32 {
     match view {
         View::Data(d) => {
             let mut h = PAD;
@@ -112,9 +120,28 @@ pub fn flyout_height(view: &View) -> f32 {
                 }
                 h += TITLE_H + SECTION_GAP + section_body_h(&sec.body);
             }
-            h + FOOTER_GAP_ABOVE + 1.0 + FOOTER_GAP_BELOW + CAPTION_H + PAD
+            h
         }
-        _ => 120.0,
+        _ => MSG_H,
+    }
+}
+
+/// Vibecode toggle row, spanning the flyout's content width. Present in every
+/// view — the mode is useful exactly when usage can't be fetched, too.
+pub fn vibe_row(view: &View) -> D2D_RECT_F {
+    vibe_row_at(content_h(view) + VIBE_GAP)
+}
+
+/// Same row from a cached top edge (hit-testing, without rebuilding the view).
+pub fn vibe_row_at(top: f32) -> D2D_RECT_F {
+    rect(PAD, top, FLYOUT_W - PAD, top + VIBE_H)
+}
+
+pub fn flyout_height(view: &View) -> f32 {
+    let bottom = vibe_row(view).bottom;
+    match view {
+        View::Data(_) => bottom + FOOTER_GAP_ABOVE + 1.0 + FOOTER_GAP_BELOW + CAPTION_H + PAD,
+        _ => bottom + PAD,
     }
 }
 
@@ -400,6 +427,7 @@ impl Surface {
         focus: i32,
         fetching: bool,
         update_dot: bool,
+        vibe_on: bool,
     ) -> Result<()> {
         self.ensure_size(w_px.max(8), h_px.max(8), dpi)?;
         self.ensure_brushes(dark, accent)?;
@@ -418,6 +446,12 @@ impl Surface {
                     self.draw_message(w_dip, head, rest)?
                 }
                 View::Data(d) => self.draw_data(w_dip, d)?,
+            }
+
+            let vibe = vibe_row(view);
+            self.draw_vibe_row(vibe, vibe_on, hover == FlyHover::Vibe, focus == 2)?;
+            if let View::Data(d) = view {
+                self.draw_footer(w_dip, vibe.bottom + FOOTER_GAP_ABOVE, d)?;
             }
 
             self.draw_header_buttons(hover, focus, fetching, update_dot)?;
@@ -526,7 +560,12 @@ impl Surface {
             }
         }
 
-        let div_y = y + FOOTER_GAP_ABOVE;
+        Ok(())
+    }
+
+    /// Divider + "Updated …" caption, drawn under the Vibecode row.
+    fn draw_footer(&self, w: f32, div_y: f32, d: &FlyoutData) -> Result<()> {
+        let b = self.cache();
         self.fill(rect(PAD, div_y, w - PAD, div_y + 1.0), &b.divider);
         let foot_y = div_y + 1.0 + FOOTER_GAP_BELOW;
         let mut footer = match d.fetched_unix {
@@ -540,6 +579,39 @@ impl Surface {
             footer.push_str(n);
         }
         self.text(&footer, &self.fmt_caption, rect(PAD, foot_y, w - PAD, foot_y + CAPTION_H), &b.dim, false)?;
+        Ok(())
+    }
+
+    /// Vibecode mode row — settings-style card with a Fluent ToggleSwitch.
+    fn draw_vibe_row(&self, r: D2D_RECT_F, on: bool, hover: bool, focused: bool) -> Result<()> {
+        let b = self.cache();
+        let bg = if hover { &b.card_hover } else { &b.card_bg };
+        self.rounded(r, 4.0, bg)?;
+        let rr = D2D1_ROUNDED_RECT {
+            rect: rect(r.left + 0.5, r.top + 0.5, r.right - 0.5, r.bottom - 0.5),
+            radiusX: 3.5,
+            radiusY: 3.5,
+        };
+        unsafe { self.dc.DrawRoundedRectangle(&rr, &b.card_stroke, 1.0, None) };
+
+        let cy = (r.top + r.bottom) / 2.0;
+        let icon_brush = if on { &b.accent } else { &b.text };
+        self.icon16("\u{E945}", rect(r.left + 12.0, cy - 10.0, r.left + 32.0, cy + 10.0), icon_brush)?;
+
+        let text_left = r.left + 40.0;
+        let text_right = r.right - 56.0; // clear of the 40px toggle + margin
+        self.text("Vibecode mode", &self.fmt_body, rect(text_left, r.top + 4.0, text_right, r.top + 4.0 + LABEL_H), &b.text, false)?;
+        let caption = if on {
+            "Awake · lid close ignored"
+        } else {
+            "Sleep and lid close normal"
+        };
+        self.text(caption, &self.fmt_caption, rect(text_left, r.top + 24.0, text_right, r.top + 24.0 + CAPTION_H), &b.dim, false)?;
+
+        self.toggle(r.right - 12.0, cy, on)?;
+        if focused {
+            self.focus_ring(r, 4.0)?;
+        }
         Ok(())
     }
 

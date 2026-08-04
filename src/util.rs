@@ -151,6 +151,38 @@ pub fn set_alerts_enabled(on: bool) {
     write_config_field("alerts", on.into());
 }
 
+/// Vibecode mode (no sleep, lid close ignored) — a persisted preference,
+/// re-armed at startup. Default off.
+pub fn vibecode_enabled() -> bool {
+    read_config()
+        .get("vibecode")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
+}
+
+pub fn set_vibecode_enabled(on: bool) {
+    write_config_field("vibecode", on.into());
+}
+
+/// The (AC, DC) lid-close action indices Vibecode mode overrode. Present only
+/// while the override is live, so a crash still leaves the restore on disk.
+pub fn vibecode_saved_lid() -> Option<(u32, u32)> {
+    let cfg = read_config();
+    let v = cfg.get("vibecode_lid")?;
+    Some((
+        v.get("ac")?.as_u64()? as u32,
+        v.get("dc")?.as_u64()? as u32,
+    ))
+}
+
+pub fn save_vibecode_lid(v: Option<(u32, u32)>) {
+    let value = match v {
+        Some((ac, dc)) => serde_json::json!({ "ac": ac, "dc": dc }),
+        None => serde_json::Value::Null,
+    };
+    write_config_field("vibecode_lid", value);
+}
+
 /// Alert dedup, persisted so a restart mid-window doesn't re-alert:
 /// map of limit key → `resets_at` epoch that already fired.
 pub fn load_alerted() -> std::collections::HashMap<String, i64> {

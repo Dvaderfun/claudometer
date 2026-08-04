@@ -95,22 +95,28 @@ pub enum FetchOutcome {
     Ok(UsageSnapshot),
     Err {
         msg: String,
-        /// server Retry-After (seconds) on 429 — honored exactly
+        /// server Retry-After (seconds) on 429
         retry_after: Option<u64>,
+        /// true only for HTTP 429 — drives the jittered retry + backoff
+        rate_limited: bool,
     },
 }
 
 pub fn fetch() -> FetchOutcome {
     match fetch_inner() {
         Ok(s) => FetchOutcome::Ok(s),
-        Err((msg, retry_after)) => FetchOutcome::Err { msg, retry_after },
+        Err((msg, retry_after, rate_limited)) => FetchOutcome::Err {
+            msg,
+            retry_after,
+            rate_limited,
+        },
     }
 }
 
-pub(crate) type FetchErr = (String, Option<u64>);
+pub(crate) type FetchErr = (String, Option<u64>, bool);
 
 pub(crate) fn plain(msg: impl Into<String>) -> FetchErr {
-    (msg.into(), None)
+    (msg.into(), None, false)
 }
 
 fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
@@ -135,6 +141,7 @@ fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
         .get(USAGE_URL)
         .set("Authorization", &format!("Bearer {}", creds.oauth.access_token))
         .set("anthropic-beta", "oauth-2025-04-20")
+        .set("User-Agent", concat!("claudometer/", env!("CARGO_PKG_VERSION")))
         .call()
         .map_err(|e| match e {
             ureq::Error::Status(401, _) => {
@@ -144,7 +151,7 @@ fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
                 let retry_after = resp
                     .header("retry-after")
                     .and_then(|v| v.trim().parse::<u64>().ok());
-                ("Rate limited by the API.".to_string(), retry_after)
+                ("Rate limited by the API.".to_string(), retry_after, true)
             }
             ureq::Error::Status(code, _) => plain(format!("Anthropic API error {code}.")),
             _ => plain("Network error.\nCheck your connection."),
