@@ -2,6 +2,12 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [SemVer](https://semver.org/).
 
+## [0.7.2] — 2026-08-19
+
+### Fixed
+- **Slow console on Reconnect.** Sign-in ran `claude --version` first to check the CLI was installed, which is a full launch of a ~285 MB binary (~1 s measured) before the real launch even started. The check now resolves `claude` on `PATH` in-process and only falls back to launching it to confirm a negative. Click-to-console is ~0.8 s.
+- The account card's status line no longer wraps out of the card; it stays on one line and ellipsizes.
+
 ## [0.7.1] — 2026-08-19
 
 ### Fixed

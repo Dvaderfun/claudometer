@@ -1099,11 +1099,7 @@ unsafe fn render_settings(hwnd: HWND) {
         };
         let account = auth::snapshot();
         let (account_caption, account_action, account_connected) = if account.busy {
-            (
-                "Finish sign-in in the console window".to_string(),
-                "Cancel",
-                false,
-            )
+            ("Finish sign-in in the console".to_string(), "Cancel", false)
         } else {
             match account.connection {
                 Some(auth::ClaudeConnection::Connected { email, plan }) => {

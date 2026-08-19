@@ -235,8 +235,28 @@ fn credentials_stamp() -> Option<i64> {
     crate::api::credentials_summary().map(|c| c.expires_at)
 }
 
+/// Resolving `claude` on PATH ourselves keeps the click-to-console delay down
+/// to the CLI's own start-up. Probing with `claude --version` first cost a
+/// second full launch of a ~285 MB binary — a second or more of nothing
+/// happening before the console appeared. The launch is only used to confirm a
+/// *negative*, where the extra second doesn't matter and PATH may be lying
+/// (app execution aliases, shims that resolve outside PATHEXT).
 fn cli_present() -> bool {
-    matches!(run_claude(&["--version"], &[], VERSION_TIMEOUT), Ok(Run::Ok))
+    on_path() || matches!(run_claude(&["--version"], &[], VERSION_TIMEOUT), Ok(Run::Ok))
+}
+
+fn on_path() -> bool {
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    path.split(';').filter(|dir| !dir.is_empty()).any(|dir| {
+        let base = std::path::Path::new(dir).join("claude");
+        pathext
+            .split(';')
+            .filter(|ext| !ext.is_empty())
+            .any(|ext| base.with_extension(ext.trim_start_matches('.')).is_file())
+    })
 }
 
 fn store(connection: ClaudeConnection) {

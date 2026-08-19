@@ -245,6 +245,10 @@ pub struct Surface {
     fmt_body: IDWriteTextFormat,
     fmt_body_sb: IDWriteTextFormat,
     fmt_caption: IDWriteTextFormat,
+    /// Caption that must stay on one line — ellipsized instead of wrapping out
+    /// of its card. `fmt_caption` wraps on purpose (footer notes rely on it).
+    fmt_caption_1: IDWriteTextFormat,
+    _ellipsis: IDWriteInlineObject,
     fmt_glyph: IDWriteTextFormat,
     fmt_glyph_lg: IDWriteTextFormat,
     brushes: Option<BrushCache>,
@@ -317,6 +321,17 @@ impl Surface {
             let fmt_body = mk(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_NORMAL)?;
             let fmt_body_sb = mk(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             let fmt_caption = mk(w!("Segoe UI Variable Small"), SIZE_CAPTION, DWRITE_FONT_WEIGHT_NORMAL)?;
+            let fmt_caption_1 = mk(w!("Segoe UI Variable Small"), SIZE_CAPTION, DWRITE_FONT_WEIGHT_NORMAL)?;
+            fmt_caption_1.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            let ellipsis = dwrite.CreateEllipsisTrimmingSign(&fmt_caption_1)?;
+            fmt_caption_1.SetTrimming(
+                &DWRITE_TRIMMING {
+                    granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                    delimiter: 0,
+                    delimiterCount: 0,
+                },
+                &ellipsis,
+            )?;
             let fmt_glyph = mk(w!("Segoe Fluent Icons"), 13.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             let fmt_glyph_lg = mk(w!("Segoe Fluent Icons"), 16.0, DWRITE_FONT_WEIGHT_NORMAL)?;
 
@@ -331,6 +346,8 @@ impl Surface {
                 fmt_body,
                 fmt_body_sb,
                 fmt_caption,
+                fmt_caption_1,
+                _ellipsis: ellipsis,
                 fmt_glyph,
                 fmt_glyph_lg,
                 brushes: None,
@@ -695,7 +712,7 @@ impl Surface {
                     )?;
                     self.text(
                         &st.account_caption,
-                        &self.fmt_caption,
+                        &self.fmt_caption_1,
                         rect(card.left + 48.0, card.top + 29.0, label_right, card.top + 45.0),
                         &b.dim,
                         false,
