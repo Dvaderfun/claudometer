@@ -29,7 +29,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 |---|---|
 | `main.rs` | windows, wndprocs, tray, menu, timers, per-provider fetch orchestration (`SLOTS`), hit-testing, keyboard nav, all statics |
 | `gfx.rs` | `Surface` (D3D/DXGI/DComp/D2D stack), all drawing, layout constants, Fluent palette, brush/format caches |
-| `auth.rs` | Claude account: identity from local files, non-interactive credential repair + browser login delegated to the `claude` CLI, serialized with a cooldown |
+| `auth.rs` | Claude account: identity from local files, non-interactive credential renewal (hidden) + interactive browser sign-in (own console, cancellable) delegated to the `claude` CLI, serialized with a cooldown |
 | `api.rs` | Claude credentials read + usage fetch; shared display model (`UsageSnapshot`, `LimitRow`, `FetchOutcome`), time formatting |
 | `codex.rs` | Codex (OpenAI) credentials read + usage fetch → same `UsageSnapshot` |
 | `trayicon.rs` | CPU-rasterized ring/alert HICON (premultiplied DIB, no fonts) |

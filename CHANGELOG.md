@@ -2,6 +2,14 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [SemVer](https://semver.org/).
 
+## [0.7.1] — 2026-08-19
+
+### Fixed
+- **Reconnect hung forever.** The Claude browser sign-in ends on a hosted callback page that shows a code the user pastes back into the CLI — there is no loopback listener — but Claudometer launched `claude auth login` with a hidden window and no stdin, so it could never be completed and simply sat at "Waiting for Claude sign-in…" until the 10-minute timeout. Sign-in now runs in its own console window with working input.
+- Sign-in is cancellable: clicking the account card while it runs abandons the attempt and closes the console instead of being ignored.
+- Cancelling or timing out now terminates the whole process tree; previously only the `cmd.exe` shim was killed, orphaning `claude.exe` and its console window.
+- A missing Claude Code CLI is detected before sign-in starts, so no empty console window opens.
+
 ## [0.7.0] — 2026-08-19
 
 ### Added

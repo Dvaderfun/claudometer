@@ -35,7 +35,7 @@ A tiny native Windows app that shows how much of your Claude (and optionally Ope
 ## How it works (and what it touches)
 
 - Reads the OAuth access token from `%USERPROFILE%\.claude\.credentials.json` (and, if present, `%USERPROFILE%\.codex\auth.json`) — **read-only**. Claudometer never writes either file and never receives or rotates a refresh token.
-- Uses the installed Claude Code CLI as the account broker. When the access token is about to expire, Claudometer asks the CLI to renew it non-interactively (Claude Code does the token exchange and writes its own credentials); Connect/Reconnect starts `claude auth login --claudeai`. Claude Code owns the browser flow, token rotation, and durable credential storage.
+- Uses the installed Claude Code CLI as the account broker. When the access token is about to expire, Claudometer asks the CLI to renew it non-interactively (Claude Code does the token exchange and writes its own credentials). Connect/Reconnect opens `claude auth login --claudeai` in a console window, where you sign in through the browser and paste the code it gives you back into that window; click the card again to cancel. Claude Code owns the browser flow, token rotation, and durable credential storage.
 - Calls `https://api.anthropic.com/api/oauth/usage` — the same endpoint Claude Code's `/usage` command uses — and, when Codex is signed in, `https://chatgpt.com/backend-api/wham/usage` — the same endpoint the Codex CLI polls for its own status bar. Nothing else is contacted; no telemetry, no analytics.
 - Settings live in `%APPDATA%\Claudometer\settings.json`.
 

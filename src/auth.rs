@@ -21,7 +21,13 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// The browser sign-in ends on a *hosted* callback page that shows a code the
+/// user pastes back into the CLI — there is no loopback listener. So the login
+/// child needs a real console with real stdin; a hidden, stdin-less child can
+/// only sit at "Paste code here if prompted >" until it times out.
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const REPAIR_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
@@ -29,6 +35,7 @@ static BROKER: Mutex<()> = Mutex::new(());
 static CONNECTION: Mutex<Option<ClaudeConnection>> = Mutex::new(None);
 static INTERACTIVE_BUSY: AtomicBool = AtomicBool::new(false);
 static LAST_REPAIR: Mutex<Option<Instant>> = Mutex::new(None);
+static CANCEL_LOGIN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 pub enum ClaudeConnection {
@@ -60,7 +67,15 @@ pub fn begin_interactive() -> bool {
 
 pub fn finish_interactive(connection: ClaudeConnection) {
     store(connection);
+    CANCEL_LOGIN.store(false, Ordering::SeqCst);
     INTERACTIVE_BUSY.store(false, Ordering::SeqCst);
+}
+
+/// Sign-in happens in a console the user drives, so it can outlive their
+/// interest in it. Asking again while it runs abandons it instead of being
+/// ignored — otherwise the card reads "waiting" for the full timeout.
+pub fn cancel_interactive() {
+    CANCEL_LOGIN.store(true, Ordering::SeqCst);
 }
 
 // ---------- identity (local reads, no process spawn) ----------
@@ -165,18 +180,63 @@ pub fn repair_session_if_due() -> bool {
     advanced
 }
 
-/// Let Claude Code own the complete browser login and token persistence flow.
+/// Let Claude Code own the complete browser login and token persistence flow,
+/// in its own console window so the user can read the fallback URL and paste
+/// the callback code. Completion is detected from the credentials file rather
+/// than from process exit: the console may linger after the CLI is done, and
+/// its exit code says nothing about whether credentials were actually written.
 pub fn login() -> ClaudeConnection {
     let Ok(_guard) = BROKER.lock() else {
         return ClaudeConnection::Problem("Couldn't start Claude sign-in".into());
     };
-    match run_claude(&["auth", "login", "--claudeai"], &[], LOGIN_TIMEOUT) {
-        Ok(Run::Ok) => query_status(),
-        Ok(Run::CliMissing) => ClaudeConnection::CliUnavailable,
-        Ok(Run::Failed) => ClaudeConnection::Problem("Claude sign-in wasn't completed".into()),
-        Err(RunError::TimedOut) => ClaudeConnection::Problem("Claude sign-in timed out".into()),
-        Err(RunError::Launch) => ClaudeConnection::CliUnavailable,
+    // Check first — opening an empty console for a missing CLI helps nobody.
+    if !cli_present() {
+        return ClaudeConnection::CliUnavailable;
     }
+    let before = credentials_stamp();
+    let mut child = match Command::new("cmd.exe")
+        .args(["/D", "/S", "/C", "claude", "auth", "login", "--claudeai"])
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return ClaudeConnection::CliUnavailable,
+    };
+
+    let started = Instant::now();
+    loop {
+        if credentials_stamp().is_some_and(|now| Some(now) != before) {
+            // Credentials changed: sign-in landed. Leave the console alone —
+            // it closes itself once the CLI prints its result.
+            return query_status();
+        }
+        if CANCEL_LOGIN.load(Ordering::SeqCst) {
+            kill(&mut child);
+            return query_status();
+        }
+        match child.try_wait() {
+            // Exited without writing credentials — cancelled or failed.
+            Ok(Some(_)) => return ClaudeConnection::Problem("Sign-in wasn't completed".into()),
+            Ok(None) if started.elapsed() < LOGIN_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            Ok(None) => {
+                kill(&mut child);
+                return ClaudeConnection::Problem("Sign-in timed out".into());
+            }
+            Err(_) => return ClaudeConnection::Problem("Sign-in wasn't completed".into()),
+        }
+    }
+}
+
+/// Access-token expiry doubles as a "credentials were just rewritten" marker:
+/// any successful sign-in moves it, and `None` covers the not-signed-in start.
+fn credentials_stamp() -> Option<i64> {
+    crate::api::credentials_summary().map(|c| c.expires_at)
+}
+
+fn cli_present() -> bool {
+    matches!(run_claude(&["--version"], &[], VERSION_TIMEOUT), Ok(Run::Ok))
 }
 
 fn store(connection: ClaudeConnection) {
@@ -245,7 +305,16 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<S
     })
 }
 
+/// `Child::kill` terminates only the `cmd.exe` shim — `claude.exe` and its
+/// console window would survive as orphans. Take the whole tree down.
 fn kill(child: &mut Child) {
+    let _ = Command::new("taskkill.exe")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
     let _ = child.kill();
     let _ = child.wait();
 }

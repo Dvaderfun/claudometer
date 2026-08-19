@@ -712,6 +712,9 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
 fn activate_claude_account() {
     let snap = auth::snapshot();
     if snap.busy {
+        // Sign-in runs in a console the user drives; a second click abandons a
+        // flow they've given up on instead of doing nothing for ten minutes.
+        auth::cancel_interactive();
         return;
     }
     match snap.connection {
@@ -1096,7 +1099,11 @@ unsafe fn render_settings(hwnd: HWND) {
         };
         let account = auth::snapshot();
         let (account_caption, account_action, account_connected) = if account.busy {
-            ("Waiting for Claude sign-in…".to_string(), "…", false)
+            (
+                "Finish sign-in in the console window".to_string(),
+                "Cancel",
+                false,
+            )
         } else {
             match account.connection {
                 Some(auth::ClaudeConnection::Connected { email, plan }) => {
