@@ -2,6 +2,20 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [SemVer](https://semver.org/).
 
+## [0.7.0] — 2026-08-19
+
+### Added
+- **First-class Claude account connection** in Settings: linked email/plan status, Connect/Reconnect browser flow, and install guidance when Claude Code is missing. The official Claude Code CLI remains the credential owner; Claudometer never performs a token exchange and never writes a credentials file.
+- **Automatic sign-in renewal.** Within 5 minutes of access-token expiry, or after an authoritative 401, Claudometer hands the Claude Code CLI its own refresh token so the CLI renews and rewrites its credentials; usage is then retried with credentials re-read from disk. Renewal is single-flight with a 5-minute cooldown. Reconnecting by hand is now only needed for a revoked or long-dead session.
+
+### Fixed
+- **Wrong plan in the flyout header.** The plan came from `.credentials.json`'s `subscriptionType`, which is written once at sign-in and never updated — a Max→Pro change still showed "Max" indefinitely. The plan now comes from the account profile endpoint (cached for an hour, with an offline fallback).
+- Claude credential "repair" previously ran `claude auth status`, which is a purely local read with no network call: it could never renew a token, yet launched a CLI process every 5 minutes while an account was expired.
+- Footer notes no longer read "Claude: Claude account needs attention" — the section title already names the provider.
+
+### Changed
+- The Settings account card reads the identity Claude Code caches on disk instead of launching the CLI, so opening Settings (and app startup) no longer spawns a process.
+
 ## [0.6.0] — 2026-08-04
 
 ### Added

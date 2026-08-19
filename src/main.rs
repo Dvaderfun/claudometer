@@ -6,6 +6,7 @@
 
 mod alerts;
 mod api;
+mod auth;
 mod codex;
 mod gfx;
 mod trayicon;
@@ -40,6 +41,8 @@ const WM_DATA_READY: u32 = WM_APP + 2;
 pub(crate) const WM_TOAST_ACTIVATED: u32 = WM_APP + 3;
 /// updater state changed (wparam 0) / handover ready, quit now (wparam 1)
 pub(crate) const WM_UPDATE: u32 = WM_APP + 4;
+/// Claude Code auth status/login completed on its worker thread.
+const WM_AUTH_READY: u32 = WM_APP + 5;
 
 const IDM_REFRESH: usize = 1;
 const IDM_AUTOSTART: usize = 2;
@@ -259,6 +262,7 @@ fn main() -> Result<()> {
         POLL_SECS.store(util::load_poll_secs(), Ordering::SeqCst);
         SetTimer(main, TIMER_POLL, POLL_SECS.load(Ordering::SeqCst) * 1000, None);
         // TIMER_TICK runs only while the flyout is visible (started in show_flyout)
+        spawn_claude_account(false);
         spawn_fetch_all(false);
         updater::maybe_check();
 
@@ -300,6 +304,29 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 run_alert_checks();
                 if IsWindowVisible(flyout_hwnd()).as_bool() {
                     show_flyout(ANCHOR_X.load(Ordering::SeqCst), ANCHOR_Y.load(Ordering::SeqCst));
+                }
+                let sh = settings_hwnd();
+                if !sh.is_invalid() && IsWindowVisible(sh).as_bool() {
+                    render_settings(sh);
+                }
+                LRESULT(0)
+            }
+            WM_AUTH_READY => {
+                let sh = settings_hwnd();
+                if !sh.is_invalid() && IsWindowVisible(sh).as_bool() {
+                    render_settings(sh);
+                }
+                if matches!(
+                    auth::snapshot().connection,
+                    Some(auth::ClaudeConnection::Connected { .. })
+                ) {
+                    // Login/status may have repaired the token that just
+                    // failed; do not let the normal refresh debounce delay it.
+                    *slot(Provider::Claude).last_fetch.lock().unwrap() = None;
+                    spawn_fetch(Provider::Claude, true);
+                } else {
+                    update_tray(hwnd);
+                    render_flyout_current();
                 }
                 LRESULT(0)
             }
@@ -646,9 +673,10 @@ unsafe fn step_interval(dir: i32) {
 
 unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
     match i {
-        0 => util::set_caps_led_enabled(!util::caps_led_enabled()),
-        1 => util::set_autostart(!util::autostart_enabled()),
-        2 => {
+        gfx::CARD_ACCOUNT => activate_claude_account(),
+        1 => util::set_caps_led_enabled(!util::caps_led_enabled()),
+        2 => util::set_autostart(!util::autostart_enabled()),
+        3 => {
             let on = !util::show_codex();
             util::set_show_codex(on);
             if on {
@@ -656,15 +684,15 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
             }
             update_tray(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
         }
-        3 => util::set_alerts_enabled(!util::alerts_enabled()),
-        4 => {
+        4 => util::set_alerts_enabled(!util::alerts_enabled()),
+        5 => {
             // keyboard activate on the interval card: cycle to the next option
             let cur = POLL_SECS.load(Ordering::SeqCst);
             let idx = gfx::INTERVALS.iter().position(|(s, _)| *s == cur).unwrap_or(1);
             apply_interval(gfx::INTERVALS[(idx + 1) % gfx::INTERVALS.len()].0);
         }
-        5 => spawn_fetch_all(true),
-        6 => match updater::status() {
+        6 => spawn_fetch_all(true),
+        7 => match updater::status() {
             updater::Status::Available(_) => updater::install(),
             updater::Status::Installing => {}
             updater::Status::Failed(_, page) => {
@@ -672,13 +700,29 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
             }
             updater::Status::UpToDate => updater::open_url(updater::REPO_URL),
         },
-        7 => {
+        8 => {
             let _ = DestroyWindow(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
             return;
         }
         _ => {}
     }
     render_settings(hwnd);
+}
+
+fn activate_claude_account() {
+    let snap = auth::snapshot();
+    if snap.busy {
+        return;
+    }
+    match snap.connection {
+        Some(auth::ClaudeConnection::CliUnavailable) => {
+            updater::open_url("https://docs.anthropic.com/en/docs/claude-code/getting-started");
+        }
+        // An initial click retries status; every known account state starts
+        // the official browser flow so expired and switched accounts recover.
+        None => spawn_claude_account(false),
+        Some(_) => spawn_claude_account(true),
+    }
 }
 
 // ---------- hit testing ----------
@@ -947,6 +991,9 @@ unsafe fn render_flyout_current() {
 
 unsafe fn open_settings() {
     UI.with(|ui| ui.borrow_mut().set_focus = -1);
+    if auth::snapshot().connection.is_none() {
+        spawn_claude_account(false);
+    }
     let existing = settings_hwnd();
     if !existing.is_invalid() {
         render_settings(existing);
@@ -1047,7 +1094,33 @@ unsafe fn render_settings(hwnd: HWND) {
             updater::Status::Installing => ("Installing update…".to_string(), "…"),
             updater::Status::Failed(msg, _) => (format!("Update failed — {msg}"), "GitHub"),
         };
+        let account = auth::snapshot();
+        let (account_caption, account_action, account_connected) = if account.busy {
+            ("Waiting for Claude sign-in…".to_string(), "…", false)
+        } else {
+            match account.connection {
+                Some(auth::ClaudeConnection::Connected { email, plan }) => {
+                    let caption = if plan.is_empty() {
+                        email
+                    } else {
+                        format!("{email} · {plan}")
+                    };
+                    (caption, "Reconnect", true)
+                }
+                Some(auth::ClaudeConnection::Disconnected) => {
+                    ("Not connected".to_string(), "Connect", false)
+                }
+                Some(auth::ClaudeConnection::CliUnavailable) => {
+                    ("Claude Code is required".to_string(), "Install", false)
+                }
+                Some(auth::ClaudeConnection::Problem(msg)) => (msg, "Reconnect", false),
+                None => ("Checking connection…".to_string(), "…", false),
+            }
+        };
         let st = gfx::SettingsView {
+            account_caption,
+            account_action,
+            account_connected,
             caps_on: util::caps_led_enabled(),
             autostart: util::autostart_enabled(),
             codex_on: util::show_codex(),
@@ -1068,6 +1141,26 @@ unsafe fn render_settings(hwnd: HWND) {
                 dark,
                 accent,
             );
+        }
+    });
+}
+
+fn spawn_claude_account(login: bool) {
+    if !auth::begin_interactive() {
+        return;
+    }
+    let h = MAIN_HWND.load(Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let connection = if login {
+            auth::login()
+        } else {
+            auth::query_status()
+        };
+        auth::finish_interactive(connection);
+        if h != 0 {
+            unsafe {
+                let _ = PostMessageW(HWND(h as *mut _), WM_AUTH_READY, WPARAM(0), LPARAM(0));
+            }
         }
     });
 }

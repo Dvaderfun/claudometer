@@ -1,14 +1,26 @@
 //! Fetches usage limits from the same endpoint Claude Code's `/usage` uses.
 //! Also home of the provider-agnostic display model (`UsageSnapshot`,
 //! `LimitRow`, `FetchOutcome`) shared with `codex.rs`.
-//! Read-only: never refreshes or rewrites the OAuth token (refresh rotation
-//! could invalidate the Claude Code session).
+//! Claudometer never performs a token exchange and never writes credentials.
+//! When the access token is near expiry or rejected, `auth.rs` asks the official
+//! Claude Code CLI to rotate its own credentials, and this module re-reads them.
 
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::auth;
+
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// Authoritative plan/identity. `.credentials.json`'s `subscriptionType` is
+/// written once at login and survives plan changes unchanged, so it reports
+/// "max" long after a downgrade — this endpoint is the only source that moves.
+const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+/// The plan changes at most monthly; one profile round-trip per hour is plenty.
+const PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+static PLAN_CACHE: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
 
 // ---------- credentials ----------
 
@@ -22,11 +34,51 @@ struct CredsFile {
 #[serde(rename_all = "camelCase")]
 struct Oauth {
     access_token: String,
+    /// Read-only: handed straight to the Claude Code CLI for its own rotation.
+    refresh_token: Option<String>,
     expires_at: i64,
-    subscription_type: Option<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+/// Credential facts `auth.rs` needs without giving it the access token.
+pub struct CredsSummary {
+    pub refresh_token: Option<String>,
+    pub scopes: Vec<String>,
+    pub expires_at: i64,
+    pub has_refresh_token: bool,
+    pub expired: bool,
+}
+
+pub fn credentials_summary() -> Option<CredsSummary> {
+    let oauth = read_credentials().ok()?.oauth;
+    Some(CredsSummary {
+        has_refresh_token: oauth.refresh_token.is_some(),
+        expired: OffsetDateTime::now_utc().unix_timestamp() * 1000 > oauth.expires_at,
+        refresh_token: oauth.refresh_token,
+        scopes: oauth.scopes,
+        expires_at: oauth.expires_at,
+    })
 }
 
 // ---------- API response ----------
+
+#[derive(Deserialize)]
+struct ProfileResp {
+    account: Option<ProfileAccount>,
+    organization: Option<ProfileOrg>,
+}
+
+#[derive(Deserialize)]
+struct ProfileAccount {
+    has_claude_max: Option<bool>,
+    has_claude_pro: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct ProfileOrg {
+    organization_type: Option<String>,
+}
 
 #[derive(Deserialize)]
 struct UsageResp {
@@ -119,17 +171,31 @@ pub(crate) fn plain(msg: impl Into<String>) -> FetchErr {
     (msg.into(), None, false)
 }
 
-fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
+fn read_credentials() -> Result<CredsFile, FetchErr> {
     let home = std::env::var("USERPROFILE").map_err(|_| plain("USERPROFILE not set"))?;
     let path = std::path::Path::new(&home).join(".claude").join(".credentials.json");
     let raw = std::fs::read_to_string(&path)
-        .map_err(|_| plain("No Claude sign-in found.\nSign in with Claude Code first."))?;
-    let creds: CredsFile =
-        serde_json::from_str(&raw).map_err(|_| plain("Credentials file unreadable."))?;
+        .map_err(|_| plain("Not signed in.\nOpen Settings to connect."))?;
+    serde_json::from_str(&raw).map_err(|_| plain("Credentials file unreadable."))
+}
+
+fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
+    let mut creds = read_credentials()?;
 
     let now_ms = OffsetDateTime::now_utc().unix_timestamp() * 1000;
+    let mut repaired = false;
+    // Give Claude Code time to rotate the access token before it expires. The
+    // broker is cooled down in auth.rs, so this stays cheap during an outage.
+    if creds.oauth.expires_at <= now_ms + 5 * 60 * 1000 {
+        repaired = auth::repair_session_if_due();
+        if repaired {
+            creds = read_credentials()?;
+        }
+    }
     if now_ms > creds.oauth.expires_at {
-        return Err(plain("Sign-in expired.\nOpen Claude Code once to refresh it."));
+        return Err(plain(
+            "Sign-in expired.\nOpen Settings to reconnect.",
+        ));
     }
 
     let tls = native_tls::TlsConnector::new().map_err(|_| plain("TLS init failed"))?;
@@ -137,30 +203,139 @@ fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
         .tls_connector(std::sync::Arc::new(tls))
         .timeout(std::time::Duration::from_secs(10))
         .build();
-    let resp = agent
-        .get(USAGE_URL)
-        .set("Authorization", &format!("Bearer {}", creds.oauth.access_token))
-        .set("anthropic-beta", "oauth-2025-04-20")
-        .set("User-Agent", concat!("claudometer/", env!("CARGO_PKG_VERSION")))
-        .call()
-        .map_err(|e| match e {
-            ureq::Error::Status(401, _) => {
-                plain("Sign-in rejected (401).\nOpen Claude Code once to refresh it.")
+    let request = |oauth: &Oauth| -> Result<ureq::Response, RequestFailure> {
+        agent
+            .get(USAGE_URL)
+            .set("Authorization", &format!("Bearer {}", oauth.access_token))
+            .set("anthropic-beta", "oauth-2025-04-20")
+            .set("User-Agent", concat!("claudometer/", env!("CARGO_PKG_VERSION")))
+            .call()
+            .map_err(compact_request_error)
+    };
+    let resp = match request(&creds.oauth) {
+        Ok(resp) => resp,
+        Err(RequestFailure::Auth) if !repaired => {
+            // Server authority beats the local expiry stamp. Ask the official
+            // broker once, then retry only with credentials re-read from disk.
+            if auth::repair_session_if_due() {
+                creds = read_credentials()?;
+                request(&creds.oauth).map_err(RequestFailure::into_fetch_error)?
+            } else {
+                return Err(plain(
+                    "Sign-in rejected.\nOpen Settings to reconnect.",
+                ));
             }
-            ureq::Error::Status(429, resp) => {
-                let retry_after = resp
-                    .header("retry-after")
-                    .and_then(|v| v.trim().parse::<u64>().ok());
-                ("Rate limited by the API.".to_string(), retry_after, true)
-            }
-            ureq::Error::Status(code, _) => plain(format!("Anthropic API error {code}.")),
-            _ => plain("Network error.\nCheck your connection."),
-        })?;
+        }
+        Err(e) => return Err(e.into_fetch_error()),
+    };
 
     let body = resp.into_string().map_err(|_| plain("Bad API response."))?;
     let parsed: UsageResp =
         serde_json::from_str(&body).map_err(|_| plain("Unexpected API response shape."))?;
 
+    let plan = resolve_plan(&agent, &creds.oauth.access_token);
+    parse_usage(parsed, plan)
+}
+
+/// Plan name for the flyout header. Hits `/oauth/profile` at most once an hour
+/// and falls back to the profile Claude Code caches in `~/.claude.json`, so a
+/// profile outage shows a slightly stale plan rather than none.
+fn resolve_plan(agent: &ureq::Agent, access_token: &str) -> String {
+    if let Ok(cache) = PLAN_CACHE.lock() {
+        if let Some((plan, at)) = cache.as_ref() {
+            if at.elapsed() < PLAN_TTL {
+                return plan.clone();
+            }
+        }
+    }
+    let Some(plan) = fetch_plan(agent, access_token).or_else(crate::auth::local_plan) else {
+        // Keep showing the last known plan rather than blanking the header.
+        return PLAN_CACHE
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|(p, _)| p.clone()))
+            .unwrap_or_default();
+    };
+    if let Ok(mut cache) = PLAN_CACHE.lock() {
+        *cache = Some((plan.clone(), std::time::Instant::now()));
+    }
+    plan
+}
+
+fn fetch_plan(agent: &ureq::Agent, access_token: &str) -> Option<String> {
+    let body = agent
+        .get(PROFILE_URL)
+        .set("Authorization", &format!("Bearer {access_token}"))
+        .set("anthropic-beta", "oauth-2025-04-20")
+        .set("User-Agent", concat!("claudometer/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    plan_from_profile(&serde_json::from_str::<ProfileResp>(&body).ok()?)
+}
+
+fn plan_from_profile(profile: &ProfileResp) -> Option<String> {
+    // organization_type is "claude_pro" / "claude_max" / "claude_team"…; the
+    // account booleans are the fallback for org shapes that don't set it.
+    if let Some(ty) = profile.organization.as_ref().and_then(|o| o.organization_type.as_deref()) {
+        return Some(plan_label(ty.strip_prefix("claude_").unwrap_or(ty)));
+    }
+    let account = profile.account.as_ref()?;
+    match (account.has_claude_max, account.has_claude_pro) {
+        (Some(true), _) => Some("Max".to_string()),
+        (_, Some(true)) => Some("Pro".to_string()),
+        _ => None,
+    }
+}
+
+/// "pro" -> "Pro", "max_5x" -> "Max 5x". Shared with `auth.rs`.
+pub fn plan_label(raw: &str) -> String {
+    match raw {
+        "max" => "Max".to_string(),
+        "pro" => "Pro".to_string(),
+        "team" => "Team".to_string(),
+        other => prettify(other),
+    }
+}
+
+enum RequestFailure {
+    Auth,
+    Other(FetchErr),
+}
+
+impl RequestFailure {
+    fn into_fetch_error(self) -> FetchErr {
+        match self {
+            Self::Auth => plain(
+                "Sign-in rejected.\nOpen Settings to reconnect.",
+            ),
+            Self::Other(err) => err,
+        }
+    }
+}
+
+fn compact_request_error(e: ureq::Error) -> RequestFailure {
+    match e {
+        ureq::Error::Status(401, _) => RequestFailure::Auth,
+        ureq::Error::Status(429, resp) => {
+            let retry_after = resp
+                .header("retry-after")
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            RequestFailure::Other((
+                "Rate limited by the API.".to_string(),
+                retry_after,
+                true,
+            ))
+        }
+        ureq::Error::Status(code, _) => {
+            RequestFailure::Other(plain(format!("Anthropic API error {code}.")))
+        }
+        _ => RequestFailure::Other(plain("Network error.\nCheck your connection.")),
+    }
+}
+
+fn parse_usage(parsed: UsageResp, plan: String) -> Result<UsageSnapshot, FetchErr> {
     let mut rows: Vec<LimitRow> = Vec::new();
 
     if let Some(limits) = &parsed.limits {
@@ -235,14 +410,6 @@ fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
     if rows.is_empty() {
         return Err(plain("API returned no limit data."));
     }
-
-    let plan = match creds.oauth.subscription_type.as_deref() {
-        Some("max") => "Max".to_string(),
-        Some("pro") => "Pro".to_string(),
-        Some("team") => "Team".to_string(),
-        Some(other) => prettify(other),
-        None => String::new(),
-    };
 
     Ok(UsageSnapshot {
         rows,

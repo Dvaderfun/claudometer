@@ -29,6 +29,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 |---|---|
 | `main.rs` | windows, wndprocs, tray, menu, timers, per-provider fetch orchestration (`SLOTS`), hit-testing, keyboard nav, all statics |
 | `gfx.rs` | `Surface` (D3D/DXGI/DComp/D2D stack), all drawing, layout constants, Fluent palette, brush/format caches |
+| `auth.rs` | Claude account: identity from local files, non-interactive credential repair + browser login delegated to the `claude` CLI, serialized with a cooldown |
 | `api.rs` | Claude credentials read + usage fetch; shared display model (`UsageSnapshot`, `LimitRow`, `FetchOutcome`), time formatting |
 | `codex.rs` | Codex (OpenAI) credentials read + usage fetch → same `UsageSnapshot` |
 | `trayicon.rs` | CPU-rasterized ring/alert HICON (premultiplied DIB, no fonts) |
@@ -55,9 +56,10 @@ Two independent providers, one worker thread each per poll (~1/min), both produc
 
 **Claude** (`api.rs::fetch`):
 
-1. Read `%USERPROFILE%\.claude\.credentials.json` — **read-only, never refreshed** (refresh rotation would kill the user's Claude Code session). Expired → friendly error.
+1. Read `%USERPROFILE%\.claude\.credentials.json` — always read-only. Within 5 min of expiry, or on an authoritative 401, `auth.rs` runs `claude auth login` with `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`/`_SCOPES` set from that file so Claude Code performs the exchange and rewrites its own credentials; Claudometer re-reads them and retries once. Repair is single-flight with a 5 min cooldown and only counts as success when `expiresAt` actually moved forward.
 2. `GET api.anthropic.com/api/oauth/usage`, Bearer token, `anthropic-beta: oauth-2025-04-20`, via ureq + native-tls (schannel — OS cert store, no C deps). **Unofficial endpoint** — parsing is defensive, every field optional.
 3. Prefer the `limits[]` array (kind/percent/severity/resets_at/scope); fall back to legacy `five_hour`/`seven_day`; append `extra_usage` if enabled.
+4. Plan label comes from `GET /api/oauth/profile` (cached 1 h, falls back to `~/.claude.json` then to the last known value) — the credentials file's `subscriptionType` is stale after a plan change.
 
 **Codex** (`codex.rs::fetch`):
 
@@ -107,7 +109,7 @@ Install (only on click), all failure paths falling back to opening the release p
 
 - Cross-thread: `SLOTS[2]` (per-provider `state`, `last_good`, `last_fetch`, `cooldown_until` mutexes + `fetching` atomic); `POLL_SECS`, hwnds (atomics).
 - UI-thread only: `UI` thread_local — surfaces, hover, keyboard focus, mouse-tracking flags.
-- Persistent: `%APPDATA%\Claudometer\settings.json` (poll interval, Codex toggle, alerts toggle, `alerted` dedup map, Vibecode flag + saved lid indices), `%APPDATA%\Claudometer\icon.ico` (toast icon), HKCU Run key (autostart), HKCU AppUserModelId key (toast registration), `~/.claude/hooks/caps-led.disabled` (LED kill switch).
+- Persistent: `%APPDATA%\Claudometer\settings.json` (poll interval, Codex toggle, alerts toggle, `alerted` dedup map, Vibecode flag + saved lid indices), `%APPDATA%\Claudometer\icon.ico` (toast icon), HKCU Run key (autostart), HKCU AppUserModelId key (toast registration), `~/.claude/hooks/caps-led.disabled` (LED kill switch). Account credentials remain owned by Claude Code/Codex; Claudometer adds no token store.
 
 ## Known gaps
 

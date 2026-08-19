@@ -64,6 +64,9 @@ pub enum FlyHover {
 }
 
 pub struct SettingsView {
+    pub account_caption: String,
+    pub account_action: &'static str,
+    pub account_connected: bool,
     pub caps_on: bool,
     pub autostart: bool,
     pub codex_on: bool,
@@ -169,9 +172,10 @@ pub const SET_W: f32 = 400.0;
 const SET_PAD: f32 = 24.0;
 const CARD_H: f32 = 56.0;
 const CARD_GAP: f32 = 4.0;
-pub const N_CARDS: usize = 8;
+pub const N_CARDS: usize = 9;
+pub const CARD_ACCOUNT: usize = 0;
 /// Card index of the auto-refresh interval row (pills, ←/→ keyboard handling).
-pub const CARD_INTERVAL: usize = 4;
+pub const CARD_INTERVAL: usize = 5;
 
 pub fn settings_height() -> f32 {
     let cards = N_CARDS as f32 * CARD_H + (N_CARDS as f32 - 1.0) * CARD_GAP;
@@ -642,6 +646,7 @@ impl Surface {
             self.dc.Clear(None); // Mica shows through
 
             let labels: [&str; N_CARDS] = [
+                "Claude account",
                 "Caps Lock light shows Claude status",
                 "Start with Windows",
                 "Show Codex usage",
@@ -651,11 +656,11 @@ impl Surface {
                 st.about.as_str(),
                 "Quit Claudometer",
             ];
-            // Segoe Fluent Icons: keyboard, power, command prompt, bell
-            // (EA8F Ringer — E7ED is the *muted* bell), clock, refresh, info,
-            // cancel
+            // Segoe Fluent Icons: account, keyboard, power, command prompt,
+            // bell (EA8F Ringer — E7ED is the muted bell), clock, refresh,
+            // info, cancel
             let icons = [
-                "\u{E765}", "\u{E7E8}", "\u{E756}", "\u{EA8F}",
+                "\u{E77B}", "\u{E765}", "\u{E7E8}", "\u{E756}", "\u{EA8F}",
                 "\u{E823}", "\u{E72C}", "\u{E946}", "\u{E711}",
             ];
             let cards = settings_rects();
@@ -671,21 +676,45 @@ impl Surface {
                 self.dc.DrawRoundedRectangle(&rr, &b.card_stroke, 1.0, None);
 
                 let cy0 = (card.top + card.bottom) / 2.0;
-                let icon_brush = if i == 6 && st.update_ready { &b.accent } else { &b.text };
+                let icon_brush = if (i == CARD_ACCOUNT && st.account_connected)
+                    || (i == 7 && st.update_ready)
+                {
+                    &b.accent
+                } else {
+                    &b.text
+                };
                 self.icon16(icons[i], rect(card.left + 16.0, cy0 - 10.0, card.left + 36.0, cy0 + 10.0), icon_brush)?;
                 let label_right = if i == CARD_INTERVAL { card.right - 200.0 } else { card.right - 120.0 };
-                self.text_v(labels[i], &self.fmt_body, rect(card.left + 48.0, card.top, label_right, card.bottom), &b.text)?;
+                if i == CARD_ACCOUNT {
+                    self.text(
+                        labels[i],
+                        &self.fmt_body,
+                        rect(card.left + 48.0, card.top + 7.0, label_right, card.top + 27.0),
+                        &b.text,
+                        false,
+                    )?;
+                    self.text(
+                        &st.account_caption,
+                        &self.fmt_caption,
+                        rect(card.left + 48.0, card.top + 29.0, label_right, card.top + 45.0),
+                        &b.dim,
+                        false,
+                    )?;
+                } else {
+                    self.text_v(labels[i], &self.fmt_body, rect(card.left + 48.0, card.top, label_right, card.bottom), &b.text)?;
+                }
 
                 let cy = (card.top + card.bottom) / 2.0;
                 match i {
-                    0 => self.toggle(card.right - 16.0, cy, st.caps_on)?,
-                    1 => self.toggle(card.right - 16.0, cy, st.autostart)?,
-                    2 => self.toggle(card.right - 16.0, cy, st.codex_on)?,
-                    3 => self.toggle(card.right - 16.0, cy, st.alerts_on)?,
-                    4 => self.interval_row(card, st.poll_secs)?,
-                    5 => self.button(card.right - 16.0, cy, "Refresh")?,
-                    6 => self.button(card.right - 16.0, cy, st.about_btn)?,
-                    7 => self.button(card.right - 16.0, cy, "Quit")?,
+                    CARD_ACCOUNT => self.button(card.right - 16.0, cy, st.account_action)?,
+                    1 => self.toggle(card.right - 16.0, cy, st.caps_on)?,
+                    2 => self.toggle(card.right - 16.0, cy, st.autostart)?,
+                    3 => self.toggle(card.right - 16.0, cy, st.codex_on)?,
+                    4 => self.toggle(card.right - 16.0, cy, st.alerts_on)?,
+                    5 => self.interval_row(card, st.poll_secs)?,
+                    6 => self.button(card.right - 16.0, cy, "Refresh")?,
+                    7 => self.button(card.right - 16.0, cy, st.about_btn)?,
+                    8 => self.button(card.right - 16.0, cy, "Quit")?,
                     _ => {}
                 }
 
