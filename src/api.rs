@@ -1,15 +1,13 @@
 //! Fetches usage limits from the same endpoint Claude Code's `/usage` uses.
 //! Also home of the provider-agnostic display model (`UsageSnapshot`,
 //! `LimitRow`, `FetchOutcome`) shared with `codex.rs`.
-//! Claudometer never performs a token exchange and never writes credentials.
-//! When the access token is near expiry or rejected, `auth.rs` asks the official
-//! Claude Code CLI to rotate its own credentials, and this module re-reads them.
+//! Read-only: Claudometer never exchanges refresh tokens or writes credentials.
+//! Claude Code alone owns its rotating OAuth session; this module trusts the
+//! API response instead of treating the local `expiresAt` hint as authoritative.
 
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
-
-use crate::auth;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// Authoritative plan/identity. `.credentials.json`'s `subscriptionType` is
@@ -34,31 +32,55 @@ struct CredsFile {
 #[serde(rename_all = "camelCase")]
 struct Oauth {
     access_token: String,
-    /// Read-only: handed straight to the Claude Code CLI for its own rotation.
-    refresh_token: Option<String>,
     expires_at: i64,
-    #[serde(default)]
-    scopes: Vec<String>,
 }
 
-/// Credential facts `auth.rs` needs without giving it the access token.
-pub struct CredsSummary {
-    pub refresh_token: Option<String>,
-    pub scopes: Vec<String>,
-    pub expires_at: i64,
-    pub has_refresh_token: bool,
-    pub expired: bool,
+#[derive(Clone, PartialEq, Eq)]
+pub struct CredentialsStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    expires_at: i64,
 }
 
-pub fn credentials_summary() -> Option<CredsSummary> {
-    let oauth = read_credentials().ok()?.oauth;
-    Some(CredsSummary {
-        has_refresh_token: oauth.refresh_token.is_some(),
-        expired: OffsetDateTime::now_utc().unix_timestamp() * 1000 > oauth.expires_at,
-        refresh_token: oauth.refresh_token,
-        scopes: oauth.scopes,
-        expires_at: oauth.expires_at,
+pub fn credentials_available() -> bool {
+    read_credentials().is_ok()
+}
+
+pub fn credentials_stamp() -> Option<CredentialsStamp> {
+    let path = credentials_path()?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    let expires_at = read_credentials().ok()?.oauth.expires_at;
+    Some(CredentialsStamp {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+        expires_at,
     })
+}
+
+fn claude_config_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".claude"))
+        })
+}
+
+fn credentials_path() -> Option<std::path::PathBuf> {
+    Some(claude_config_dir()?.join(".credentials.json"))
+}
+
+/// Claude Code places `.claude.json` inside a custom config directory, but at
+/// the profile root for the default configuration.
+pub fn claude_state_path() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()) {
+        return Some(std::path::PathBuf::from(dir).join(".claude.json"));
+    }
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".claude.json"))
 }
 
 // ---------- API response ----------
@@ -172,31 +194,34 @@ pub(crate) fn plain(msg: impl Into<String>) -> FetchErr {
 }
 
 fn read_credentials() -> Result<CredsFile, FetchErr> {
-    let home = std::env::var("USERPROFILE").map_err(|_| plain("USERPROFILE not set"))?;
-    let path = std::path::Path::new(&home).join(".claude").join(".credentials.json");
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|_| plain("Not signed in.\nOpen Settings to connect."))?;
-    serde_json::from_str(&raw).map_err(|_| plain("Credentials file unreadable."))
+    let path = credentials_path().ok_or_else(|| plain("Claude config path unavailable."))?;
+    let mut file_seen = false;
+    for attempt in 0..3 {
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => {
+                file_seen = true;
+                if let Ok(credentials) = serde_json::from_str(&raw) {
+                    return Ok(credentials);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => file_seen = true,
+        }
+        if attempt < 2 {
+            // Claude Code replaces this file during token rotation. A tiny retry
+            // avoids misreporting that atomic hand-off as a logout.
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    if file_seen {
+        Err(plain("Credentials temporarily unavailable.\nKeeping the last reading."))
+    } else {
+        Err(plain("Not signed in.\nOpen Settings to connect."))
+    }
 }
 
 fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
-    let mut creds = read_credentials()?;
-
-    let now_ms = OffsetDateTime::now_utc().unix_timestamp() * 1000;
-    let mut repaired = false;
-    // Give Claude Code time to rotate the access token before it expires. The
-    // broker is cooled down in auth.rs, so this stays cheap during an outage.
-    if creds.oauth.expires_at <= now_ms + 5 * 60 * 1000 {
-        repaired = auth::repair_session_if_due();
-        if repaired {
-            creds = read_credentials()?;
-        }
-    }
-    if now_ms > creds.oauth.expires_at {
-        return Err(plain(
-            "Sign-in expired.\nOpen Settings to reconnect.",
-        ));
-    }
+    let creds = read_credentials()?;
 
     let tls = native_tls::TlsConnector::new().map_err(|_| plain("TLS init failed"))?;
     let agent = ureq::AgentBuilder::new()
@@ -212,22 +237,7 @@ fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
             .call()
             .map_err(compact_request_error)
     };
-    let resp = match request(&creds.oauth) {
-        Ok(resp) => resp,
-        Err(RequestFailure::Auth) if !repaired => {
-            // Server authority beats the local expiry stamp. Ask the official
-            // broker once, then retry only with credentials re-read from disk.
-            if auth::repair_session_if_due() {
-                creds = read_credentials()?;
-                request(&creds.oauth).map_err(RequestFailure::into_fetch_error)?
-            } else {
-                return Err(plain(
-                    "Sign-in rejected.\nOpen Settings to reconnect.",
-                ));
-            }
-        }
-        Err(e) => return Err(e.into_fetch_error()),
-    };
+    let resp = request(&creds.oauth).map_err(RequestFailure::into_fetch_error)?;
 
     let body = resp.into_string().map_err(|_| plain("Bad API response."))?;
     let parsed: UsageResp =
@@ -308,7 +318,7 @@ impl RequestFailure {
     fn into_fetch_error(self) -> FetchErr {
         match self {
             Self::Auth => plain(
-                "Sign-in rejected.\nOpen Settings to reconnect.",
+                "Claude Code needs to refresh sign-in.\nOpen Claude Code once, then refresh.",
             ),
             Self::Other(err) => err,
         }
@@ -317,7 +327,7 @@ impl RequestFailure {
 
 fn compact_request_error(e: ureq::Error) -> RequestFailure {
     match e {
-        ureq::Error::Status(401, _) => RequestFailure::Auth,
+        ureq::Error::Status(401 | 403, _) => RequestFailure::Auth,
         ureq::Error::Status(429, resp) => {
             let retry_after = resp
                 .header("retry-after")
@@ -363,7 +373,7 @@ fn parse_usage(parsed: UsageResp, plan: String) -> Result<UsageSnapshot, FetchEr
             rows.push(LimitRow {
                 kind,
                 label,
-                percent: pct,
+                percent: clamp_percent(pct),
                 severity: l.severity.clone().unwrap_or_default(),
                 reset_text: reset_dt.map(fmt_reset_dt).unwrap_or_default(),
                 resets_unix: reset_dt.map(|d| d.unix_timestamp()),
@@ -386,7 +396,7 @@ fn parse_usage(parsed: UsageResp, plan: String) -> Result<UsageSnapshot, FetchEr
             rows.push(LimitRow {
                 kind: kind.into(),
                 label: label.into(),
-                percent: u,
+                percent: clamp_percent(u),
                 severity: String::new(),
                 reset_text: reset_dt.map(fmt_reset_dt).unwrap_or_default(),
                 resets_unix: reset_dt.map(|d| d.unix_timestamp()),
@@ -399,7 +409,7 @@ fn parse_usage(parsed: UsageResp, plan: String) -> Result<UsageSnapshot, FetchEr
             rows.push(LimitRow {
                 kind: "extra".into(),
                 label: "Extra usage".into(),
-                percent: x.utilization.unwrap_or(0.0),
+                percent: clamp_percent(x.utilization.unwrap_or(0.0)),
                 severity: String::new(),
                 reset_text: String::new(),
                 resets_unix: None,
@@ -436,6 +446,16 @@ pub(crate) fn prettify(s: &str) -> String {
     out
 }
 
+/// API percentages are untrusted floats. Keep NaN/infinity and out-of-range
+/// values out of text formatting, alert comparisons, and D2D geometry.
+pub(crate) fn clamp_percent(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 100.0)
+    } else {
+        0.0
+    }
+}
+
 fn local_offset() -> UtcOffset {
     UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC)
 }
@@ -457,5 +477,19 @@ fn fmt_reset_dt(dt: OffsetDateTime) -> String {
     } else {
         let wd = &local.date().weekday().to_string()[..3];
         format!("resets {} {:02}:{:02}", wd, local.hour(), local.minute())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_percent;
+
+    #[test]
+    fn sanitizes_untrusted_percentages() {
+        assert_eq!(clamp_percent(f64::NAN), 0.0);
+        assert_eq!(clamp_percent(f64::INFINITY), 0.0);
+        assert_eq!(clamp_percent(-3.0), 0.0);
+        assert_eq!(clamp_percent(42.5), 42.5);
+        assert_eq!(clamp_percent(104.0), 100.0);
     }
 }

@@ -5,7 +5,7 @@
 
 use serde::Deserialize;
 
-use crate::api::{fmt_reset_unix, plain, prettify, FetchErr, FetchOutcome, LimitRow, UsageSnapshot};
+use crate::api::{clamp_percent, fmt_reset_unix, plain, prettify, FetchErr, FetchOutcome, LimitRow, UsageSnapshot};
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
@@ -179,7 +179,7 @@ fn push_row(rows: &mut Vec<LimitRow>, w: &Window, fallback_kind: &str) {
     rows.push(LimitRow {
         kind: kind.into(),
         label,
-        percent: pct,
+        percent: clamp_percent(pct),
         severity: String::new(), // no severity field — percent thresholds apply
         reset_text: w.reset_at.map(fmt_reset_unix).unwrap_or_default(),
         resets_unix: w.reset_at,

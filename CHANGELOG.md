@@ -2,6 +2,16 @@
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [SemVer](https://semver.org/).
 
+## [0.7.3] — 2026-08-29
+
+### Fixed
+- **Recurring Claude logouts.** Claudometer no longer replays Claude Code's rotating refresh token through a second `claude auth login` process. Polling is now strictly read-only and Claude Code remains the only process that refreshes or writes its OAuth session, avoiding cross-process refresh-token races.
+- **Reconnect detoured through CMD.** The app now prefers the recommended native `%USERPROFILE%\.local\bin\claude.exe` and resolves the real `claude.exe` embedded behind current official npm shims. CMD is only a compatibility fallback for legacy batch-only installs.
+- Claude credentials and cached identity now honor `CLAUDE_CONFIG_DIR`. A local `expiresAt` value of `0` or another stale hint no longer causes a false logout; the API response is authoritative.
+- Credential reads retry briefly across Claude Code's atomic file replacement instead of flashing a false "not signed in" state.
+- A 429 now starts a real 60–900 second cooldown immediately. Manual refresh respects the cooldown, and the removed fast retry can no longer extend server throttling. Stale data is retained for at most 10 minutes.
+- Non-finite and out-of-range percentages from either unofficial usage API are clamped before reaching labels, alerts, or D2D geometry.
+
 ## [0.7.2] — 2026-08-19
 
 ### Fixed

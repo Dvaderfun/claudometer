@@ -10,7 +10,7 @@ A tiny native Windows app that shows how much of your Claude (and optionally Ope
 - **Flyout on click** — every limit the API reports (session, weekly all-models, weekly per-model), each with a progress bar and its reset time. Acrylic blur, rounded corners, light/dark theme, your Windows accent color.
 - **Codex too** — if you're signed into the [Codex CLI](https://developers.openai.com/codex/cli), a second section shows its session/weekly limits automatically. No setup; no Codex, no section. Toggle in settings.
 - **Tooltip on hover** — quick numbers without clicking.
-- **Account connection** — see the linked Claude account and plan in Settings; connect, switch, or repair it through Claude Code's official browser sign-in without copying OAuth secrets into Claudometer.
+- **Account connection** — see the linked Claude account and plan in Settings; connect or switch it through Claude Code's official browser sign-in without copying OAuth secrets into Claudometer.
 - **Settings window** (Mica) — Claude account, auto-refresh interval (30s / 1m / 2m / 5m), start with Windows, Codex section toggle, refresh, quit.
 - **Keyboard**: Tab cycles controls (visible focus ring), Space/Enter activates, ←/→ changes the refresh interval, Esc closes.
 - Survives Explorer restarts, per-monitor DPI aware, respects `Retry-After` on rate limits, keeps showing cached data through network blips.
@@ -34,14 +34,14 @@ A tiny native Windows app that shows how much of your Claude (and optionally Ope
 
 ## How it works (and what it touches)
 
-- Reads the OAuth access token from `%USERPROFILE%\.claude\.credentials.json` (and, if present, `%USERPROFILE%\.codex\auth.json`) — **read-only**. Claudometer never writes either file and never receives or rotates a refresh token.
-- Uses the installed Claude Code CLI as the account broker. When the access token is about to expire, Claudometer asks the CLI to renew it non-interactively (Claude Code does the token exchange and writes its own credentials). Connect/Reconnect opens `claude auth login --claudeai` in a console window, where you sign in through the browser and paste the code it gives you back into that window; click the card again to cancel. Claude Code owns the browser flow, token rotation, and durable credential storage.
+- Reads the OAuth access token from `%USERPROFILE%\.claude\.credentials.json`, or `$CLAUDE_CONFIG_DIR\.credentials.json` when configured (and, if present, `%USERPROFILE%\.codex\auth.json`) — **read-only**. Claudometer never writes either file and never receives or rotates a refresh token.
+- Uses the installed Claude Code CLI only for an explicit Connect/Reconnect. It opens `claude auth login` in a console window so the browser flow's fallback code can be pasted if needed; click the card again to cancel. Current native and npm installs are resolved to the real `claude.exe`, avoiding a CMD shim. Claude Code alone owns token refresh and durable credential storage.
 - Calls `https://api.anthropic.com/api/oauth/usage` — the same endpoint Claude Code's `/usage` command uses — and, when Codex is signed in, `https://chatgpt.com/backend-api/wham/usage` — the same endpoint the Codex CLI polls for its own status bar. Nothing else is contacted; no telemetry, no analytics.
 - Settings live in `%APPDATA%\Claudometer\settings.json`.
 
 ⚠️ Both usage endpoints are **unofficial**. Anthropic/OpenAI can change them any time, at which point the flyout will tell you it can't parse the response until this app is updated.
 
-Claude sign-in renews itself in the background. If that ever fails (revoked or long-expired session), open Settings and choose **Reconnect**. Codex credentials remain read-only; open Codex if that sign-in expires.
+If the server rejects Claude's access token, open Claude Code once so its credential owner can refresh the session, then refresh Claudometer. Use **Reconnect** only if Claude Code itself asks you to sign in. Codex credentials are also read-only; open Codex if that sign-in expires.
 
 ## Build from source
 

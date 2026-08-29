@@ -74,13 +74,13 @@ enum Provider {
 }
 
 /// Per-provider fetch state; both providers share the resilience rules
-/// (stale data beats errors, 429 jittered-retry + backoff, 3 s debounce).
+/// (recent stale data beats errors, strict 429 backoff, 3 s debounce).
 struct Slot {
     state: Mutex<Option<api::FetchOutcome>>,
     last_good: Mutex<Option<api::UsageSnapshot>>,
     last_fetch: Mutex<Option<Instant>>,
-    /// no *automatic* requests before this instant (server Retry-After, or
-    /// exponential backoff after sustained 429s) — manual refresh bypasses it
+    /// No requests before this instant (server Retry-After or exponential
+    /// backoff). Manual refresh respects it: retries can extend a 429 cooldown.
     cooldown_until: Mutex<Option<Instant>>,
     /// consecutive rate-limited fetches — drives the 429 backoff
     rl_streak: AtomicU32,
@@ -123,7 +123,10 @@ fn effective(p: Provider) -> (Option<api::UsageSnapshot>, Option<String>) {
     match &*state {
         Some(api::FetchOutcome::Ok(snap)) => (Some(snap.clone()), None),
         Some(api::FetchOutcome::Err { msg, .. }) => {
-            (s.last_good.lock().unwrap().clone(), Some(msg.clone()))
+            let recent = s.last_good.lock().unwrap().clone().filter(|snapshot| {
+                time::OffsetDateTime::now_utc().unix_timestamp() - snapshot.fetched_unix < 10 * 60
+            });
+            (recent, Some(msg.clone()))
         }
         None => (s.last_good.lock().unwrap().clone(), None),
     }
@@ -263,7 +266,7 @@ fn main() -> Result<()> {
         SetTimer(main, TIMER_POLL, POLL_SECS.load(Ordering::SeqCst) * 1000, None);
         // TIMER_TICK runs only while the flyout is visible (started in show_flyout)
         spawn_claude_account(false);
-        spawn_fetch_all(false);
+        spawn_fetch_all();
         updater::maybe_check();
 
         let mut msg = MSG::default();
@@ -320,10 +323,10 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     auth::snapshot().connection,
                     Some(auth::ClaudeConnection::Connected { .. })
                 ) {
-                    // Login/status may have repaired the token that just
-                    // failed; do not let the normal refresh debounce delay it.
+                    // An explicit login may have replaced the credential that
+                    // just failed; do not let the normal debounce delay it.
                     *slot(Provider::Claude).last_fetch.lock().unwrap() = None;
-                    spawn_fetch(Provider::Claude, true);
+                    spawn_fetch(Provider::Claude);
                 } else {
                     update_tray(hwnd);
                     render_flyout_current();
@@ -363,7 +366,7 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_POLL => {
-                spawn_fetch_all(false);
+                spawn_fetch_all();
                 updater::maybe_check(); // no-op unless 24h passed
                 LRESULT(0)
             }
@@ -437,7 +440,7 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 } else if vk == VK_RETURN.0 || vk == VK_SPACE.0 {
                     match UI.with(|ui| ui.borrow().fly_focus) {
                         0 => {
-                            spawn_fetch_all(true);
+                            spawn_fetch_all();
                             render_flyout_current();
                         }
                         1 => {
@@ -488,7 +491,7 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (x, y) = mouse_dip(hwnd, lparam);
                 match fly_hit(x, y) {
                     gfx::FlyHover::Refresh => {
-                        spawn_fetch_all(true);
+                        spawn_fetch_all();
                         render_flyout_current(); // spinner starts immediately
                     }
                     gfx::FlyHover::Gear => {
@@ -680,7 +683,7 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
             let on = !util::show_codex();
             util::set_show_codex(on);
             if on {
-                spawn_fetch(Provider::Codex, true);
+                spawn_fetch(Provider::Codex);
             }
             update_tray(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
         }
@@ -691,7 +694,7 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
             let idx = gfx::INTERVALS.iter().position(|(s, _)| *s == cur).unwrap_or(1);
             apply_interval(gfx::INTERVALS[(idx + 1) % gfx::INTERVALS.len()].0);
         }
-        6 => spawn_fetch_all(true),
+        6 => spawn_fetch_all(),
         7 => match updater::status() {
             updater::Status::Available(_) => updater::install(),
             updater::Status::Installing => {}
@@ -904,10 +907,10 @@ unsafe fn show_flyout(cx: i32, cy: i32) {
             .unwrap_or(true)
     };
     if stale(Provider::Claude) {
-        spawn_fetch(Provider::Claude, false);
+        spawn_fetch(Provider::Claude);
     }
     if codex_active() && stale(Provider::Codex) {
-        spawn_fetch(Provider::Codex, false);
+        spawn_fetch(Provider::Codex);
     }
 
     let fh = flyout_hwnd();
@@ -1321,7 +1324,7 @@ unsafe fn show_menu(owner: HWND, x: i32, y: i32) {
     let _ = DestroyMenu(menu);
 
     match cmd.0 as usize {
-        IDM_REFRESH => spawn_fetch_all(true),
+        IDM_REFRESH => spawn_fetch_all(),
         IDM_SETTINGS => open_settings(),
         IDM_AUTOSTART => util::set_autostart(!auto),
         IDM_QUIT => {
@@ -1352,30 +1355,20 @@ fn run_alert_checks() {
 
 // ---------- fetch ----------
 
-/// Refresh every live provider (Claude always, Codex when active).
-/// `force` = user-initiated: bypasses an active 429 cooldown (one polite
-/// request on click beats a silent no-op).
-fn spawn_fetch_all(force: bool) {
-    spawn_fetch(Provider::Claude, force);
+/// Refresh every live provider (Claude always, Codex when active). Manual and
+/// periodic requests obey the same debounce and API-mandated cooldown.
+fn spawn_fetch_all() {
+    spawn_fetch(Provider::Claude);
     if codex_active() {
-        spawn_fetch(Provider::Codex, force);
+        spawn_fetch(Provider::Codex);
     }
 }
 
-/// Sub-second clock noise for retry jitter (no rand dependency).
-fn subsec_jitter() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_nanos()))
-}
-
-fn spawn_fetch(p: Provider, force: bool) {
+fn spawn_fetch(p: Provider) {
     let s = slot(p);
-    if !force {
-        if let Some(until) = *s.cooldown_until.lock().unwrap() {
-            if Instant::now() < until {
-                return;
-            }
+    if let Some(until) = *s.cooldown_until.lock().unwrap() {
+        if Instant::now() < until {
+            return;
         }
     }
     // debounce: manual refresh spam turns into API 429s
@@ -1392,25 +1385,7 @@ fn spawn_fetch(p: Provider, force: bool) {
             Provider::Claude => api::fetch(),
             Provider::Codex => codex::fetch(),
         };
-        let mut out = fetch_once();
-        // The usage endpoint's burst limiter is shared with Claude Code's own
-        // polling, and a fixed poll phase can collide with it for many ticks
-        // in a row (observed: 429 + `Retry-After: 0`, i.e. "fine again in a
-        // moment"). One short jittered retry de-phases us instead of showing
-        // stale data until the next tick.
-        if let api::FetchOutcome::Err {
-            rate_limited: true,
-            retry_after,
-            ..
-        } = &out
-        {
-            let ra = retry_after.unwrap_or(0);
-            if ra <= 5 {
-                let ms = (ra * 1000).max(2_000 + subsec_jitter() % 3_000);
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-                out = fetch_once();
-            }
-        }
+        let out = fetch_once();
         let s = slot(p);
         match &out {
             api::FetchOutcome::Ok(snap) => {
@@ -1424,19 +1399,14 @@ fn spawn_fetch(p: Provider, force: bool) {
                 ..
             } => {
                 let n = s.rl_streak.fetch_add(1, Ordering::SeqCst) + 1;
-                let secs = match retry_after {
-                    // explicit server wait — honored, capped at 15 min
-                    Some(ra) if *ra > 5 => (*ra).min(900),
-                    // burst 429s ride the normal poll for two rounds, then
-                    // back off 120s→240s→480s→600s: sustained throttling
-                    // gets rarer requests, not hammering
-                    _ if n >= 3 => (60u64 << (n - 2).min(4)).min(600),
-                    _ => 0,
-                };
-                if secs > 0 {
-                    *s.cooldown_until.lock().unwrap() =
-                        Some(Instant::now() + std::time::Duration::from_secs(secs));
-                }
+                // Never fast-retry a 429. Retry-After: 0 is still a rate-limit
+                // signal, so give the shared endpoint at least a minute. With no
+                // useful server hint, back off 60s → 120s → … → 600s.
+                let secs = retry_after
+                    .map(|seconds| seconds.clamp(60, 900))
+                    .unwrap_or_else(|| (60u64 << (n - 1).min(4)).min(600));
+                *s.cooldown_until.lock().unwrap() =
+                    Some(Instant::now() + std::time::Duration::from_secs(secs));
             }
             api::FetchOutcome::Err { .. } => {}
         }

@@ -29,7 +29,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 |---|---|
 | `main.rs` | windows, wndprocs, tray, menu, timers, per-provider fetch orchestration (`SLOTS`), hit-testing, keyboard nav, all statics |
 | `gfx.rs` | `Surface` (D3D/DXGI/DComp/D2D stack), all drawing, layout constants, Fluent palette, brush/format caches |
-| `auth.rs` | Claude account: identity from local files, non-interactive credential renewal (hidden) + interactive browser sign-in (own console, cancellable) delegated to the `claude` CLI, serialized with a cooldown |
+| `auth.rs` | Claude account: identity from local files + explicit interactive browser sign-in (own console, cancellable) delegated to the resolved native `claude` executable |
 | `api.rs` | Claude credentials read + usage fetch; shared display model (`UsageSnapshot`, `LimitRow`, `FetchOutcome`), time formatting |
 | `codex.rs` | Codex (OpenAI) credentials read + usage fetch → same `UsageSnapshot` |
 | `trayicon.rs` | CPU-rasterized ring/alert HICON (premultiplied DIB, no fonts) |
@@ -56,7 +56,7 @@ Two independent providers, one worker thread each per poll (~1/min), both produc
 
 **Claude** (`api.rs::fetch`):
 
-1. Read `%USERPROFILE%\.claude\.credentials.json` — always read-only. Within 5 min of expiry, or on an authoritative 401, `auth.rs` runs `claude auth login` with `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`/`_SCOPES` set from that file so Claude Code performs the exchange and rewrites its own credentials; Claudometer re-reads them and retries once. Repair is single-flight with a 5 min cooldown and only counts as success when `expiresAt` actually moved forward.
+1. Read `%USERPROFILE%\.claude\.credentials.json`, or `$CLAUDE_CONFIG_DIR\.credentials.json` when configured — always read-only. The local `expiresAt` field is only a login-completion stamp, never authority for rejecting an otherwise usable token. Claudometer does not read or replay the refresh token; Claude Code is the sole session writer.
 2. `GET api.anthropic.com/api/oauth/usage`, Bearer token, `anthropic-beta: oauth-2025-04-20`, via ureq + native-tls (schannel — OS cert store, no C deps). **Unofficial endpoint** — parsing is defensive, every field optional.
 3. Prefer the `limits[]` array (kind/percent/severity/resets_at/scope); fall back to legacy `five_hour`/`seven_day`; append `extra_usage` if enabled.
 4. Plan label comes from `GET /api/oauth/profile` (cached 1 h, falls back to `~/.claude.json` then to the last known value) — the credentials file's `subscriptionType` is stale after a plan change.
@@ -69,8 +69,8 @@ Two independent providers, one worker thread each per poll (~1/min), both produc
 
 Resilience rules (in `main.rs`, per provider via `SLOTS`):
 
-- `last_good` snapshot survives failed fetches — UI shows stale data + footer note; a provider with no data degrades to a dim note line in its own section; the whole-flyout error view exists only for the nothing-ever-fetched case.
-- 429 `Retry-After` honored exactly (capped 300 s) via `cooldown_until`; no extra client backoff on top (the poll interval is the floor).
+- `last_good` snapshot survives failed fetches for up to 10 minutes — UI shows stale data + footer note; a provider with no data degrades to a dim note line in its own section; the whole-flyout error view exists only for the nothing-ever-fetched case.
+- Every 429 starts a 60–900 s `cooldown_until` immediately (server `Retry-After` when useful, exponential fallback otherwise). Automatic and manual refreshes both honor it; there is no fast retry.
 - 3 s debounce on refresh; `fetching` flag dedupes concurrent spawns.
 - Fetch threads publish via mutexed statics + `PostMessageW(WM_DATA_READY)` — UI mutations stay on the UI thread.
 - Codex enablement (`codex_active`) = settings toggle AND auth file present — checked per poll, so signing in/out of Codex shows/hides the section without restart.
