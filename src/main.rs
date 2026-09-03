@@ -225,6 +225,9 @@ thread_local! {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(result) = updater::run_watchdog_if_requested(&args) {
+        return result.map_err(|message| Error::new(E_FAIL, message));
+    }
     let demo_request =
         demo::parse_request(&args).map_err(|message| Error::new(E_INVALIDARG, message))?;
     if let Some(request) = demo_request {
@@ -272,9 +275,21 @@ fn main() -> Result<()> {
             Some(mutex)
         };
 
+        let update_startup = if demo::is_active() {
+            None
+        } else {
+            Some(updater::prepare_startup(&args).map_err(|message| Error::new(E_FAIL, message))?)
+        };
+
         if !demo::is_active() {
-            std::thread::spawn(updater::cleanup_old);
-            config::initialize();
+            if update_startup
+                .as_ref()
+                .is_some_and(updater::StartupGuard::compatibility_mode)
+            {
+                config::initialize_compatibility();
+            } else {
+                config::initialize();
+            }
             runtime_state::initialize();
             util::enable_dark_context_menus();
             alerts::init();
@@ -365,6 +380,9 @@ fn main() -> Result<()> {
                 show_demo_flyout(flyout, state);
             }
         } else {
+            updater::complete_startup(update_startup.expect("non-demo startup guard"))
+                .map_err(|message| Error::new(E_FAIL, message))?;
+            config::commit_pending_migration();
             // wake lock is per-thread — must be armed (and dropped) on this thread
             vibecode::init();
             POLL_SECS.store(config::settings().poll_interval_seconds, Ordering::SeqCst);

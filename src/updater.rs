@@ -18,6 +18,7 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -55,6 +56,11 @@ const MANAGED_CHANNEL: &str = "managed";
 const UPDATE_JOURNAL: &str = "update-operation.v1.json";
 const UPDATE_SCHEMA: u64 = 1;
 const ATTEMPT_ID_BYTES: usize = 16;
+const READINESS_NONCE_BYTES: usize = 32;
+const READINESS_SCHEMA: u64 = 1;
+const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+const WATCHDOG_POLL: Duration = Duration::from_millis(50);
 const UNINSTALL_KEY: PCWSTR =
     windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Claudometer_is1");
 
@@ -368,6 +374,8 @@ enum UpdatePhase {
 struct UpdateOperation {
     schema_version: u64,
     attempt_id: String,
+    readiness_nonce: String,
+    candidate_pid: Option<u32>,
     phase: UpdatePhase,
     canonical_name: String,
     candidate_name: String,
@@ -381,6 +389,7 @@ impl UpdateOperation {
     fn new(
         canonical: &Path,
         attempt_id: String,
+        readiness_nonce: String,
         current_sha256: String,
         candidate_sha256: String,
         candidate_version: (u16, u16, u16),
@@ -394,6 +403,8 @@ impl UpdateOperation {
         Ok(Self {
             schema_version: UPDATE_SCHEMA,
             attempt_id,
+            readiness_nonce,
+            candidate_pid: None,
             phase: UpdatePhase::Verified,
             canonical_name,
             candidate_name,
@@ -410,6 +421,8 @@ impl UpdateOperation {
     fn validate(&self) -> Result<(), String> {
         if self.schema_version != UPDATE_SCHEMA
             || !valid_lower_hex(&self.attempt_id, ATTEMPT_ID_BYTES)
+            || !valid_lower_hex(&self.readiness_nonce, READINESS_NONCE_BYTES)
+            || self.candidate_pid == Some(0)
             || !valid_lower_hex(&self.current_sha256, 32)
             || !valid_lower_hex(&self.candidate_sha256, 32)
             || crate::release_manifest::strict_version(&self.candidate_version).is_none()
@@ -453,8 +466,8 @@ fn update_names(canonical_name: &str, attempt_id: &str) -> Result<(String, Strin
     ))
 }
 
-fn new_attempt_id() -> Result<String, String> {
-    let mut bytes = [0u8; ATTEMPT_ID_BYTES];
+fn random_lower_hex<const N: usize>() -> Result<String, String> {
+    let mut bytes = [0u8; N];
     let status = unsafe {
         BCryptGenRandom(
             BCRYPT_ALG_HANDLE::default(),
@@ -465,11 +478,19 @@ fn new_attempt_id() -> Result<String, String> {
     if !status.is_ok() {
         return Err("system entropy unavailable".into());
     }
-    let mut encoded = String::with_capacity(ATTEMPT_ID_BYTES * 2);
+    let mut encoded = String::with_capacity(N * 2);
     for byte in bytes {
         write!(&mut encoded, "{byte:02x}").map_err(|_| "attempt ID encoding failed")?;
     }
     Ok(encoded)
+}
+
+fn new_attempt_id() -> Result<String, String> {
+    random_lower_hex::<ATTEMPT_ID_BYTES>()
+}
+
+fn new_readiness_nonce() -> Result<String, String> {
+    random_lower_hex::<READINESS_NONCE_BYTES>()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -479,10 +500,15 @@ enum UpdateBoundary {
     CurrentMovedPersisted,
     CandidateRenamed,
     CandidateInstalledPersisted,
+    CandidatePidPersisted,
+    ReadinessPersisted,
     CandidateReturned,
     BackupRestored,
     CandidateReadyPersisted,
     CommittedPersisted,
+    BackupRemoved,
+    ReadinessRemoved,
+    JournalRemoved,
 }
 
 trait UpdateBoundaryHook {
@@ -498,6 +524,29 @@ struct OperationPaths {
     backup: PathBuf,
     journal: PathBuf,
     journal_backup: PathBuf,
+    readiness: PathBuf,
+    readiness_backup: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateReadiness {
+    schema_version: u64,
+    attempt_id: String,
+    nonce: String,
+    pid: u32,
+    version: String,
+    sha256: String,
+}
+
+fn readiness_matches(readiness: &CandidateReadiness, operation: &UpdateOperation) -> bool {
+    readiness.schema_version == READINESS_SCHEMA
+        && readiness.attempt_id == operation.attempt_id
+        && readiness.nonce == operation.readiness_nonce
+        && Some(readiness.pid) == operation.candidate_pid
+        && readiness.pid != 0
+        && readiness.version == operation.candidate_version
+        && readiness.sha256 == operation.candidate_sha256
 }
 
 fn operation_paths(
@@ -511,6 +560,11 @@ fn operation_paths(
         backup: directory.join(&operation.backup_name),
         journal: directory.join(UPDATE_JOURNAL),
         journal_backup: directory.join(format!("{UPDATE_JOURNAL}.bak")),
+        readiness: directory.join(format!("update-readiness.{}.json", operation.attempt_id)),
+        readiness_backup: directory.join(format!(
+            "update-readiness.{}.json.bak",
+            operation.attempt_id
+        )),
     })
 }
 
@@ -528,6 +582,61 @@ fn save_update_phase(
         .map_err(|error| format!("update journal write failed: {error}"))?;
     *operation = next;
     hook.after(boundary);
+    Ok(())
+}
+
+fn save_candidate_pid(
+    paths: &OperationPaths,
+    operation: &mut UpdateOperation,
+    pid: u32,
+    hook: &mut impl UpdateBoundaryHook,
+) -> Result<(), String> {
+    if pid == 0 || operation.phase != UpdatePhase::CandidateInstalled {
+        return Err("candidate process identity is invalid".into());
+    }
+    let mut next = operation.clone();
+    next.candidate_pid = Some(pid);
+    crate::store::AtomicJsonStore::new(&paths.journal)
+        .save(&next)
+        .map_err(|error| format!("update journal write failed: {error}"))?;
+    *operation = next;
+    hook.after(UpdateBoundary::CandidatePidPersisted);
+    Ok(())
+}
+
+fn load_candidate_readiness(paths: &OperationPaths) -> Result<Option<CandidateReadiness>, String> {
+    use crate::store::LoadOutcome;
+
+    match crate::store::AtomicJsonStore::new(&paths.readiness)
+        .load::<CandidateReadiness>()
+        .map_err(|error| format!("readiness read failed: {error}"))?
+    {
+        LoadOutcome::Loaded(readiness) | LoadOutcome::RecoveredFromBackup(readiness) => {
+            Ok(Some(readiness))
+        }
+        LoadOutcome::Missing | LoadOutcome::CorruptPreserved => Ok(None),
+    }
+}
+
+fn load_authenticated_readiness(
+    paths: &OperationPaths,
+    operation: &UpdateOperation,
+) -> Result<Option<CandidateReadiness>, String> {
+    Ok(
+        load_candidate_readiness(paths)?
+            .filter(|readiness| readiness_matches(readiness, operation)),
+    )
+}
+
+fn persist_candidate_readiness(
+    paths: &OperationPaths,
+    readiness: &CandidateReadiness,
+    hook: &mut impl UpdateBoundaryHook,
+) -> Result<(), String> {
+    crate::store::AtomicJsonStore::new(&paths.readiness)
+        .save(readiness)
+        .map_err(|error| format!("readiness write failed: {error}"))?;
+    hook.after(UpdateBoundary::ReadinessPersisted);
     Ok(())
 }
 
@@ -645,22 +754,35 @@ fn remove_update_file(path: &Path) -> Result<(), String> {
     }
 }
 
-fn delete_update_journal(paths: &OperationPaths) -> Result<(), String> {
+fn delete_update_journal(
+    paths: &OperationPaths,
+    hook: &mut impl UpdateBoundaryHook,
+) -> Result<(), String> {
     // Remove the store backup first: if interrupted, the committed primary
     // journal still makes cleanup retryable on the next launch.
     remove_update_file(&paths.journal_backup)?;
-    remove_update_file(&paths.journal)
+    remove_update_file(&paths.journal)?;
+    hook.after(UpdateBoundary::JournalRemoved);
+    Ok(())
 }
 
-fn finish_committed(paths: &OperationPaths) -> Result<(), String> {
+fn finish_committed(
+    paths: &OperationPaths,
+    hook: &mut impl UpdateBoundaryHook,
+) -> Result<(), String> {
     remove_update_file(&paths.backup)?;
+    hook.after(UpdateBoundary::BackupRemoved);
     remove_update_file(&paths.candidate)?;
-    delete_update_journal(paths)
+    remove_update_file(&paths.readiness_backup)?;
+    remove_update_file(&paths.readiness)?;
+    hook.after(UpdateBoundary::ReadinessRemoved);
+    delete_update_journal(paths, hook)
 }
 
 fn commit_candidate(
     operation: &mut UpdateOperation,
     paths: &OperationPaths,
+    readiness: &CandidateReadiness,
     hook: &mut impl UpdateBoundaryHook,
 ) -> Result<(), String> {
     if installed_image(
@@ -675,6 +797,9 @@ fn commit_candidate(
         ) != InstalledImage::Current
     {
         return Err("update images do not match the journal".into());
+    }
+    if !readiness_matches(readiness, operation) {
+        return Err("candidate readiness does not match the update attempt".into());
     }
     let store = crate::store::AtomicJsonStore::new(&paths.journal);
     if operation.phase < UpdatePhase::CandidateInstalled {
@@ -704,7 +829,7 @@ fn commit_candidate(
             hook,
         )?;
     }
-    finish_committed(paths)
+    Ok(())
 }
 
 fn rollback_update(
@@ -769,12 +894,220 @@ fn rollback_update(
     }
     remove_update_file(&paths.candidate)?;
     remove_update_file(&paths.backup)?;
-    delete_update_journal(paths)
+    remove_update_file(&paths.readiness_backup)?;
+    remove_update_file(&paths.readiness)?;
+    delete_update_journal(paths, hook)
+}
+
+trait WatchdogPlatform {
+    fn spawn_candidate(
+        &mut self,
+        canonical: &Path,
+        operation: &UpdateOperation,
+    ) -> Result<u32, String>;
+    fn await_readiness(
+        &mut self,
+        paths: &OperationPaths,
+        operation: &UpdateOperation,
+    ) -> Result<CandidateReadiness, String>;
+    fn terminate_candidate(&mut self);
+    fn restart_previous(&mut self, canonical: &Path) -> Result<(), String>;
+}
+
+struct WindowsWatchdog {
+    child: Option<Child>,
+}
+
+impl WatchdogPlatform for WindowsWatchdog {
+    fn spawn_candidate(
+        &mut self,
+        canonical: &Path,
+        operation: &UpdateOperation,
+    ) -> Result<u32, String> {
+        let child = std::process::Command::new(canonical)
+            .arg("--swap-wait")
+            .arg("--update-attempt")
+            .arg(&operation.attempt_id)
+            .arg("--update-nonce")
+            .arg(&operation.readiness_nonce)
+            .spawn()
+            .map_err(|_| "candidate spawn failed".to_string())?;
+        let pid = child.id();
+        self.child = Some(child);
+        Ok(pid)
+    }
+
+    fn await_readiness(
+        &mut self,
+        paths: &OperationPaths,
+        operation: &UpdateOperation,
+    ) -> Result<CandidateReadiness, String> {
+        let deadline = Instant::now() + READINESS_TIMEOUT;
+        loop {
+            if self
+                .child
+                .as_mut()
+                .ok_or("candidate process is unavailable")?
+                .try_wait()
+                .map_err(|_| "candidate process status failed")?
+                .is_some()
+            {
+                return Err("candidate exited before readiness".into());
+            }
+            if let Some(readiness) = load_authenticated_readiness(paths, operation)? {
+                if self
+                    .child
+                    .as_mut()
+                    .ok_or("candidate process is unavailable")?
+                    .try_wait()
+                    .map_err(|_| "candidate process status failed")?
+                    .is_none()
+                {
+                    return Ok(readiness);
+                }
+                return Err("candidate exited before readiness commit".into());
+            }
+            if Instant::now() >= deadline {
+                return Err("candidate readiness timed out".into());
+            }
+            std::thread::sleep(WATCHDOG_POLL);
+        }
+    }
+
+    fn terminate_candidate(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn restart_previous(&mut self, canonical: &Path) -> Result<(), String> {
+        std::process::Command::new(canonical)
+            .arg("--swap-wait")
+            .spawn()
+            .map(|_| ())
+            .map_err(|_| "previous version restart failed".into())
+    }
+}
+
+fn rollback_and_restart(
+    primary: String,
+    operation: &UpdateOperation,
+    paths: &OperationPaths,
+    platform: &mut impl WatchdogPlatform,
+    hook: &mut impl UpdateBoundaryHook,
+) -> Result<(), String> {
+    platform.terminate_candidate();
+    let rollback = rollback_update(operation, paths, hook);
+    let restart = rollback
+        .as_ref()
+        .ok()
+        .and_then(|()| platform.restart_previous(&paths.canonical).err());
+    match (rollback, restart) {
+        (Ok(()), None) => Err(format!("{primary} — previous version restored")),
+        (Ok(()), Some(restart)) => Err(format!("{primary}; {restart}")),
+        (Err(rollback), _) => Err(format!("{primary}; {rollback}")),
+    }
+}
+
+fn supervise_candidate(
+    operation: &mut UpdateOperation,
+    paths: &OperationPaths,
+    platform: &mut impl WatchdogPlatform,
+    hook: &mut impl UpdateBoundaryHook,
+) -> Result<(), String> {
+    let pid = match platform.spawn_candidate(&paths.canonical, operation) {
+        Ok(pid) => pid,
+        Err(error) => return rollback_and_restart(error, operation, paths, platform, hook),
+    };
+    if let Err(error) = save_candidate_pid(paths, operation, pid, hook) {
+        return rollback_and_restart(error, operation, paths, platform, hook);
+    }
+    let readiness = match platform.await_readiness(paths, operation) {
+        Ok(readiness) => readiness,
+        Err(error) => return rollback_and_restart(error, operation, paths, platform, hook),
+    };
+    if let Err(error) = commit_candidate(operation, paths, &readiness, hook) {
+        return rollback_and_restart(error, operation, paths, platform, hook);
+    }
+    Ok(())
+}
+
+fn update_argument<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>, String> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| (arg == name).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() > 1 {
+        return Err("update invocation is malformed".into());
+    }
+    let Some(index) = positions.first().copied() else {
+        return Ok(None);
+    };
+    let value = args
+        .get(index + 1)
+        .filter(|value| !value.starts_with("--"))
+        .ok_or("update invocation is malformed")?;
+    Ok(Some(value))
+}
+
+fn update_invocation(args: &[String]) -> Result<Option<(&str, &str)>, String> {
+    match (
+        update_argument(args, "--update-attempt")?,
+        update_argument(args, "--update-nonce")?,
+    ) {
+        (None, None) => Ok(None),
+        (Some(attempt), Some(nonce)) => Ok(Some((attempt, nonce))),
+        _ => Err("update invocation is incomplete".into()),
+    }
+}
+
+pub fn run_watchdog_if_requested(args: &[String]) -> Option<Result<(), String>> {
+    if !args.iter().any(|arg| arg == "--update-watchdog") {
+        return None;
+    }
+    Some(run_watchdog(args))
+}
+
+fn run_watchdog(args: &[String]) -> Result<(), String> {
+    let (attempt, nonce) = update_invocation(args)?.ok_or("watchdog invocation is incomplete")?;
+    let running_exe = std::env::current_exe().map_err(|_| "can't locate watchdog executable")?;
+    let directory = running_exe.parent().ok_or("can't locate exe folder")?;
+    let mut operation = load_update_operation(directory)?.ok_or("update journal is missing")?;
+    let paths = operation_paths(directory, &operation)?;
+    if attempt != operation.attempt_id
+        || nonce != operation.readiness_nonce
+        || operation.phase != UpdatePhase::CandidateInstalled
+        || !paths_equal(&running_exe, &paths.backup)
+        || installed_image(
+            &paths.backup,
+            &operation.current_sha256,
+            &operation.candidate_sha256,
+        ) != InstalledImage::Current
+        || installed_image(
+            &paths.canonical,
+            &operation.current_sha256,
+            &operation.candidate_sha256,
+        ) != InstalledImage::Candidate
+        || file_version(&paths.canonical)
+            != crate::release_manifest::strict_version(&operation.candidate_version)
+    {
+        return Err("watchdog update identity is invalid".into());
+    }
+    remove_update_file(&paths.readiness_backup)?;
+    remove_update_file(&paths.readiness)?;
+    supervise_candidate(
+        &mut operation,
+        &paths,
+        &mut WindowsWatchdog { child: None },
+        &mut NoUpdateHook,
+    )
 }
 
 fn recover_update(running_exe: &Path, hook: &mut impl UpdateBoundaryHook) -> Result<(), String> {
     let directory = running_exe.parent().ok_or("can't locate exe folder")?;
-    let Some(mut operation) = load_update_operation(directory)? else {
+    let Some(operation) = load_update_operation(directory)? else {
         return Ok(());
     };
     let paths = operation_paths(directory, &operation)?;
@@ -792,14 +1125,203 @@ fn recover_update(running_exe: &Path, hook: &mut impl UpdateBoundaryHook) -> Res
 
     if operation.phase == UpdatePhase::Committed {
         if canonical_image == InstalledImage::Candidate {
-            return finish_committed(&paths);
+            return finish_committed(&paths, hook);
         }
         return rollback_update(&operation, &paths, hook);
     }
-    if running_candidate {
-        return commit_candidate(&mut operation, &paths, hook);
+    if running_candidate && paths_equal(running_exe, &paths.canonical) {
+        return Err("candidate cannot commit without authenticated readiness".into());
     }
     rollback_update(&operation, &paths, hook)
+}
+
+pub struct StartupGuard {
+    mode: StartupMode,
+}
+
+enum StartupMode {
+    Normal,
+    Candidate(Box<CandidateStartup>),
+    Cleanup { paths: Box<OperationPaths> },
+}
+
+struct CandidateStartup {
+    operation: UpdateOperation,
+    paths: OperationPaths,
+    running_exe: PathBuf,
+}
+
+impl StartupGuard {
+    pub fn compatibility_mode(&self) -> bool {
+        matches!(self.mode, StartupMode::Candidate(_))
+    }
+}
+
+pub fn prepare_startup(args: &[String]) -> Result<StartupGuard, String> {
+    let running_exe = std::env::current_exe().map_err(|_| "can't locate exe")?;
+    prepare_startup_at(&running_exe, args, &mut NoUpdateHook)
+}
+
+fn prepare_startup_at(
+    running_exe: &Path,
+    args: &[String],
+    hook: &mut impl UpdateBoundaryHook,
+) -> Result<StartupGuard, String> {
+    let invocation = update_invocation(args)?;
+    let directory = running_exe.parent().ok_or("can't locate exe folder")?;
+    let Some(operation) = load_update_operation(directory)? else {
+        if invocation.is_some() {
+            return Err("stale update invocation rejected".into());
+        }
+        return Ok(StartupGuard {
+            mode: StartupMode::Normal,
+        });
+    };
+    let paths = operation_paths(directory, &operation)?;
+    require_portable(&paths.canonical)?;
+    let canonical_image = installed_image(
+        &paths.canonical,
+        &operation.current_sha256,
+        &operation.candidate_sha256,
+    );
+
+    if operation.phase == UpdatePhase::Committed {
+        if invocation.is_some() {
+            return Err("stale update invocation rejected".into());
+        }
+        if paths_equal(running_exe, &paths.canonical)
+            && canonical_image == InstalledImage::Candidate
+        {
+            return Ok(StartupGuard {
+                mode: StartupMode::Cleanup {
+                    paths: Box::new(paths),
+                },
+            });
+        }
+        rollback_update(&operation, &paths, hook)?;
+        return Ok(StartupGuard {
+            mode: StartupMode::Normal,
+        });
+    }
+
+    let running_candidate =
+        paths_equal(running_exe, &paths.canonical) && canonical_image == InstalledImage::Candidate;
+    if running_candidate {
+        let Some((attempt, nonce)) = invocation else {
+            rollback_update(&operation, &paths, hook)?;
+            std::process::Command::new(&paths.canonical)
+                .arg("--swap-wait")
+                .spawn()
+                .map_err(|_| "previous version restart failed")?;
+            return Err("candidate update identity is missing — previous version restored".into());
+        };
+        let expected_version =
+            crate::release_manifest::strict_version(&operation.candidate_version);
+        if operation.phase != UpdatePhase::CandidateInstalled
+            || operation.candidate_pid != Some(std::process::id())
+            || attempt != operation.attempt_id
+            || nonce != operation.readiness_nonce
+            || file_version(running_exe) != expected_version
+            || sha256_of(running_exe).as_deref() != Some(&operation.candidate_sha256)
+        {
+            rollback_update(&operation, &paths, hook)?;
+            std::process::Command::new(&paths.canonical)
+                .arg("--swap-wait")
+                .spawn()
+                .map_err(|_| "previous version restart failed")?;
+            return Err("candidate update identity is invalid — previous version restored".into());
+        }
+        return Ok(StartupGuard {
+            mode: StartupMode::Candidate(Box::new(CandidateStartup {
+                operation,
+                paths,
+                running_exe: running_exe.to_path_buf(),
+            })),
+        });
+    }
+
+    if invocation.is_some() {
+        return Err("update invocation is not bound to the candidate".into());
+    }
+    rollback_update(&operation, &paths, hook)?;
+    Ok(StartupGuard {
+        mode: StartupMode::Normal,
+    })
+}
+
+pub fn complete_startup(guard: StartupGuard) -> Result<(), String> {
+    complete_startup_with_hook(guard, &mut NoUpdateHook)
+}
+
+fn complete_startup_with_hook(
+    guard: StartupGuard,
+    hook: &mut impl UpdateBoundaryHook,
+) -> Result<(), String> {
+    match guard.mode {
+        StartupMode::Normal => {}
+        StartupMode::Cleanup { paths } => finish_committed(&paths, hook)?,
+        StartupMode::Candidate(candidate) => {
+            let CandidateStartup {
+                operation,
+                paths,
+                running_exe,
+            } = *candidate;
+            let readiness = CandidateReadiness {
+                schema_version: READINESS_SCHEMA,
+                attempt_id: operation.attempt_id.clone(),
+                nonce: operation.readiness_nonce.clone(),
+                pid: std::process::id(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                sha256: sha256_of(&running_exe)
+                    .ok_or("candidate readiness hash could not be verified")?,
+            };
+            if !readiness_matches(&readiness, &operation) {
+                return Err("candidate readiness identity is invalid".into());
+            }
+            persist_candidate_readiness(&paths, &readiness, hook)?;
+
+            let deadline = Instant::now() + COMMIT_TIMEOUT;
+            loop {
+                let committed =
+                    load_update_operation(running_exe.parent().ok_or("can't locate exe folder")?)?
+                        .is_some_and(|current| {
+                            current.phase == UpdatePhase::Committed
+                                && current.attempt_id == operation.attempt_id
+                                && current.readiness_nonce == operation.readiness_nonce
+                                && current.candidate_pid == operation.candidate_pid
+                                && current.candidate_sha256 == operation.candidate_sha256
+                                && current.candidate_version == operation.candidate_version
+                        });
+                if committed {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err("update commit acknowledgement timed out".into());
+                }
+                std::thread::sleep(WATCHDOG_POLL);
+            }
+        }
+    }
+    cleanup_legacy_backup();
+    Ok(())
+}
+
+fn cleanup_legacy_backup() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(directory) = exe.parent() else {
+        return;
+    };
+    let legacy_backup = directory.join("claudometer.old.exe");
+    if legacy_backup.exists() {
+        for _ in 0..10 {
+            if std::fs::remove_file(&legacy_backup).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 // ---------- install ----------
@@ -841,10 +1363,12 @@ fn install_inner(rel: &Release) -> Result<(), String> {
     }
     let dir = exe.parent().ok_or("can't locate exe folder")?;
     let attempt_id = new_attempt_id()?;
+    let readiness_nonce = new_readiness_nonce()?;
     let current_sha256 = sha256_of(&exe).ok_or("couldn't verify current executable")?;
     let mut operation = UpdateOperation::new(
         &exe,
         attempt_id,
+        readiness_nonce,
         current_sha256,
         rel.asset_sha256.clone(),
         rel.version,
@@ -888,16 +1412,42 @@ fn install_inner(rel: &Release) -> Result<(), String> {
         };
     }
 
-    // Hand over: the candidate waits for our mutex, records readiness and
-    // commit, then removes this attempt's backup.
-    if std::process::Command::new(&exe)
-        .arg("--swap-wait")
+    if installed_image(
+        &paths.canonical,
+        &operation.current_sha256,
+        &operation.candidate_sha256,
+    ) != InstalledImage::Candidate
+        || installed_image(
+            &paths.backup,
+            &operation.current_sha256,
+            &operation.candidate_sha256,
+        ) != InstalledImage::Current
+        || file_version(&paths.canonical) != Some(rel.version)
+    {
+        return match rollback_update(&operation, &paths, &mut NoUpdateHook) {
+            Ok(()) => {
+                Err("installed candidate verification failed — previous version restored".into())
+            }
+            Err(recovery) => Err(format!(
+                "installed candidate verification failed; {recovery}"
+            )),
+        };
+    }
+
+    // The preserved old executable supervises candidate spawn, readiness,
+    // commit, and rollback after this UI process exits and releases its mutex.
+    if std::process::Command::new(&paths.backup)
+        .arg("--update-watchdog")
+        .arg("--update-attempt")
+        .arg(&operation.attempt_id)
+        .arg("--update-nonce")
+        .arg(&operation.readiness_nonce)
         .spawn()
         .is_err()
     {
         return match rollback_update(&operation, &paths, &mut NoUpdateHook) {
-            Ok(()) => Err("relaunch failed — previous version restored".into()),
-            Err(recovery) => Err(format!("relaunch failed; {recovery}")),
+            Ok(()) => Err("watchdog spawn failed — previous version restored".into()),
+            Err(recovery) => Err(format!("watchdog spawn failed; {recovery}")),
         };
     }
     Ok(())
@@ -1162,33 +1712,6 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
             .to_string()
     };
     normalize(left).eq_ignore_ascii_case(&normalize(right))
-}
-
-/// Startup recovery reconciles the journal with the actual file hashes. A
-/// canonical candidate commits only when this process is that candidate;
-/// every other pre-commit launch restores the previous verified executable.
-pub fn cleanup_old() {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    if let Err(message) = recover_update(&exe, &mut NoUpdateHook) {
-        set_status(Status::Failed(message, None));
-        return;
-    }
-
-    // One-way cleanup for the pre-journal updater's fixed backup name.
-    let Some(directory) = exe.parent() else {
-        return;
-    };
-    let legacy_backup = directory.join("claudometer.old.exe");
-    if legacy_backup.exists() {
-        for _ in 0..10 {
-            if std::fs::remove_file(&legacy_backup).is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    }
 }
 
 pub fn open_url(url: &str) {
@@ -1646,6 +2169,7 @@ mod tests {
             let operation = UpdateOperation::new(
                 &canonical,
                 "11".repeat(ATTEMPT_ID_BYTES),
+                "22".repeat(READINESS_NONCE_BYTES),
                 sha256_of(&canonical).unwrap(),
                 sha256_reader(std::io::Cursor::new(b"verified candidate executable")).unwrap(),
                 (9, 9, 9),
@@ -1684,16 +2208,89 @@ mod tests {
         assert!(!paths.backup.exists());
         assert!(!paths.journal.exists());
         assert!(!paths.journal_backup.exists());
+        assert!(!paths.readiness.exists());
+        assert!(!paths.readiness_backup.exists());
+    }
+
+    fn matching_readiness(operation: &UpdateOperation) -> CandidateReadiness {
+        CandidateReadiness {
+            schema_version: READINESS_SCHEMA,
+            attempt_id: operation.attempt_id.clone(),
+            nonce: operation.readiness_nonce.clone(),
+            pid: operation.candidate_pid.unwrap(),
+            version: operation.candidate_version.clone(),
+            sha256: operation.candidate_sha256.clone(),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeReadiness {
+        Ready,
+        Crash,
+        Timeout,
+    }
+
+    struct FakeWatchdog {
+        spawn_fails: bool,
+        readiness: FakeReadiness,
+        terminated: bool,
+        restarted: bool,
+    }
+
+    impl FakeWatchdog {
+        fn ready() -> Self {
+            Self {
+                spawn_fails: false,
+                readiness: FakeReadiness::Ready,
+                terminated: false,
+                restarted: false,
+            }
+        }
+    }
+
+    impl WatchdogPlatform for FakeWatchdog {
+        fn spawn_candidate(
+            &mut self,
+            _canonical: &Path,
+            _operation: &UpdateOperation,
+        ) -> Result<u32, String> {
+            if self.spawn_fails {
+                Err("injected candidate spawn failure".into())
+            } else {
+                Ok(4242)
+            }
+        }
+
+        fn await_readiness(
+            &mut self,
+            _paths: &OperationPaths,
+            operation: &UpdateOperation,
+        ) -> Result<CandidateReadiness, String> {
+            match self.readiness {
+                FakeReadiness::Ready => Ok(matching_readiness(operation)),
+                FakeReadiness::Crash => Err("injected candidate crash".into()),
+                FakeReadiness::Timeout => Err("injected readiness timeout".into()),
+            }
+        }
+
+        fn terminate_candidate(&mut self) {
+            self.terminated = true;
+        }
+
+        fn restart_previous(&mut self, _canonical: &Path) -> Result<(), String> {
+            self.restarted = true;
+            Ok(())
+        }
     }
 
     #[test]
     fn every_pre_ready_journal_write_and_rename_boundary_recovers() {
-        for (boundary, candidate_was_installed) in [
-            (UpdateBoundary::VerifiedPersisted, false),
-            (UpdateBoundary::CurrentRenamed, false),
-            (UpdateBoundary::CurrentMovedPersisted, false),
-            (UpdateBoundary::CandidateRenamed, true),
-            (UpdateBoundary::CandidateInstalledPersisted, true),
+        for boundary in [
+            UpdateBoundary::VerifiedPersisted,
+            UpdateBoundary::CurrentRenamed,
+            UpdateBoundary::CurrentMovedPersisted,
+            UpdateBoundary::CandidateRenamed,
+            UpdateBoundary::CandidateInstalledPersisted,
         ] {
             let directory = UpdateTestDirectory::new();
             let (mut operation, paths) = directory.setup();
@@ -1709,18 +2306,13 @@ mod tests {
                 "last verified executable lost at {boundary:?}"
             );
 
-            let running = if candidate_was_installed || paths.canonical.exists() {
-                &paths.canonical
-            } else {
+            let running = if paths.backup.exists() {
                 &paths.backup
+            } else {
+                &paths.canonical
             };
             recover_update(running, &mut NoUpdateHook).unwrap();
-            let expected: &[u8] = if candidate_was_installed {
-                b"verified candidate executable"
-            } else {
-                b"verified current executable"
-            };
-            assert_recovery_complete(&paths, expected);
+            assert_recovery_complete(&paths, b"verified current executable");
         }
     }
 
@@ -1733,9 +2325,17 @@ mod tests {
             let directory = UpdateTestDirectory::new();
             let (mut operation, paths) = directory.setup();
             start_handover(&directory.0, &mut operation, &mut NoUpdateHook).unwrap();
+            save_candidate_pid(&paths, &mut operation, 4242, &mut NoUpdateHook).unwrap();
+            let readiness = matching_readiness(&operation);
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                recover_update(&paths.canonical, &mut CrashAfter(boundary)).unwrap();
+                commit_candidate(
+                    &mut operation,
+                    &paths,
+                    &readiness,
+                    &mut CrashAfter(boundary),
+                )
+                .unwrap();
             }));
             assert!(result.is_err(), "boundary {boundary:?}");
             assert_eq!(
@@ -1744,7 +2344,160 @@ mod tests {
                 "the last verified executable must survive until commit"
             );
 
-            recover_update(&paths.canonical, &mut NoUpdateHook).unwrap();
+            commit_candidate(&mut operation, &paths, &readiness, &mut NoUpdateHook).unwrap();
+            assert!(
+                paths.backup.exists(),
+                "cleanup is deferred to a later launch"
+            );
+            finish_committed(&paths, &mut NoUpdateHook).unwrap();
+            assert_recovery_complete(&paths, b"verified candidate executable");
+        }
+    }
+
+    #[test]
+    fn watchdog_spawn_failure_and_timeout_restore_and_restart_previous() {
+        for (spawn_fails, readiness) in [
+            (true, FakeReadiness::Ready),
+            (false, FakeReadiness::Crash),
+            (false, FakeReadiness::Timeout),
+        ] {
+            let directory = UpdateTestDirectory::new();
+            let (mut operation, paths) = directory.setup();
+            start_handover(&directory.0, &mut operation, &mut NoUpdateHook).unwrap();
+            let mut platform = FakeWatchdog {
+                spawn_fails,
+                readiness,
+                terminated: false,
+                restarted: false,
+            };
+
+            assert!(
+                supervise_candidate(&mut operation, &paths, &mut platform, &mut NoUpdateHook)
+                    .is_err()
+            );
+            assert!(platform.terminated);
+            assert!(platform.restarted);
+            assert_recovery_complete(&paths, b"verified current executable");
+        }
+    }
+
+    #[test]
+    fn readiness_requires_exact_attempt_pid_version_hash_and_nonce() {
+        let directory = UpdateTestDirectory::new();
+        let (mut operation, paths) = directory.setup();
+        operation.candidate_pid = Some(4242);
+        let valid = matching_readiness(&operation);
+        assert!(readiness_matches(&valid, &operation));
+
+        let mutations: [fn(&mut CandidateReadiness); 5] = [
+            |value| value.attempt_id = "33".repeat(ATTEMPT_ID_BYTES),
+            |value| value.nonce = "44".repeat(READINESS_NONCE_BYTES),
+            |value| value.pid += 1,
+            |value| value.version = "1.2.3".into(),
+            |value| value.sha256 = "55".repeat(32),
+        ];
+        for mutate in mutations {
+            let mut stale_or_spoofed = valid.clone();
+            mutate(&mut stale_or_spoofed);
+            assert!(!readiness_matches(&stale_or_spoofed, &operation));
+            crate::store::AtomicJsonStore::new(&paths.readiness)
+                .save(&stale_or_spoofed)
+                .unwrap();
+            assert!(load_authenticated_readiness(&paths, &operation)
+                .unwrap()
+                .is_none());
+        }
+        crate::store::AtomicJsonStore::new(&paths.readiness)
+            .save(&valid)
+            .unwrap();
+        assert_eq!(
+            load_authenticated_readiness(&paths, &operation).unwrap(),
+            Some(valid)
+        );
+    }
+
+    #[test]
+    fn candidate_pid_and_readiness_write_boundaries_remain_recoverable() {
+        let directory = UpdateTestDirectory::new();
+        let (mut operation, paths) = directory.setup();
+        start_handover(&directory.0, &mut operation, &mut NoUpdateHook).unwrap();
+
+        let pid_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            save_candidate_pid(
+                &paths,
+                &mut operation,
+                4242,
+                &mut CrashAfter(UpdateBoundary::CandidatePidPersisted),
+            )
+            .unwrap();
+        }));
+        assert!(pid_result.is_err());
+
+        let readiness = matching_readiness(&operation);
+        let readiness_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            persist_candidate_readiness(
+                &paths,
+                &readiness,
+                &mut CrashAfter(UpdateBoundary::ReadinessPersisted),
+            )
+            .unwrap();
+        }));
+        assert!(readiness_result.is_err());
+        assert_eq!(
+            load_authenticated_readiness(&paths, &operation).unwrap(),
+            Some(readiness)
+        );
+
+        recover_update(&paths.backup, &mut NoUpdateHook).unwrap();
+        assert_recovery_complete(&paths, b"verified current executable");
+    }
+
+    #[test]
+    fn candidate_ready_without_commit_rolls_back_idempotently() {
+        let directory = UpdateTestDirectory::new();
+        let (mut operation, paths) = directory.setup();
+        start_handover(&directory.0, &mut operation, &mut NoUpdateHook).unwrap();
+        save_candidate_pid(&paths, &mut operation, 4242, &mut NoUpdateHook).unwrap();
+        let readiness = matching_readiness(&operation);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            commit_candidate(
+                &mut operation,
+                &paths,
+                &readiness,
+                &mut CrashAfter(UpdateBoundary::CandidateReadyPersisted),
+            )
+            .unwrap();
+        }));
+        assert!(result.is_err());
+
+        recover_update(&paths.backup, &mut NoUpdateHook).unwrap();
+        recover_update(&paths.canonical, &mut NoUpdateHook).unwrap();
+        assert_recovery_complete(&paths, b"verified current executable");
+    }
+
+    #[test]
+    fn successful_watchdog_commit_keeps_backup_until_retryable_later_cleanup() {
+        for boundary in [
+            UpdateBoundary::BackupRemoved,
+            UpdateBoundary::ReadinessRemoved,
+            UpdateBoundary::JournalRemoved,
+        ] {
+            let directory = UpdateTestDirectory::new();
+            let (mut operation, paths) = directory.setup();
+            start_handover(&directory.0, &mut operation, &mut NoUpdateHook).unwrap();
+            let mut platform = FakeWatchdog::ready();
+            supervise_candidate(&mut operation, &paths, &mut platform, &mut NoUpdateHook).unwrap();
+            assert_eq!(operation.phase, UpdatePhase::Committed);
+            assert_eq!(
+                std::fs::read(&paths.backup).unwrap(),
+                b"verified current executable"
+            );
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                finish_committed(&paths, &mut CrashAfter(boundary)).unwrap();
+            }));
+            assert!(result.is_err(), "boundary {boundary:?}");
+            finish_committed(&paths, &mut NoUpdateHook).unwrap();
             assert_recovery_complete(&paths, b"verified candidate executable");
         }
     }

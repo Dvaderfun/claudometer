@@ -609,7 +609,7 @@ Abort a rollout immediately if any of these occurs:
   - Use unique candidate/backup names per attempt.
   - Never delete the last verified executable before commit.
 
-- [ ] **UPD-04 — Add readiness and rollback.**
+- [x] **UPD-04 — Add readiness and rollback.**
   - Verify before swap and again at the canonical path.
   - On spawn failure, reverse the rename and restart the old binary.
   - The old binary/watchdog creates a unique attempt nonce and waits for readiness bound to that nonce, expected candidate PID, version, and hash.
