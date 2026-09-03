@@ -154,11 +154,11 @@ These are deliberately not claimed complete:
 | Legal publisher subject | Unknown; cannot be inferred from repository/user name | Owner supplies the identity that passes Artifact Signing Public Trust validation; exact certificate subject is recorded and pinned |
 | Azure signing account/subscription | Not authorized or provisioned | Owner provisions Artifact Signing account/profile and a GitHub OIDC identity with signer-only scope |
 | Key/security custodian | Artifact Signing HSM selected; administrative custodian unassigned | A named owner accepts Azure resource/IAM/revocation responsibility |
-| Release approval owner | Protected environment described but not configured | A named human approver is assigned and no-admin-bypass protection is verified |
+| Release approval owner | Solo maintainer `Dvaderfun`; independent approval is unavailable | Protected environment requires explicit owner approval, permits self-review, and disables administrator bypass |
 | Timestamp service | Microsoft endpoint selected; no signed artifact exists | First signed test artifact has a valid RFC 3161 countersignature verified offline/online |
 | ARM64 capacity | ARM64 cross-compile passes; artifact measured at 779,776 bytes | Real Windows 11 ARM64 machine/VM passes runtime, UI, update, rollback, and uninstall suites |
 | Winget package ownership | Proposed ID `Dvaderfun.Claudometer`; no namespace/public package claim | Owner confirms publisher/ID and an accepted `winget-pkgs` submission establishes ownership |
-| Immutable releases/tag rules | Local workflow/rules document exists | Repository admin enables and captures evidence of rules, protected environment, and immutable releases |
+| Immutable releases/tag rules | Repository immutability enabled and verified on 2026-09-03; release workflow fails closed on that API and verifies downloaded draft assets | Active `main`/`v*` rulesets and the owner-approved `release` environment pass the workflow's live preflight |
 
 No signing, package publication, certificate-store change, GitHub setting, or
 Winget submission is authorized by this ADR.

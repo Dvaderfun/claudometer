@@ -15,6 +15,7 @@ claudometer-vX.Y.Z-windows-<arch>.exe
 claudometer-vX.Y.Z-windows-<arch>.exe.sha256
 claudometer-vX.Y.Z-windows-<arch>.manifest.json
 claudometer-vX.Y.Z-windows-<arch>.manifest.signatures.json
+claudometer-vX.Y.Z.sbom.spdx.json
 ```
 
 Every name is reconstructed under the fixed repository/tag URL. The GitHub API
@@ -78,6 +79,14 @@ A normal signature document is:
 The signature must verify under the public key embedded in the running binary.
 The protected signing key is never passed to the build or stored in this
 repository.
+
+The release workflow accepts that key only as an Ed25519 PKCS#8 DER document,
+base64-encoded in the protected `release` environment secret
+`CLAUDOMETER_RELEASE_PRIVATE_KEY_PKCS8_B64`. It derives the public key from the
+private document and refuses to sign unless it exactly matches the lowercase
+hex `CLAUDOMETER_RELEASE_PUBLIC_KEY_HEX` repository variable. Temporary private
+key files are created under `RUNNER_TEMP` and removed immediately after the
+manifest signatures are produced.
 
 A rotation release uses exactly two signatures over the same manifest bytes
 and adds `next_public_key`. One signature must verify under the currently
@@ -227,6 +236,28 @@ CLAUDOMETER_RELEASE_SEQUENCE=<positive integer for this binary>
 Only those public values enter the executable. A developer build with neither
 value still compiles, but update verification fails closed with an unprovisioned
 trust-root error. Supplying only one value or malformed values fails the build.
+
+The tag release workflow additionally requires the repository variable
+`CLAUDOMETER_MINIMUM_UPDATER_VERSION`. It builds each architecture once with
+`--locked` after the reusable source/security gate, hashes those exact bytes,
+generates and verifies the signed manifests, and creates a single SPDX 2.3
+SBOM from the tagged locked source. GitHub build-provenance and SBOM
+attestations bind both executables to the tag workflow. The workflow then:
+
+1. creates a draft containing the executables, checksums, manifests,
+   signatures, and SBOM;
+2. downloads the assets from that draft and repeats all local evidence checks;
+3. verifies both GitHub attestation predicate types and runs the downloaded x64
+   executable in isolated hidden demo mode; and
+4. publishes only after every smoke check succeeds.
+
+Manifest policy windows are generated for 30 days. A failed smoke test removes
+the draft. Existing releases and tags are never overwritten or reused, and the
+workflow proves the repository's immutable-release setting through an
+administration-read-only token before accessing the signing key. The same
+preflight requires an active no-bypass `main` ruleset, split `v*` creation and
+mutation rulesets, and a reviewer-gated, no-admin-bypass `release` environment
+restricted to `v*` tags.
 
 After authentication and policy checks, the updater verifies the checksum
 sidecar against the signed hash, reads the executable into bounded memory,

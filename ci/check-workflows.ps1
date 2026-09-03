@@ -32,13 +32,47 @@ foreach ($command in $requiredCommands) {
         $violations.Add("build.yml is missing required command: $command")
     }
 }
+$releaseBuildCommand = 'cargo build --locked --release --target ${{ matrix.target }}'
+if ([regex]::Matches($build, [regex]::Escape($releaseBuildCommand)).Count -ne 1) {
+    $violations.Add('build.yml must build each immutable release artifact exactly once.')
+}
 
 $release = Get-Content -LiteralPath '.github/workflows/release.yml' -Raw
 if (-not $release.Contains('uses: ./.github/workflows/build.yml')) {
     $violations.Add('release.yml does not call the unified source gate.')
 }
-if (-not $release.Contains('draft: true')) {
-    $violations.Add('release.yml must create a draft before publication.')
+if ($release.Contains('cargo build')) {
+    $violations.Add('release.yml must reuse tested artifacts instead of rebuilding them.')
+}
+$releaseRequirements = @(
+    'gh release create $env:GITHUB_REF_NAME @assets',
+    '--draft',
+    'actions/attest@',
+    'anchore/sbom-action@',
+    './ci/new-release-evidence.ps1',
+    './ci/check-release-infrastructure.ps1',
+    'gh release download $env:GITHUB_REF_NAME',
+    'gh attestation verify $exe.FullName',
+    './ci/verify-demo.ps1',
+    'gh release edit $env:GITHUB_REF_NAME',
+    '--json isDraft,isImmutable'
+)
+foreach ($requirement in $releaseRequirements) {
+    if (-not $release.Contains($requirement)) {
+        $violations.Add("release.yml is missing release evidence policy: $requirement")
+    }
+}
+if ([regex]::Matches(
+        $release,
+        [regex]::Escape('./ci/check-release-infrastructure.ps1')
+    ).Count -ne 2) {
+    $violations.Add('release.yml must check protected infrastructure before signing and before publishing.')
+}
+$infrastructure = Get-Content -LiteralPath 'ci/check-release-infrastructure.ps1' -Raw
+foreach ($policy in @('immutable-releases', 'refs/heads/main', 'refs/tags/v*', 'required_reviewers')) {
+    if (-not $infrastructure.Contains($policy)) {
+        $violations.Add("release infrastructure check is missing policy: $policy")
+    }
 }
 
 if ($violations.Count -ne 0) {
