@@ -576,7 +576,7 @@ Abort a rollout immediately if any of these occurs:
 
 ### 9.1 Immediate containment
 
-- [ ] **UPD-00 — Fail closed on current release metadata.**
+- [x] **UPD-00 — Fail closed on current release metadata.**
   - Implement the channel contract from `DIST-00`: portable may self-swap; a managed install must hand off to its signed installer/package manager and must never rename its managed executable in place.
   - Require the checksum asset rather than treating it as optional.
   - Build fixed repository/tag/asset URLs and reject unexpected schemes or hosts.
@@ -587,7 +587,7 @@ Abort a rollout immediately if any of these occurs:
 
 ### 9.2 Signed manifest
 
-- [ ] **UPD-01 — Define and verify a signed release manifest.**
+- [x] **UPD-01 — Define and verify a signed release manifest.**
   - Fields: schema, channel, monotonically increasing release sequence, version, tag, issued-at, policy expiry, architecture, exact asset name, exact size, SHA-256, and minimum updater version.
   - Sign the exact manifest bytes with an offline/protected Ed25519 key.
   - Embed only the release public key in the application.
@@ -596,14 +596,15 @@ Abort a rollout immediately if any of these occurs:
   - Accept only a newer sequence/version on the selected channel. A downgrade requires an explicit separately signed rollback authorization naming the exact target and expiry.
   - Reject replayed/older manifests, missing or malformed timestamps, expired policy, wrong channel, architecture, version, host, key, size, or hash before filesystem mutation.
 
-- [ ] **UPD-02 — Record the bootstrap decision.**
+- [x] **UPD-02 — Record the bootstrap decision.**
   - The current updater cannot securely establish a new embedded trust root.
-  - Existing users must manually install and verify the first trust-root release, or explicitly accept a documented one-time bootstrap.
+  - Existing users must manually install and independently verify the first trust-root release; no automatic update or consent-based exception may bridge the boundary.
   - This limitation must be visible in release notes; do not pretend code can retroactively authenticate the old channel.
+  - The verification procedure and dated production provisioning record are maintained in `docs/release-manifest-v1.md`; unprovisioned builds remain fail-closed.
 
 ### 9.3 Crash-safe handover
 
-- [ ] **UPD-03 — Add `update-operation.v1.json`.**
+- [x] **UPD-03 — Add `update-operation.v1.json`.**
   - Phases: `verified`, `current_moved`, `candidate_installed`, `candidate_ready`, and `committed`.
   - Use unique candidate/backup names per attempt.
   - Never delete the last verified executable before commit.

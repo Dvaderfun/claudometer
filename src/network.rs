@@ -7,6 +7,9 @@ pub const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/Dvaderfun/claudometer/releases/latest";
 // Owner/name also live in Cargo.toml `repository` — keep in sync.
 pub const GITHUB_REPOSITORY_URL: &str = "https://github.com/Dvaderfun/claudometer";
+pub const GITHUB_API_HOSTS: &[&str] = &["api.github.com"];
+// GitHub documents release-assets.githubusercontent.com as its release asset host.
+pub const GITHUB_RELEASE_HOSTS: &[&str] = &["github.com", "release-assets.githubusercontent.com"];
 pub const CLAUDE_CODE_GETTING_STARTED_URL: &str =
     "https://docs.anthropic.com/en/docs/claude-code/getting-started";
 

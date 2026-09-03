@@ -33,18 +33,21 @@ request time.
 | `https://api.anthropic.com/api/oauth/usage` | Startup, an eligible automatic refresh, or an eligible manual refresh | Claude OAuth access token in `Authorization: Bearer`, the `anthropic-beta: oauth-2025-04-20` header, and `claudometer/<version>` user agent; no request body | The configured refresh interval, from 30 seconds to 5 minutes (default 1 minute). Manual refresh uses the same debounce and rate-limit cooldown. | The interval is configurable. There is currently no Claude-provider off switch; exiting Claudometer or blocking the destination stops requests. |
 | `https://api.anthropic.com/api/oauth/profile` | After a successful Claude usage request when the in-memory plan cache is missing or expired | The same Claude bearer token, beta header, and user agent; no request body | On the first successful usage fetch for the active account, then no more than hourly while its entry remains cached. An account switch can cause another request. | No separate control; it follows Claude refresh activity. |
 | `https://chatgpt.com/backend-api/wham/usage` | Startup, an eligible automatic refresh, or an eligible manual refresh when the Codex section is enabled and a ChatGPT-login Codex credential is available | Codex OAuth access token in `Authorization: Bearer`, the Codex account ID in `chatgpt-account-id`, and `claudometer/<version>` user agent; no request body | The configured refresh interval, subject to the same debounce and rate-limit cooldown as Claude | The **Codex section** setting enables or disables these requests. It is enabled by default. |
-| `https://api.github.com/repos/Dvaderfun/claudometer/releases/latest` | Normal startup and later polling ticks, only when automatic update checks are enabled | `claudometer/<version>` user agent and GitHub JSON accept header; no credential and no request body | Once at startup, then at most once every 24 hours per running process | The **Automatically check for updates** setting controls metadata requests. It defaults off for a genuinely new install; an existing settings document that predates the setting migrates to enabled. |
-| Update asset URLs returned as `browser_download_url` by the GitHub release response | The user clicks **Install** for an available update | `claudometer/<version>` user agent; no credential and no request body | One executable download and, when advertised, one SHA-256 file download per install attempt | The download requires an explicit **Install** click. In this version the asset URL host and redirects are not allowlisted. |
+| `https://api.github.com/repos/Dvaderfun/claudometer/releases/latest` and fixed manifest/signature assets under the matching GitHub release tag | Normal startup and later polling ticks, only when automatic update checks are enabled | `claudometer/<version>` user agent and, for the API call, the GitHub JSON accept header; no credential and no request body | Once at startup, then at most once every 24 hours per running process; one manifest and signature document per check, plus a rollback authorization/signature only for an advertised downgrade | The **Automatically check for updates** setting controls these requests. It defaults off for a genuinely new install; an existing settings document that predates the setting migrates to enabled. The exact manifest bytes must pass the embedded Ed25519 trust root and local policy before an update is offered. |
+| Fixed GitHub release asset URLs under `https://github.com/Dvaderfun/claudometer/releases/download/<tag>/` | The user clicks **Install** for an authenticated available portable update | `claudometer/<version>` user agent; no credential and no request body | One required SHA-256 file and one exact-size architecture-specific executable download per install attempt | The download requires an explicit **Install** click. The checksum must match the signed manifest hash. The executable is verified in bounded memory before a candidate file is created. Initial URLs and every redirect must use HTTPS and an exact allowlisted GitHub release host. Managed or ambiguous installs instead show an explicit release-page action. |
 
-The HTTP client can follow redirects. This version does not enforce a redirect
-host allowlist for provider, release-metadata, or asset requests.
+Updater requests disable automatic redirects and validate each hop before
+following it. Release metadata stays on `api.github.com`; release downloads are
+restricted to `github.com` and GitHub's documented
+`release-assets.githubusercontent.com` host. Provider requests retain their
+existing HTTP-client redirect behavior.
 
 Claudometer can also hand a URL or a network-capable operation to another
 program:
 
 | Owner of subsequent network activity | Trigger | Behavior and control |
 | --- | --- | --- |
-| Default browser | The user opens the About link, asks for Claude Code setup help, clicks a failed update's GitHub action, or an explicitly requested update install fails | Windows opens `https://github.com/Dvaderfun/claudometer`, `https://docs.anthropic.com/en/docs/claude-code/getting-started`, or a release-page URL. Release-page URLs can come from GitHub release metadata and are not host-validated in this version. The browser, not Claudometer, owns any resulting requests, cookies, and history. |
+| Default browser | The user opens the About link, asks for Claude Code setup help, or explicitly clicks a managed/ambiguous/failed update's **Release** action | Windows opens `https://github.com/Dvaderfun/claudometer`, `https://docs.anthropic.com/en/docs/claude-code/getting-started`, or a fixed repository release-page URL. Update failure never opens the browser automatically. The browser, not Claudometer, owns any resulting requests, cookies, and history. |
 | Claude Code CLI and default browser | The user explicitly chooses Connect/Reconnect | Claudometer launches `claude auth login`. Claude Code owns the authentication requests, browser flow, callback-code handling, refresh-token rotation, and credential writes. Claudometer creates no loopback listener. Clicking the account card again cancels the launched process tree. |
 
 No other direct network request site exists in this source tree. In particular,
@@ -66,14 +69,14 @@ reviewable update to this contract.
 | `CODEX_USAGE_URL` | `https://chatgpt.com/backend-api/wham/usage` |
 | `GITHUB_LATEST_RELEASE_URL` | `https://api.github.com/repos/Dvaderfun/claudometer/releases/latest` |
 | `GITHUB_REPOSITORY_URL` | `https://github.com/Dvaderfun/claudometer` |
+| `GITHUB_API_HOSTS` | Update metadata is restricted to `api.github.com` |
+| `GITHUB_RELEASE_HOSTS` | Fixed release downloads and redirects are restricted to `github.com` and GitHub's documented `release-assets.githubusercontent.com` host |
 | `CLAUDE_CODE_GETTING_STARTED_URL` | `https://docs.anthropic.com/en/docs/claude-code/getting-started` |
 
 <!-- PRIVACY_REQUEST src/api.rs|ANTHROPIC_USAGE_URL -->
 <!-- PRIVACY_REQUEST src/api.rs|ANTHROPIC_PROFILE_URL -->
 <!-- PRIVACY_REQUEST src/codex.rs|CODEX_USAGE_URL -->
-<!-- PRIVACY_REQUEST src/updater.rs|GITHUB_LATEST_RELEASE_URL -->
-<!-- PRIVACY_REQUEST src/updater.rs|sha_url -->
-<!-- PRIVACY_REQUEST src/updater.rs|url -->
+<!-- PRIVACY_REQUEST src/updater.rs|&current -->
 
 ## Local files
 
@@ -91,7 +94,8 @@ delete-data command or remove all application data on exit.
 | `%APPDATA%\Claudometer\power-override.v1.json` and `.bak`/`.corrupt.*` siblings | Crash-recovery journal containing the power-scheme GUID, original and applied AC/DC lid-close values, operation phase, restoration progress, start time, and app version. | The primary and backup are deleted after verified restoration. They are retained while an override is active or recovery is incomplete. Malformed preservation copies remain until manually deleted. |
 | `%APPDATA%\Claudometer\icon.ico` | The embedded app icon is extracted for Windows toast registration and replaced if its byte length differs. | Retained until manually deleted. |
 | `%APPDATA%\Claudometer\alert-test.txt` | Written only by the hidden `--test-alert` verification mode with `ok` or a toast error. | Overwritten by a later test; otherwise retained until manually deleted. |
-| The running executable and adjacent `claudometer.new.exe` / `claudometer.old.exe` | An explicit update install downloads `.new`, reads it for PE/version/hash checks, renames the running executable to `.old`, renames `.new` into place, and relaunches it. | `.new` is removed after most validation failures; an interrupted download or crash can leave it. `.old` is normally deleted by the replacement process after handover and is also removed before a later swap attempt. Failures or crashes can leave update debris. |
+| The portable running executable and adjacent `claudometer.new.exe` / `claudometer.old.exe` | An explicit portable update authenticates the release policy, verifies the downloaded bytes against its signed exact size/hash in memory, then writes `.new`, verifies PE version/hash again, revalidates the install channel, renames the running executable to `.old`, renames `.new` into place, and relaunches it. Managed and ambiguous installs never enter this path. | Invalid manifests, policies, checksums, sizes, hashes, or PE magic create no candidate file. `.new` is removed after handled post-write validation failures; a process or machine crash can leave it. `.old` is normally deleted by the replacement process after handover and is also removed before a later swap attempt. Failures or crashes can leave update debris. |
+| `%LOCALAPPDATA%\Programs\Claudometer\claudometer.install-channel` | A managed installer writes the exact UTF-8 value `managed`; Claudometer reads it when classifying the install channel. Claudometer does not create or modify it. | Retained for the managed install lifetime and removed by its installer/uninstaller. A missing, unreadable, or malformed marker blocks self-update at the managed path. |
 
 ### Provider and helper files
 
@@ -136,8 +140,10 @@ memory-only account digest; the token itself is not persisted.
 | --- | --- | --- |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme` | Read only | Read while choosing the Windows light/dark appearance; Claudometer does not change it. |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Claudometer` | Read, create/update, or delete | Read to render the **Start with Windows** setting. Enabling stores the quoted current executable path; disabling deletes the value. The value remains until disabled or manually removed. |
+| `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Claudometer_is1\InstallLocation` | Read only | Read before offering or applying an update when the executable is in the managed install root. It must agree with the adjacent managed-channel marker and executable directory; otherwise self-update is blocked. |
 | `HKCU\Software\Classes\AppUserModelId\Claudometer` | Create/update `DisplayName` and `IconUri` | Written on every normal startup so an unpackaged executable can send Windows toasts. This happens even when usage alerts are disabled. The key is not deleted by Claudometer in this version. |
 | Process AppUserModelID `Claudometer` | Set for the running process | Set on normal startup for toast routing; it lasts for the process lifetime. |
+| Windows CNG SHA-256 | Read-only in-process hashing | Hashes a downloaded portable update before any executable rename. No child process or provider credential is involved. |
 
 Claudometer creates a named single-instance mutex, window classes, tray icon,
 and graphics resources. Those are process-scoped Windows objects, not durable
@@ -149,7 +155,6 @@ records.
 | --- | --- | --- |
 | Native `claude.exe`/`claude.com`, or `cmd.exe` for a batch shim | Explicit Connect/Reconnect | Runs `claude auth login` in a visible console. Claude Code can open the browser and write its own credentials. |
 | `taskkill.exe /T /F` | The user cancels Claude sign-in or the ten-minute login deadline expires | Terminates the launched Claude Code process tree; Claudometer also asks the direct child to exit and waits for it. |
-| `certutil -hashfile <download> SHA256` | Explicit update install when the release advertises a SHA-256 asset | Hashes the downloaded executable in a hidden process. No provider credential is passed. |
 | The replacement Claudometer executable with `--swap-wait` | Successful update file swap | Waits for the old single-instance mutex owner to exit, then starts normally and removes `.old`. |
 | Hidden `powershell ... caps-led.ps1 end` | The user disables an installed Caps helper in Settings | Stops helper flashing and turns the LED off. The optional script can itself start a hidden PowerShell flasher when Claude Code invokes its hooks. |
 | Windows `ShellExecute` with the `open` verb | Link/help/update actions described in the network section | Delegates the URL to the user's registered handler, normally the default browser. |

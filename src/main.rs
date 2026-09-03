@@ -13,6 +13,7 @@ mod demo;
 mod gfx;
 mod network;
 pub mod provider;
+mod release_manifest;
 pub mod runtime_state;
 mod state_policy;
 pub mod store;
@@ -914,7 +915,8 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
         }
         gfx::CARD_REFRESH => spawn_fetch_all(RefreshTrigger::Manual),
         gfx::CARD_ABOUT => match updater::status() {
-            updater::Status::Available(_) => updater::install(),
+            updater::Status::Available(_) if updater::can_self_update() => updater::install(),
+            updater::Status::Available(release) => updater::open_url(&release.page_url),
             updater::Status::Installing => {}
             updater::Status::Failed(_, page) => {
                 updater::open_url(page.as_deref().unwrap_or(network::GITHUB_REPOSITORY_URL));
@@ -1507,9 +1509,15 @@ unsafe fn render_settings(hwnd: HWND) {
                 concat!("Claudometer ", env!("CARGO_PKG_VERSION")).to_string(),
                 "GitHub",
             ),
-            updater::Status::Available(r) => (format!("Update {} available", r.tag), "Install"),
+            updater::Status::Available(r) if updater::can_self_update() => {
+                (format!("Update {} available", r.tag), "Install")
+            }
+            updater::Status::Available(r) => (
+                format!("Update {} — use signed installer/Winget", r.tag),
+                "Release",
+            ),
             updater::Status::Installing => ("Installing update…".to_string(), "…"),
-            updater::Status::Failed(msg, _) => (format!("Update failed — {msg}"), "GitHub"),
+            updater::Status::Failed(msg, _) => (format!("Update failed — {msg}"), "Release"),
         };
         if let Some(diagnostic) = config::diagnostic()
             .or_else(runtime_state::diagnostic)

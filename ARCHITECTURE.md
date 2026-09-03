@@ -112,14 +112,22 @@ Legacy `settings.json.vibecode_lid` has no scheme GUID, so it blocks new overrid
 
 Passive, transparent, user-initiated. When **Automatically check for updates** is enabled, `releases/latest` is checked once per day and once at launch (worker thread, silent failures, drafts/prereleases and non-semver tags skipped). The setting defaults off for genuinely new installs and migrates on for existing settings documents. Surfaces: the Settings toggle and About card ("Claudometer X.Y.Z · GitHub" → "Update vX.Y.Z available · Install"), plus an accent dot on the flyout gear. Deliberately **no** update toast — toasts are reserved for usage limits.
 
+Versions without the Ed25519 trust root—including all published versions
+through 0.7.3—cannot authenticate it retroactively and may not update
+automatically to the first trust-root-enabled release. Existing users must
+manually install that release after following the independent hash and
+Authenticode checks in `docs/release-manifest-v1.md`. Builds without both a
+production public key and a positive embedded release sequence reject every
+manifest.
+
 All fixed provider, updater, repository, and help destinations live in `network.rs`; direct GET construction also passes through that module. The CI privacy allowlist compares those constants and request sites with `PRIVACY.md`.
 
 Install (only on click), all failure paths falling back to opening the release page:
 
-1. Download the `claudometer.exe` asset to `claudometer.new.exe` **next to the current exe** (same volume → atomic renames; also proves the folder is writable).
-2. Verify: length sanity → `MZ` magic → VERSIONINFO version == release tag → SHA256 via `certutil` (ships with Windows, zero crypto deps) against the release's `.sha256` asset when present (release.yml attaches it since 0.5.0).
-3. The rename swap: running exe → `claudometer.old.exe`, new → `claudometer.exe` (Windows allows renaming a mapped exe, not deleting it), rollback if the second rename fails.
-4. Handover: spawn `claudometer.exe --swap-wait`, post `WM_UPDATE(1)`, old instance quits. The new instance sees the busy single-instance mutex, `WaitForSingleObject`s on it (abandoned-mutex on old-process death counts as acquired), then deletes the `.old`. Startup always tries the `.old` cleanup, covering crashed updates.
+1. Download the exact signed-manifest asset beside the current executable under a CNG-random, attempt-scoped candidate name. Bound its size, require `MZ`, and verify its in-process CNG SHA-256 before writing; then `sync_all` and verify VERSIONINFO and SHA-256 again from disk.
+2. Persist `update-operation.v1.json` with the canonical, candidate, and backup names plus both executable hashes. Its atomic phases are `verified`, `current_moved`, `candidate_installed`, `candidate_ready`, and `committed`.
+3. Move the running executable to the attempt-scoped backup and the candidate to the canonical name with same-directory, write-through renames, persisting the corresponding phase after each boundary. The backup is never deleted before `committed` is durable.
+4. Handover by spawning the canonical executable with `--swap-wait`. Startup reconciles journal phase and actual hashes: a canonical candidate completes ready/commit, while any other pre-commit launch restores the verified backup. Recovery is idempotent even when the journal lags a completed rename; corrupt or path-tampered journals fail closed.
 
 ## State
 

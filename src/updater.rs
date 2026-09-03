@@ -1,41 +1,80 @@
 //! Self-update from GitHub Releases — passive, transparent, user-initiated.
 //!
-//! Check: `releases/latest` when enabled, at most once per day (and once at
-//! launch), in a worker thread; failures are silent and drafts/prereleases are
-//! skipped. No nag or toast — the only surfaces are the Settings toggle, About
-//! card, and a dot on the flyout gear.
+//! Check: `releases/latest` locates fixed manifest assets. A bounded manifest is
+//! accepted only after an embedded-root Ed25519 signature and all local policy
+//! checks pass. Checks run at most once per day (and once at launch) when
+//! enabled; failures are silent. No nag or toast — the only surfaces are the
+//! Settings toggle, About card, and a dot on the flyout gear.
 //!
-//! Install (only when the user clicks): download the exe asset next to the
-//! current exe, verify it (PE magic, VERSIONINFO == release tag, SHA256 via
-//! certutil when the release ships a `.sha256` asset), then the rename swap —
-//! Windows lets a *running* exe be renamed, so: exe → .old, new → exe, spawn
-//! `--swap-wait`, quit. The new instance waits for the single-instance mutex,
-//! then deletes the `.old`. Any failure rolls back and falls back to opening
-//! the release page.
+//! Install (only when the user clicks): a verified portable install downloads
+//! the fixed checksum and executable into bounded memory, checks the signed
+//! exact size/hash plus PE magic, then stages and re-verifies the file before
+//! a journaled, write-through rename swap. Attempt-unique candidate and backup
+//! names plus hash-based startup reconciliation keep the previous executable
+//! through durable commit. Managed and ambiguous installs fail closed to an
+//! explicit release-page action; they never rename the executable in place.
 
-use std::io::Read;
-use std::path::Path;
+use std::fmt::Write as _;
+use std::io::{Read, Write};
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::Storage::FileSystem::{
-    GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+use windows::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HWND, LPARAM, WPARAM,
 };
+use windows::Win32::Security::Cryptography::{
+    BCryptCloseAlgorithmProvider, BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash,
+    BCryptGenRandom, BCryptHashData, BCryptOpenAlgorithmProvider, BCRYPT_ALG_HANDLE,
+    BCRYPT_HASH_HANDLE, BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS, BCRYPT_SHA256_ALGORITHM,
+    BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+};
+use windows::Win32::Storage::FileSystem::{
+    GetFileVersionInfoSizeW, GetFileVersionInfoW, MoveFileExW, VerQueryValueW,
+    MOVEFILE_WRITE_THROUGH, VS_FIXEDFILEINFO,
+};
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 const UA: &str = concat!("claudometer/", env!("CARGO_PKG_VERSION"));
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
+const MAX_RELEASE_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_CHECKSUM_BYTES: u64 = 1024;
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024;
+const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
+const MAX_ROLLBACK_BYTES: u64 = 8 * 1024;
+const MAX_EXE_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_REDIRECTS: usize = 5;
+const CHANNEL_MARKER: &str = "claudometer.install-channel";
+const MANAGED_CHANNEL: &str = "managed";
+const UPDATE_JOURNAL: &str = "update-operation.v1.json";
+const UPDATE_SCHEMA: u64 = 1;
+const ATTEMPT_ID_BYTES: usize = 16;
+const UNINSTALL_KEY: PCWSTR =
+    windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Claudometer_is1");
+
+#[cfg(target_arch = "x86_64")]
+const RELEASE_ARCH: &str = "x64";
+#[cfg(target_arch = "aarch64")]
+const RELEASE_ARCH: &str = "arm64";
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("Claudometer releases support only x64 and ARM64 Windows");
 
 #[derive(Clone)]
 pub struct Release {
     pub tag: String,
     version: (u16, u16, u16),
+    expires_at: OffsetDateTime,
+    asset_name: String,
+    asset_size: u64,
+    asset_sha256: String,
     exe_url: String,
-    sha_url: Option<String>,
+    sha_url: String,
     pub page_url: String,
 }
 
@@ -59,6 +98,12 @@ pub fn status() -> Status {
 
 pub fn has_update() -> bool {
     matches!(*STATUS.lock().unwrap(), Status::Available(_))
+}
+
+pub fn can_self_update() -> bool {
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| install_channel(&exe) == InstallChannel::Portable)
 }
 
 fn set_status(s: Status) {
@@ -98,7 +143,7 @@ pub fn maybe_check() {
                     set_status(Status::UpToDate);
                 }
             }
-            Err(()) => {}
+            Err(_) => {}
         }
     });
 }
@@ -108,7 +153,6 @@ pub fn maybe_check() {
 #[derive(Deserialize)]
 struct ApiRelease {
     tag_name: Option<String>,
-    html_url: Option<String>,
     draft: Option<bool>,
     prerelease: Option<bool>,
     assets: Option<Vec<ApiAsset>>,
@@ -117,7 +161,6 @@ struct ApiRelease {
 #[derive(Deserialize)]
 struct ApiAsset {
     name: Option<String>,
-    browser_download_url: Option<String>,
 }
 
 fn agent(timeout_secs: u64) -> Option<ureq::Agent> {
@@ -126,66 +169,637 @@ fn agent(timeout_secs: u64) -> Option<ureq::Agent> {
         ureq::AgentBuilder::new()
             .tls_connector(std::sync::Arc::new(tls))
             .timeout(Duration::from_secs(timeout_secs))
+            .redirects(0)
             .build(),
     )
 }
 
-fn check_inner() -> Result<Option<Release>, ()> {
-    let agent = agent(10).ok_or(())?;
-    let resp = crate::network::get(&agent, crate::network::GITHUB_LATEST_RELEASE_URL)
-        .set("User-Agent", UA)
-        .set("Accept", "application/vnd.github+json")
-        .call()
-        .map_err(|_| ())?;
-    let body = resp.into_string().map_err(|_| ())?;
-    let rel: ApiRelease = serde_json::from_str(&body).map_err(|_| ())?;
-    Ok(pick_release(
-        &rel,
-        parse_ver(env!("CARGO_PKG_VERSION")).ok_or(())?,
-    ))
+fn check_inner() -> Result<Option<Release>, String> {
+    let agent = agent(10).ok_or("TLS init failed")?;
+    let resp = restricted_get(
+        &agent,
+        crate::network::GITHUB_LATEST_RELEASE_URL,
+        crate::network::GITHUB_API_HOSTS,
+        Some("application/vnd.github+json"),
+    )?;
+    let body = read_string_bounded(resp.into_reader(), MAX_RELEASE_METADATA_BYTES)?;
+    let rel: ApiRelease = serde_json::from_str(&body).map_err(|_| "release metadata malformed")?;
+    fetch_verified_release(&agent, &rel)
 }
 
-/// Newer, non-draft, non-prerelease release with a claudometer.exe asset.
-fn pick_release(rel: &ApiRelease, current: (u16, u16, u16)) -> Option<Release> {
-    if rel.draft == Some(true) || rel.prerelease == Some(true) {
+struct ManifestAssets {
+    tag: String,
+    manifest_url: String,
+    signatures_url: String,
+    rollback_url: Option<String>,
+    rollback_signatures_url: Option<String>,
+}
+
+fn pick_manifest_assets(rel: &ApiRelease) -> Option<ManifestAssets> {
+    if rel.draft != Some(false) || rel.prerelease != Some(false) {
         return None;
     }
     let tag = rel.tag_name.clone()?;
-    let version = parse_ver(&tag)?;
-    if version <= current {
+    let version = tag
+        .strip_prefix('v')
+        .and_then(crate::release_manifest::strict_version)?;
+    if tag != format!("v{}.{}.{}", version.0, version.1, version.2) {
         return None;
     }
+    let stem = format!("claudometer-{tag}-windows-{RELEASE_ARCH}");
+    let manifest_name = format!("{stem}.manifest.json");
+    let signatures_name = format!("{stem}.manifest.signatures.json");
+    let rollback_name = format!("{stem}.rollback.json");
+    let rollback_signatures_name = format!("{stem}.rollback.signatures.json");
     let assets = rel.assets.as_deref().unwrap_or(&[]);
-    let url_of = |n: &str| {
+    let exactly_one = |name: &str| {
         assets
             .iter()
-            .find(|a| a.name.as_deref() == Some(n))
-            .and_then(|a| a.browser_download_url.clone())
+            .filter(|asset| asset.name.as_deref() == Some(name))
+            .count()
+            == 1
     };
-    Some(Release {
-        version,
-        exe_url: url_of("claudometer.exe")?,
-        sha_url: url_of("claudometer.exe.sha256"),
-        page_url: rel
-            .html_url
-            .clone()
-            .unwrap_or_else(|| crate::network::GITHUB_REPOSITORY_URL.to_string()),
+    if !exactly_one(&manifest_name) || !exactly_one(&signatures_name) {
+        return None;
+    }
+    let base = crate::network::GITHUB_REPOSITORY_URL;
+    let download_base = format!("{base}/releases/download/{tag}");
+    let rollback_present = exactly_one(&rollback_name);
+    let rollback_signatures_present = exactly_one(&rollback_signatures_name);
+    if rollback_present != rollback_signatures_present {
+        return None;
+    }
+    Some(ManifestAssets {
         tag,
+        manifest_url: format!("{download_base}/{manifest_name}"),
+        signatures_url: format!("{download_base}/{signatures_name}"),
+        rollback_url: rollback_present.then(|| format!("{download_base}/{rollback_name}")),
+        rollback_signatures_url: rollback_signatures_present
+            .then(|| format!("{download_base}/{rollback_signatures_name}")),
     })
 }
 
-/// "v0.5.0" / "0.5.0" → (0, 5, 0); anything fancier (rc-suffix etc.) → None.
-fn parse_ver(s: &str) -> Option<(u16, u16, u16)> {
-    let mut it = s.trim().trim_start_matches('v').split('.');
-    let out = (
-        it.next()?.parse().ok()?,
-        it.next()?.parse().ok()?,
-        it.next()?.parse().ok()?,
-    );
-    if it.next().is_some() {
-        return None;
+fn fetch_verified_release(
+    agent: &ureq::Agent,
+    metadata: &ApiRelease,
+) -> Result<Option<Release>, String> {
+    let Some(assets) = pick_manifest_assets(metadata) else {
+        return Ok(None);
+    };
+    let manifest_bytes = get_bounded(agent, &assets.manifest_url, MAX_MANIFEST_BYTES)?;
+    let signature_bytes = get_bounded(agent, &assets.signatures_url, MAX_SIGNATURE_BYTES)?;
+    let current_version = crate::release_manifest::strict_version(env!("CARGO_PKG_VERSION"))
+        .ok_or("current updater version malformed")?;
+    let needs_rollback =
+        serde_json::from_slice::<crate::release_manifest::ReleaseManifest>(&manifest_bytes)
+            .ok()
+            .and_then(|manifest| crate::release_manifest::strict_version(&manifest.version))
+            .is_some_and(|version| version < current_version);
+    let rollback_bytes = if needs_rollback {
+        match (&assets.rollback_url, &assets.rollback_signatures_url) {
+            (Some(authorization), Some(signatures)) => Some((
+                get_bounded(agent, authorization, MAX_ROLLBACK_BYTES)?,
+                get_bounded(agent, signatures, MAX_SIGNATURE_BYTES)?,
+            )),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let rollback = rollback_bytes
+        .as_ref()
+        .map(|(bytes, signatures)| crate::release_manifest::RollbackProof { bytes, signatures });
+    let verified = verify_release_manifest(
+        &manifest_bytes,
+        &signature_bytes,
+        rollback,
+        option_env!("CLAUDOMETER_RELEASE_PUBLIC_KEY_HEX"),
+        option_env!("CLAUDOMETER_RELEASE_SEQUENCE"),
+        current_version,
+        OffsetDateTime::now_utc(),
+    )?;
+    let manifest = verified.manifest;
+    if manifest.tag != assets.tag {
+        return Err("release metadata tag mismatch".into());
     }
-    Some(out)
+    let release_assets = metadata.assets.as_deref().unwrap_or(&[]);
+    let exactly_one = |name: &str| {
+        release_assets
+            .iter()
+            .filter(|asset| asset.name.as_deref() == Some(name))
+            .count()
+            == 1
+    };
+    if !exactly_one(&manifest.asset) || !exactly_one(&format!("{}.sha256", manifest.asset)) {
+        return Err("signed release asset missing or duplicated".into());
+    }
+    let version = crate::release_manifest::strict_version(&manifest.version)
+        .ok_or("release version malformed")?;
+    let expires_at = OffsetDateTime::parse(
+        &manifest.policy_expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| "release expiry malformed")?;
+    let base = crate::network::GITHUB_REPOSITORY_URL;
+    let download_base = format!("{base}/releases/download/{}", manifest.tag);
+    Ok(Some(Release {
+        tag: manifest.tag.clone(),
+        version,
+        expires_at,
+        asset_name: manifest.asset.clone(),
+        asset_size: manifest.size,
+        asset_sha256: manifest.sha256,
+        exe_url: format!("{download_base}/{}", manifest.asset),
+        sha_url: format!("{download_base}/{}.sha256", manifest.asset),
+        page_url: format!("{base}/releases/tag/{}", manifest.tag),
+    }))
+}
+
+fn verify_release_manifest(
+    manifest_bytes: &[u8],
+    signature_bytes: &[u8],
+    rollback: Option<crate::release_manifest::RollbackProof<'_>>,
+    public_key_hex: Option<&str>,
+    release_sequence: Option<&str>,
+    current_version: (u16, u16, u16),
+    now: OffsetDateTime,
+) -> Result<crate::release_manifest::VerifiedRelease, String> {
+    let public_key_hex = public_key_hex.ok_or("release trust root not provisioned")?;
+    let trusted_public_key = decode_lower_hex::<32>(public_key_hex)
+        .ok_or_else(|| "embedded release public key invalid".to_string())?;
+    let current_sequence = release_sequence
+        .ok_or("release sequence not provisioned")?
+        .parse::<u64>()
+        .map_err(|_| "embedded release sequence invalid".to_string())?;
+    if current_sequence == 0 {
+        return Err("release sequence not provisioned".into());
+    }
+    crate::release_manifest::verify(
+        manifest_bytes,
+        signature_bytes,
+        rollback,
+        crate::release_manifest::VerificationPolicy {
+            trusted_public_key,
+            channel: crate::release_manifest::RELEASE_CHANNEL,
+            architecture: RELEASE_ARCH,
+            current_sequence,
+            current_version,
+            now,
+            max_asset_size: MAX_EXE_BYTES,
+        },
+    )
+    .map_err(Into::into)
+}
+
+// ---------- crash-safe install operation ----------
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UpdatePhase {
+    Verified,
+    CurrentMoved,
+    CandidateInstalled,
+    CandidateReady,
+    Committed,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateOperation {
+    schema_version: u64,
+    attempt_id: String,
+    phase: UpdatePhase,
+    canonical_name: String,
+    candidate_name: String,
+    backup_name: String,
+    current_sha256: String,
+    candidate_sha256: String,
+    candidate_version: String,
+}
+
+impl UpdateOperation {
+    fn new(
+        canonical: &Path,
+        attempt_id: String,
+        current_sha256: String,
+        candidate_sha256: String,
+        candidate_version: (u16, u16, u16),
+    ) -> Result<Self, String> {
+        let canonical_name = canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("executable name is not valid Unicode")?
+            .to_string();
+        let (candidate_name, backup_name) = update_names(&canonical_name, &attempt_id)?;
+        Ok(Self {
+            schema_version: UPDATE_SCHEMA,
+            attempt_id,
+            phase: UpdatePhase::Verified,
+            canonical_name,
+            candidate_name,
+            backup_name,
+            current_sha256,
+            candidate_sha256,
+            candidate_version: format!(
+                "{}.{}.{}",
+                candidate_version.0, candidate_version.1, candidate_version.2
+            ),
+        })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.schema_version != UPDATE_SCHEMA
+            || !valid_lower_hex(&self.attempt_id, ATTEMPT_ID_BYTES)
+            || !valid_lower_hex(&self.current_sha256, 32)
+            || !valid_lower_hex(&self.candidate_sha256, 32)
+            || crate::release_manifest::strict_version(&self.candidate_version).is_none()
+        {
+            return Err("update journal is invalid".into());
+        }
+        let (candidate, backup) = update_names(&self.canonical_name, &self.attempt_id)?;
+        if self.candidate_name != candidate || self.backup_name != backup {
+            return Err("update journal paths are invalid".into());
+        }
+        Ok(())
+    }
+}
+
+fn valid_lower_hex(value: &str, bytes: usize) -> bool {
+    value.len() == bytes * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn update_names(canonical_name: &str, attempt_id: &str) -> Result<(String, String), String> {
+    let canonical = Path::new(canonical_name);
+    if canonical.components().count() != 1
+        || canonical.file_name().and_then(|name| name.to_str()) != Some(canonical_name)
+        || !canonical
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+        || !valid_lower_hex(attempt_id, ATTEMPT_ID_BYTES)
+    {
+        return Err("update journal paths are invalid".into());
+    }
+    let stem = canonical
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or("update journal paths are invalid")?;
+    Ok((
+        format!("{stem}.{attempt_id}.candidate.exe"),
+        format!("{stem}.{attempt_id}.backup.exe"),
+    ))
+}
+
+fn new_attempt_id() -> Result<String, String> {
+    let mut bytes = [0u8; ATTEMPT_ID_BYTES];
+    let status = unsafe {
+        BCryptGenRandom(
+            BCRYPT_ALG_HANDLE::default(),
+            &mut bytes,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if !status.is_ok() {
+        return Err("system entropy unavailable".into());
+    }
+    let mut encoded = String::with_capacity(ATTEMPT_ID_BYTES * 2);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").map_err(|_| "attempt ID encoding failed")?;
+    }
+    Ok(encoded)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateBoundary {
+    VerifiedPersisted,
+    CurrentRenamed,
+    CurrentMovedPersisted,
+    CandidateRenamed,
+    CandidateInstalledPersisted,
+    CandidateReturned,
+    BackupRestored,
+    CandidateReadyPersisted,
+    CommittedPersisted,
+}
+
+trait UpdateBoundaryHook {
+    fn after(&mut self, _boundary: UpdateBoundary) {}
+}
+
+struct NoUpdateHook;
+impl UpdateBoundaryHook for NoUpdateHook {}
+
+struct OperationPaths {
+    canonical: PathBuf,
+    candidate: PathBuf,
+    backup: PathBuf,
+    journal: PathBuf,
+    journal_backup: PathBuf,
+}
+
+fn operation_paths(
+    directory: &Path,
+    operation: &UpdateOperation,
+) -> Result<OperationPaths, String> {
+    operation.validate()?;
+    Ok(OperationPaths {
+        canonical: directory.join(&operation.canonical_name),
+        candidate: directory.join(&operation.candidate_name),
+        backup: directory.join(&operation.backup_name),
+        journal: directory.join(UPDATE_JOURNAL),
+        journal_backup: directory.join(format!("{UPDATE_JOURNAL}.bak")),
+    })
+}
+
+fn save_update_phase(
+    store: &crate::store::AtomicJsonStore,
+    operation: &mut UpdateOperation,
+    phase: UpdatePhase,
+    boundary: UpdateBoundary,
+    hook: &mut impl UpdateBoundaryHook,
+) -> Result<(), String> {
+    let mut next = operation.clone();
+    next.phase = phase;
+    store
+        .save(&next)
+        .map_err(|error| format!("update journal write failed: {error}"))?;
+    *operation = next;
+    hook.after(boundary);
+    Ok(())
+}
+
+fn load_update_operation(directory: &Path) -> Result<Option<UpdateOperation>, String> {
+    use crate::store::LoadOutcome;
+
+    let store = crate::store::AtomicJsonStore::new(directory.join(UPDATE_JOURNAL));
+    let operation = match store
+        .load::<UpdateOperation>()
+        .map_err(|error| format!("update journal read failed: {error}"))?
+    {
+        LoadOutcome::Loaded(operation) | LoadOutcome::RecoveredFromBackup(operation) => operation,
+        LoadOutcome::Missing if has_preserved_update_journal(directory) => {
+            return Err("update journal is corrupt".into())
+        }
+        LoadOutcome::Missing => return Ok(None),
+        LoadOutcome::CorruptPreserved => return Err("update journal is corrupt".into()),
+    };
+    operation.validate()?;
+    Ok(Some(operation))
+}
+
+fn has_preserved_update_journal(directory: &Path) -> bool {
+    let prefix = format!("{UPDATE_JOURNAL}.corrupt.");
+    std::fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+}
+
+fn move_update_file(source: &Path, destination: &Path) -> Result<(), String> {
+    if destination.exists() {
+        return Err("update destination already exists".into());
+    }
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|_| "update rename failed".into())
+}
+
+fn start_handover(
+    directory: &Path,
+    operation: &mut UpdateOperation,
+    hook: &mut impl UpdateBoundaryHook,
+) -> Result<(), String> {
+    let paths = operation_paths(directory, operation)?;
+    let store = crate::store::AtomicJsonStore::new(&paths.journal);
+    save_update_phase(
+        &store,
+        operation,
+        UpdatePhase::Verified,
+        UpdateBoundary::VerifiedPersisted,
+        hook,
+    )?;
+    move_update_file(&paths.canonical, &paths.backup)?;
+    hook.after(UpdateBoundary::CurrentRenamed);
+    save_update_phase(
+        &store,
+        operation,
+        UpdatePhase::CurrentMoved,
+        UpdateBoundary::CurrentMovedPersisted,
+        hook,
+    )?;
+    move_update_file(&paths.candidate, &paths.canonical)?;
+    hook.after(UpdateBoundary::CandidateRenamed);
+    save_update_phase(
+        &store,
+        operation,
+        UpdatePhase::CandidateInstalled,
+        UpdateBoundary::CandidateInstalledPersisted,
+        hook,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstalledImage {
+    Missing,
+    Current,
+    Candidate,
+    Unknown,
+}
+
+fn installed_image(path: &Path, current_sha256: &str, candidate_sha256: &str) -> InstalledImage {
+    if !path.exists() {
+        return InstalledImage::Missing;
+    }
+    match sha256_of(path).as_deref() {
+        Some(hash) if hash == current_sha256 => InstalledImage::Current,
+        Some(hash) if hash == candidate_sha256 => InstalledImage::Candidate,
+        _ => InstalledImage::Unknown,
+    }
+}
+
+fn remove_update_file(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("update cleanup failed".into()),
+    }
+}
+
+fn delete_update_journal(paths: &OperationPaths) -> Result<(), String> {
+    // Remove the store backup first: if interrupted, the committed primary
+    // journal still makes cleanup retryable on the next launch.
+    remove_update_file(&paths.journal_backup)?;
+    remove_update_file(&paths.journal)
+}
+
+fn finish_committed(paths: &OperationPaths) -> Result<(), String> {
+    remove_update_file(&paths.backup)?;
+    remove_update_file(&paths.candidate)?;
+    delete_update_journal(paths)
+}
+
+fn commit_candidate(
+    operation: &mut UpdateOperation,
+    paths: &OperationPaths,
+    hook: &mut impl UpdateBoundaryHook,
+) -> Result<(), String> {
+    if installed_image(
+        &paths.canonical,
+        &operation.current_sha256,
+        &operation.candidate_sha256,
+    ) != InstalledImage::Candidate
+        || installed_image(
+            &paths.backup,
+            &operation.current_sha256,
+            &operation.candidate_sha256,
+        ) != InstalledImage::Current
+    {
+        return Err("update images do not match the journal".into());
+    }
+    let store = crate::store::AtomicJsonStore::new(&paths.journal);
+    if operation.phase < UpdatePhase::CandidateInstalled {
+        save_update_phase(
+            &store,
+            operation,
+            UpdatePhase::CandidateInstalled,
+            UpdateBoundary::CandidateInstalledPersisted,
+            hook,
+        )?;
+    }
+    if operation.phase < UpdatePhase::CandidateReady {
+        save_update_phase(
+            &store,
+            operation,
+            UpdatePhase::CandidateReady,
+            UpdateBoundary::CandidateReadyPersisted,
+            hook,
+        )?;
+    }
+    if operation.phase < UpdatePhase::Committed {
+        save_update_phase(
+            &store,
+            operation,
+            UpdatePhase::Committed,
+            UpdateBoundary::CommittedPersisted,
+            hook,
+        )?;
+    }
+    finish_committed(paths)
+}
+
+fn rollback_update(
+    operation: &UpdateOperation,
+    paths: &OperationPaths,
+    hook: &mut impl UpdateBoundaryHook,
+) -> Result<(), String> {
+    match installed_image(
+        &paths.canonical,
+        &operation.current_sha256,
+        &operation.candidate_sha256,
+    ) {
+        InstalledImage::Current => {}
+        InstalledImage::Missing => {
+            if installed_image(
+                &paths.backup,
+                &operation.current_sha256,
+                &operation.candidate_sha256,
+            ) != InstalledImage::Current
+            {
+                return Err("last verified executable is unavailable".into());
+            }
+            move_update_file(&paths.backup, &paths.canonical)?;
+            hook.after(UpdateBoundary::BackupRestored);
+        }
+        InstalledImage::Candidate => {
+            if installed_image(
+                &paths.backup,
+                &operation.current_sha256,
+                &operation.candidate_sha256,
+            ) != InstalledImage::Current
+            {
+                return Err("last verified executable is unavailable".into());
+            }
+            if paths.candidate.exists() {
+                if installed_image(
+                    &paths.candidate,
+                    &operation.current_sha256,
+                    &operation.candidate_sha256,
+                ) != InstalledImage::Candidate
+                {
+                    return Err("update candidate path is occupied".into());
+                }
+                remove_update_file(&paths.candidate)?;
+            }
+            move_update_file(&paths.canonical, &paths.candidate)?;
+            hook.after(UpdateBoundary::CandidateReturned);
+            move_update_file(&paths.backup, &paths.canonical)?;
+            hook.after(UpdateBoundary::BackupRestored);
+        }
+        InstalledImage::Unknown => {
+            return Err("canonical executable does not match the journal".into())
+        }
+    }
+    if installed_image(
+        &paths.canonical,
+        &operation.current_sha256,
+        &operation.candidate_sha256,
+    ) != InstalledImage::Current
+    {
+        return Err("last verified executable could not be restored".into());
+    }
+    remove_update_file(&paths.candidate)?;
+    remove_update_file(&paths.backup)?;
+    delete_update_journal(paths)
+}
+
+fn recover_update(running_exe: &Path, hook: &mut impl UpdateBoundaryHook) -> Result<(), String> {
+    let directory = running_exe.parent().ok_or("can't locate exe folder")?;
+    let Some(mut operation) = load_update_operation(directory)? else {
+        return Ok(());
+    };
+    let paths = operation_paths(directory, &operation)?;
+    if !paths_equal(running_exe, &paths.canonical) && !paths_equal(running_exe, &paths.backup) {
+        return Err("update journal is not bound to this executable".into());
+    }
+    require_portable(&paths.canonical)?;
+    let canonical_image = installed_image(
+        &paths.canonical,
+        &operation.current_sha256,
+        &operation.candidate_sha256,
+    );
+    let running_candidate =
+        paths_equal(running_exe, &paths.canonical) && canonical_image == InstalledImage::Candidate;
+
+    if operation.phase == UpdatePhase::Committed {
+        if canonical_image == InstalledImage::Candidate {
+            return finish_committed(&paths);
+        }
+        return rollback_update(&operation, &paths, hook);
+    }
+    if running_candidate {
+        return commit_candidate(&mut operation, &paths, hook);
+    }
+    rollback_update(&operation, &paths, hook)
 }
 
 // ---------- install ----------
@@ -212,8 +826,6 @@ pub fn install() {
                 }
             }
             Err(msg) => {
-                // best help on failure: hand the user the release page
-                open_url(&rel.page_url);
                 set_status(Status::Failed(msg, Some(rel.page_url.clone())));
             }
         }
@@ -222,96 +834,356 @@ pub fn install() {
 
 fn install_inner(rel: &Release) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|_| "can't locate exe")?;
+    require_portable(&exe)?;
+    recover_update(&exe, &mut NoUpdateHook)?;
+    if rel.expires_at <= OffsetDateTime::now_utc() {
+        return Err("release policy expired — check for updates again".into());
+    }
     let dir = exe.parent().ok_or("can't locate exe folder")?;
-    let new = dir.join("claudometer.new.exe");
-    let old = dir.join("claudometer.old.exe");
+    let attempt_id = new_attempt_id()?;
+    let current_sha256 = sha256_of(&exe).ok_or("couldn't verify current executable")?;
+    let mut operation = UpdateOperation::new(
+        &exe,
+        attempt_id,
+        current_sha256,
+        rel.asset_sha256.clone(),
+        rel.version,
+    )?;
+    let paths = operation_paths(dir, &operation)?;
+    if paths.candidate.exists() || paths.backup.exists() {
+        return Err("unique update paths are already occupied".into());
+    }
 
     let agent = agent(180).ok_or("TLS init failed")?;
-    download(&agent, &rel.exe_url, &new).map_err(|e| format!("download failed: {e}"))?;
+    let checksum = get_bounded(&agent, &rel.sha_url, MAX_CHECKSUM_BYTES)
+        .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "hash asset is not UTF-8".into()))?;
+    let expected = parse_checksum(&checksum, &rel.asset_name)
+        .ok_or_else(|| "hash asset malformed".to_string())?;
+    if expected != rel.asset_sha256 {
+        return Err("checksum does not match signed manifest".into());
+    }
+    let candidate = get_exact(&agent, &rel.exe_url, rel.asset_size)
+        .map_err(|error| format!("download failed: {error}"))?;
+    validate_candidate_bytes(&candidate, rel)?;
+    if rel.expires_at <= OffsetDateTime::now_utc() {
+        return Err("release policy expired during download".into());
+    }
 
-    let cleanup_new = |msg: &str| -> String {
-        let _ = std::fs::remove_file(&new);
+    let cleanup_candidate = |msg: &str| -> String {
+        let _ = std::fs::remove_file(&paths.candidate);
         msg.to_string()
     };
-
-    // integrity: right shape, right version, right hash
-    let len = std::fs::metadata(&new).map(|m| m.len()).unwrap_or(0);
-    if len < 100_000 {
-        return Err(cleanup_new("download truncated"));
+    write_candidate(&paths.candidate, &candidate, rel)?;
+    if file_version(&paths.candidate) != Some(rel.version) {
+        return Err(cleanup_candidate("downloaded exe version mismatch"));
     }
-    let mut magic = [0u8; 2];
-    std::fs::File::open(&new)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .map_err(|_| cleanup_new("downloaded file unreadable"))?;
-    if &magic != b"MZ" {
-        return Err(cleanup_new("downloaded file is not an exe"));
+    if sha256_of(&paths.candidate).as_deref() != Some(&rel.asset_sha256) {
+        return Err(cleanup_candidate("written executable hash mismatch"));
     }
-    if file_version(&new) != Some(rel.version) {
-        return Err(cleanup_new("downloaded exe version mismatch"));
-    }
-    if let Some(sha_url) = &rel.sha_url {
-        let expected = crate::network::get(&agent, sha_url)
-            .set("User-Agent", UA)
-            .call()
-            .map_err(|_| cleanup_new("hash download failed"))?
-            .into_string()
-            .ok()
-            .and_then(|s| s.split_whitespace().next().map(str::to_lowercase))
-            .ok_or_else(|| cleanup_new("hash asset unreadable"))?;
-        let actual = sha256_of(&new).ok_or_else(|| cleanup_new("hashing failed"))?;
-        if actual != expected {
-            return Err(cleanup_new("SHA256 mismatch"));
-        }
+    require_portable(&exe).map_err(|message| cleanup_candidate(&message))?;
+    if let Err(error) = start_handover(dir, &mut operation, &mut NoUpdateHook) {
+        return match rollback_update(&operation, &paths, &mut NoUpdateHook) {
+            Ok(()) => Err(error),
+            Err(recovery) => Err(format!("{error}; {recovery}")),
+        };
     }
 
-    swap_files(&exe, &new, &old)
-        .map_err(|_| cleanup_new("couldn't replace exe (folder read-only?)"))?;
-
-    // hand over: new instance waits for our mutex, then cleans up the .old
-    std::process::Command::new(&exe)
+    // Hand over: the candidate waits for our mutex, records readiness and
+    // commit, then removes this attempt's backup.
+    if std::process::Command::new(&exe)
         .arg("--swap-wait")
         .spawn()
-        .map_err(|_| "relaunch failed — restart Claudometer manually".to_string())?;
+        .is_err()
+    {
+        return match rollback_update(&operation, &paths, &mut NoUpdateHook) {
+            Ok(()) => Err("relaunch failed — previous version restored".into()),
+            Err(recovery) => Err(format!("relaunch failed; {recovery}")),
+        };
+    }
     Ok(())
 }
 
-fn download(agent: &ureq::Agent, url: &str, dest: &Path) -> Result<(), String> {
-    let resp = crate::network::get(agent, url)
-        .set("User-Agent", UA)
-        .call()
-        .map_err(|e| match e {
+fn validate_candidate_bytes(candidate: &[u8], rel: &Release) -> Result<(), String> {
+    if candidate.len() as u64 != rel.asset_size {
+        return Err("download size mismatch".into());
+    }
+    if candidate.get(..2) != Some(b"MZ") {
+        return Err("downloaded file is not an exe".into());
+    }
+    let actual = sha256_reader(std::io::Cursor::new(candidate)).ok_or("hashing failed")?;
+    if actual != rel.asset_sha256 {
+        return Err("SHA256 mismatch".into());
+    }
+    Ok(())
+}
+
+fn write_candidate(path: &Path, candidate: &[u8], rel: &Release) -> Result<(), String> {
+    validate_candidate_bytes(candidate, rel)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| "candidate path is not uniquely writable")?;
+    if file
+        .write_all(candidate)
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err("write failed".into());
+    }
+    Ok(())
+}
+
+fn require_portable(exe: &Path) -> Result<(), String> {
+    match install_channel(exe) {
+        InstallChannel::Portable => {}
+        InstallChannel::Managed => {
+            return Err("managed install — use its signed installer or package manager".into())
+        }
+        InstallChannel::Ambiguous => {
+            return Err("install channel could not be verified — use the signed installer".into())
+        }
+    }
+    Ok(())
+}
+
+fn get_bounded(agent: &ureq::Agent, url: &str, max: u64) -> Result<Vec<u8>, String> {
+    let resp = restricted_get(agent, url, crate::network::GITHUB_RELEASE_HOSTS, None)?;
+    if resp
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > max)
+    {
+        return Err("download too large".into());
+    }
+    read_bounded(resp.into_reader(), max)
+}
+
+fn get_exact(agent: &ureq::Agent, url: &str, expected: u64) -> Result<Vec<u8>, String> {
+    let resp = restricted_get(agent, url, crate::network::GITHUB_RELEASE_HOSTS, None)?;
+    if resp
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length != expected)
+    {
+        return Err("download size mismatch".into());
+    }
+    let bytes = read_bounded(resp.into_reader(), expected)?;
+    if bytes.len() as u64 != expected {
+        return Err("download size mismatch".into());
+    }
+    Ok(bytes)
+}
+
+fn restricted_get(
+    agent: &ureq::Agent,
+    url: &str,
+    allowed_hosts: &[&str],
+    accept: Option<&str>,
+) -> Result<ureq::Response, String> {
+    let mut current = url.to_string();
+    for redirects in 0..=MAX_REDIRECTS {
+        let parsed = agent
+            .get(&current)
+            .request_url()
+            .map_err(|_| "invalid URL")?;
+        if !allowed_url(&parsed, allowed_hosts) {
+            return Err("URL destination not allowed".into());
+        }
+
+        let mut request = crate::network::get(agent, &current).set("User-Agent", UA);
+        if let Some(value) = accept {
+            request = request.set("Accept", value);
+        }
+        let response = request.call().map_err(|error| match error {
             ureq::Error::Status(code, _) => format!("HTTP {code}"),
             _ => "network error".to_string(),
         })?;
-    let mut file = std::fs::File::create(dest).map_err(|_| "folder not writable")?;
-    // 100 MB cap — a claudometer.exe orders of magnitude bigger is not ours
-    std::io::copy(&mut resp.into_reader().take(100 * 1024 * 1024), &mut file)
-        .map_err(|_| "write failed")?;
-    Ok(())
-}
-
-/// exe → .old, new → exe; rollback if the second rename fails.
-/// (Windows allows renaming a running exe — deleting/overwriting it, no.)
-fn swap_files(exe: &Path, new: &Path, old: &Path) -> std::io::Result<()> {
-    let _ = std::fs::remove_file(old); // stale leftover from a crashed update
-    std::fs::rename(exe, old)?;
-    if let Err(e) = std::fs::rename(new, exe) {
-        let _ = std::fs::rename(old, exe);
-        return Err(e);
+        if (200..300).contains(&response.status()) {
+            return Ok(response);
+        }
+        if !matches!(response.status(), 301 | 302 | 303 | 307 | 308) {
+            return Err(format!("unexpected HTTP {}", response.status()));
+        }
+        if redirects == MAX_REDIRECTS {
+            return Err("too many redirects".into());
+        }
+        let location = response
+            .header("Location")
+            .ok_or("redirect missing location")?;
+        current = parsed
+            .as_url()
+            .join(location)
+            .map_err(|_| "invalid redirect URL")?
+            .to_string();
     }
-    Ok(())
+    unreachable!()
 }
 
-/// Post-update startup: drop the previous exe once its process is gone.
+fn allowed_url(url: &ureq::RequestUrl, allowed_hosts: &[&str]) -> bool {
+    url.scheme() == "https"
+        && url.port().is_none()
+        && url.as_url().username().is_empty()
+        && url.as_url().password().is_none()
+        && url.as_url().fragment().is_none()
+        && allowed_hosts
+            .iter()
+            .any(|host| url.host().eq_ignore_ascii_case(host))
+}
+
+fn read_string_bounded(reader: impl Read, max: u64) -> Result<String, String> {
+    let bytes = read_bounded(reader, max)?;
+    String::from_utf8(bytes).map_err(|_| "response is not UTF-8".into())
+}
+
+fn read_bounded(reader: impl Read, max: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "read failed")?;
+    if bytes.len() as u64 > max {
+        return Err("response too large".into());
+    }
+    Ok(bytes)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallChannel {
+    Portable,
+    Managed,
+    Ambiguous,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ChannelMarker {
+    Missing,
+    Managed,
+    Invalid,
+}
+
+fn install_channel(exe: &Path) -> InstallChannel {
+    let Some(dir) = exe.parent() else {
+        return InstallChannel::Ambiguous;
+    };
+    let marker = read_channel_marker(dir);
+    let Some(local_appdata) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) else {
+        return InstallChannel::Ambiguous;
+    };
+    classify_install_channel(
+        dir,
+        &local_appdata.join("Programs").join("Claudometer"),
+        marker,
+        || read_registered_install_location().ok().flatten(),
+    )
+}
+
+fn classify_install_channel(
+    exe_dir: &Path,
+    managed_root: &Path,
+    marker: ChannelMarker,
+    registered_location: impl FnOnce() -> Option<PathBuf>,
+) -> InstallChannel {
+    let at_managed_root = paths_equal(exe_dir, managed_root);
+    if marker == ChannelMarker::Missing && !at_managed_root {
+        return InstallChannel::Portable;
+    }
+    if marker != ChannelMarker::Managed || !at_managed_root {
+        return InstallChannel::Ambiguous;
+    }
+    match registered_location() {
+        Some(location) if paths_equal(exe_dir, &location) => InstallChannel::Managed,
+        _ => InstallChannel::Ambiguous,
+    }
+}
+
+fn read_channel_marker(dir: &Path) -> ChannelMarker {
+    let path = dir.join(CHANNEL_MARKER);
+    match std::fs::File::open(path) {
+        Ok(file) => match read_string_bounded(file, 32) {
+            Ok(value) if value == MANAGED_CHANNEL => ChannelMarker::Managed,
+            _ => ChannelMarker::Invalid,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ChannelMarker::Missing,
+        Err(_) => ChannelMarker::Invalid,
+    }
+}
+
+fn read_registered_install_location() -> Result<Option<PathBuf>, ()> {
+    unsafe {
+        let mut bytes = 0u32;
+        let status = RegGetValueW(
+            HKEY_CURRENT_USER,
+            UNINSTALL_KEY,
+            windows::core::w!("InstallLocation"),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut bytes),
+        );
+        if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+            return Ok(None);
+        }
+        if status.is_err() || bytes == 0 || bytes > 64 * 1024 {
+            return Err(());
+        }
+        let mut value = vec![0u16; bytes.div_ceil(2) as usize];
+        let status = RegGetValueW(
+            HKEY_CURRENT_USER,
+            UNINSTALL_KEY,
+            windows::core::w!("InstallLocation"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(value.as_mut_ptr() as *mut _),
+            Some(&mut bytes),
+        );
+        if status.is_err() {
+            return Err(());
+        }
+        let length = value
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(value.len());
+        let location = String::from_utf16(&value[..length]).map_err(|_| ())?;
+        if location.is_empty() {
+            return Err(());
+        }
+        Ok(Some(PathBuf::from(location)))
+    }
+}
+
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    let normalize = |path: &Path| {
+        path.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_string()
+    };
+    normalize(left).eq_ignore_ascii_case(&normalize(right))
+}
+
+/// Startup recovery reconciles the journal with the actual file hashes. A
+/// canonical candidate commits only when this process is that candidate;
+/// every other pre-commit launch restores the previous verified executable.
 pub fn cleanup_old() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let Some(dir) = exe.parent() else { return };
-    let old = dir.join("claudometer.old.exe");
-    if old.exists() {
+    if let Err(message) = recover_update(&exe, &mut NoUpdateHook) {
+        set_status(Status::Failed(message, None));
+        return;
+    }
+
+    // One-way cleanup for the pre-journal updater's fixed backup name.
+    let Some(directory) = exe.parent() else {
+        return;
+    };
+    let legacy_backup = directory.join("claudometer.old.exe");
+    if legacy_backup.exists() {
         for _ in 0..10 {
-            if std::fs::remove_file(&old).is_ok() {
+            if std::fs::remove_file(&legacy_backup).is_ok() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(200));
@@ -376,30 +1248,91 @@ fn file_version(path: &Path) -> Option<(u16, u16, u16)> {
     }
 }
 
-/// SHA256 via certutil (ships with Windows) — no crypto dependency.
 fn sha256_of(path: &Path) -> Option<String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new("certutil")
-        .arg("-hashfile")
-        .arg(path)
-        .arg("SHA256")
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_certutil(&String::from_utf8_lossy(&out.stdout))
+    sha256_reader(std::fs::File::open(path).ok()?)
 }
 
-/// certutil output: header line, hex line (spaces possible on old builds),
-/// trailer. The hash is the only line that strips down to 64 hex chars.
-fn parse_certutil(s: &str) -> Option<String> {
-    s.lines().find_map(|l| {
-        let h: String = l.chars().filter(|c| !c.is_whitespace()).collect();
-        (h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit())).then(|| h.to_lowercase())
-    })
+fn sha256_reader(mut reader: impl Read) -> Option<String> {
+    unsafe {
+        let mut algorithm = BCRYPT_ALG_HANDLE::default();
+        if !BCryptOpenAlgorithmProvider(
+            &mut algorithm,
+            BCRYPT_SHA256_ALGORITHM,
+            PCWSTR::null(),
+            BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS(0),
+        )
+        .is_ok()
+        {
+            return None;
+        }
+
+        let result = (|| {
+            let mut hash = BCRYPT_HASH_HANDLE::default();
+            if !BCryptCreateHash(algorithm, &mut hash, None, None, 0).is_ok() {
+                return None;
+            }
+            let digest = (|| {
+                let mut buffer = [0u8; 64 * 1024];
+                loop {
+                    let read = reader.read(&mut buffer).ok()?;
+                    if read == 0 {
+                        break;
+                    }
+                    if !BCryptHashData(hash, &buffer[..read], 0).is_ok() {
+                        return None;
+                    }
+                }
+                let mut digest = [0u8; 32];
+                BCryptFinishHash(hash, &mut digest, 0)
+                    .is_ok()
+                    .then_some(digest)
+            })();
+            let _ = BCryptDestroyHash(hash);
+            digest
+        })();
+        let _ = BCryptCloseAlgorithmProvider(algorithm, 0);
+
+        let mut hex = String::with_capacity(64);
+        for byte in result? {
+            write!(&mut hex, "{byte:02x}").ok()?;
+        }
+        Some(hex)
+    }
+}
+
+fn parse_checksum(contents: &str, asset_name: &str) -> Option<String> {
+    let mut fields = contents.split_whitespace();
+    let digest = fields.next()?;
+    let filename = fields.next()?;
+    if fields.next().is_some()
+        || digest.len() != 64
+        || !digest.chars().all(|ch| ch.is_ascii_hexdigit())
+        || filename != format!("*{asset_name}")
+    {
+        return None;
+    }
+    Some(digest.to_ascii_lowercase())
+}
+
+fn decode_lower_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut output = [0u8; N];
+    for (index, byte) in output.iter_mut().enumerate() {
+        let nibble = |value| match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            _ => None,
+        };
+        *byte =
+            nibble(value.as_bytes()[index * 2])? << 4 | nibble(value.as_bytes()[index * 2 + 1])?;
+    }
+    Some(output)
 }
 
 #[cfg(test)]
@@ -416,93 +1349,457 @@ mod tests {
     }
 
     #[test]
-    fn version_parsing() {
-        assert_eq!(parse_ver("v0.5.0"), Some((0, 5, 0)));
-        assert_eq!(parse_ver("0.5.0"), Some((0, 5, 0)));
-        assert_eq!(parse_ver("1.12.3"), Some((1, 12, 3)));
-        assert_eq!(parse_ver("v0.5"), None);
-        assert_eq!(parse_ver("v0.5.0.1"), None);
-        assert_eq!(parse_ver("v0.5.0-rc1"), None);
-    }
-
-    #[test]
-    fn version_ordering() {
-        assert!(parse_ver("v0.5.0") > parse_ver("v0.4.9"));
-        assert!(parse_ver("v0.10.0") > parse_ver("v0.9.9"));
-        assert!(parse_ver("v1.0.0") > parse_ver("v0.99.99"));
-    }
-
-    #[test]
-    fn certutil_parse_plain_and_spaced() {
-        let plain = "SHA256 hash of x.exe:\r\nd2b2f2a1c3e4556677889900aabbccddeeff00112233445566778899aabbccdd\r\nCertUtil: -hashfile command completed successfully.\r\n";
+    fn cng_sha256_matches_known_digest() {
         assert_eq!(
-            parse_certutil(plain).as_deref(),
+            sha256_reader(std::io::Cursor::new(b"abc")).as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+    }
+
+    #[test]
+    fn checksum_requires_exact_digest_and_asset_name() {
+        let digest = "D2B2F2A1C3E4556677889900AABBCCDDEEFF00112233445566778899AABBCCDD";
+        assert_eq!(
+            parse_checksum(
+                &format!("{digest} *claudometer-v9.9.9-windows-x64.exe"),
+                "claudometer-v9.9.9-windows-x64.exe"
+            )
+            .as_deref(),
             Some("d2b2f2a1c3e4556677889900aabbccddeeff00112233445566778899aabbccdd")
         );
-        let spaced = "SHA256 hash of x.exe:\r\nd2 b2 f2 a1 c3 e4 55 66 77 88 99 00 aa bb cc dd ee ff 00 11 22 33 44 55 66 77 88 99 aa bb cc dd\r\ndone\r\n";
-        assert_eq!(
-            parse_certutil(spaced).as_deref(),
-            Some("d2b2f2a1c3e4556677889900aabbccddeeff00112233445566778899aabbccdd")
-        );
-        assert_eq!(parse_certutil("no hash here"), None);
+        assert!(parse_checksum(digest, "asset.exe").is_none());
+        assert!(parse_checksum(&format!("{digest} *other.exe"), "asset.exe").is_none());
+        assert!(parse_checksum(&format!("{digest} *asset.exe extra"), "asset.exe").is_none());
     }
 
     #[test]
-    fn release_picking() {
+    fn release_metadata_builds_fixed_manifest_urls_and_requires_signature() {
+        let stem = format!("claudometer-v9.9.9-windows-{RELEASE_ARCH}");
+        let manifest = format!("{stem}.manifest.json");
+        let signatures = format!("{stem}.manifest.signatures.json");
         let rel = ApiRelease {
             tag_name: Some("v9.9.9".into()),
-            html_url: Some("https://github.com/x/y/releases/tag/v9.9.9".into()),
             draft: Some(false),
             prerelease: Some(false),
             assets: Some(vec![
                 ApiAsset {
-                    name: Some("claudometer.exe".into()),
-                    browser_download_url: Some("https://dl/claudometer.exe".into()),
+                    name: Some(manifest.clone()),
                 },
                 ApiAsset {
-                    name: Some("claudometer.exe.sha256".into()),
-                    browser_download_url: Some("https://dl/claudometer.exe.sha256".into()),
+                    name: Some(signatures.clone()),
                 },
             ]),
         };
-        let picked = pick_release(&rel, (0, 4, 0)).expect("newer release picked");
+        let picked = pick_manifest_assets(&rel).expect("complete manifest assets picked");
         assert_eq!(picked.tag, "v9.9.9");
-        assert!(picked.sha_url.is_some());
+        assert_eq!(
+            picked.manifest_url,
+            format!("https://github.com/Dvaderfun/claudometer/releases/download/v9.9.9/{manifest}")
+        );
+        assert_eq!(
+            picked.signatures_url,
+            format!(
+                "https://github.com/Dvaderfun/claudometer/releases/download/v9.9.9/{signatures}"
+            )
+        );
 
-        // same or older version → no update
-        assert!(pick_release(&rel, (9, 9, 9)).is_none());
-        assert!(pick_release(&rel, (10, 0, 0)).is_none());
-
-        // prerelease → skipped
-        let pre = ApiRelease {
-            prerelease: Some(true),
+        let missing_signature = ApiRelease {
+            assets: Some(vec![ApiAsset {
+                name: Some(manifest.clone()),
+            }]),
             ..rel
         };
-        assert!(pick_release(&pre, (0, 4, 0)).is_none());
+        assert!(pick_manifest_assets(&missing_signature).is_none());
+
+        let incomplete = ApiRelease {
+            draft: None,
+            ..missing_signature
+        };
+        assert!(pick_manifest_assets(&incomplete).is_none());
+
+        let noncanonical_tag = ApiRelease {
+            tag_name: Some("9.9.9".into()),
+            draft: Some(false),
+            assets: Some(vec![
+                ApiAsset {
+                    name: Some(manifest),
+                },
+                ApiAsset {
+                    name: Some(signatures),
+                },
+            ]),
+            ..incomplete
+        };
+        assert!(pick_manifest_assets(&noncanonical_tag).is_none());
+
+        let prerelease = ApiRelease {
+            prerelease: Some(true),
+            ..noncanonical_tag
+        };
+        assert!(pick_manifest_assets(&prerelease).is_none());
     }
 
     #[test]
-    fn swap_dance_and_rollback() {
-        let dir = std::env::temp_dir().join(format!("cm-swap-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("app.exe");
-        let new = dir.join("app.new.exe");
-        let old = dir.join("app.old.exe");
+    fn unprovisioned_updater_cannot_accept_even_a_valid_manifest() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use serde_json::json;
+        use time::macros::datetime;
 
-        // happy path: old content preserved as .old, new becomes exe
-        std::fs::write(&exe, b"v1").unwrap();
-        std::fs::write(&new, b"v2").unwrap();
-        swap_files(&exe, &new, &old).unwrap();
-        assert_eq!(std::fs::read(&exe).unwrap(), b"v2");
-        assert_eq!(std::fs::read(&old).unwrap(), b"v1");
-        assert!(!new.exists());
+        let current_version = crate::release_manifest::strict_version(env!("CARGO_PKG_VERSION"))
+            .expect("package version is canonical");
+        let target_version = format!(
+            "{}.{}.{}",
+            current_version.0,
+            current_version.1,
+            current_version.2 + 1
+        );
+        let key = SigningKey::from_bytes(&[42; 32]);
+        let key_hex: String = key
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let manifest = serde_json::to_vec(&json!({
+            "schema": crate::release_manifest::MANIFEST_SCHEMA,
+            "channel": crate::release_manifest::RELEASE_CHANNEL,
+            "sequence": 2,
+            "version": target_version,
+            "tag": format!("v{target_version}"),
+            "issued_at": "2026-09-03T11:00:00Z",
+            "policy_expires_at": "2026-09-10T11:00:00Z",
+            "architecture": RELEASE_ARCH,
+            "asset": format!("claudometer-v{target_version}-windows-{RELEASE_ARCH}.exe"),
+            "size": 123456,
+            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "minimum_updater_version": env!("CARGO_PKG_VERSION")
+        }))
+        .unwrap();
+        let signatures = serde_json::to_vec(&json!({
+            "schema": crate::release_manifest::SIGNATURE_SCHEMA,
+            "signatures": [{
+                "public_key": key_hex,
+                "signature": key.sign(&manifest).to_bytes().iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            }]
+        }))
+        .unwrap();
+        let now = datetime!(2026-09-03 12:00 UTC);
 
-        // failure path: missing new → exe restored
-        let _ = std::fs::remove_file(&old);
-        assert!(swap_files(&exe, &new, &old).is_err());
-        assert_eq!(std::fs::read(&exe).unwrap(), b"v2");
+        assert!(verify_release_manifest(
+            &manifest,
+            &signatures,
+            None,
+            Some(&key_hex),
+            Some("1"),
+            current_version,
+            now,
+        )
+        .is_ok());
+        assert_eq!(
+            verify_release_manifest(
+                &manifest,
+                &signatures,
+                None,
+                None,
+                None,
+                current_version,
+                now,
+            )
+            .unwrap_err(),
+            "release trust root not provisioned"
+        );
+        assert_eq!(
+            verify_release_manifest(
+                &manifest,
+                &signatures,
+                None,
+                Some(&key_hex),
+                Some("0"),
+                current_version,
+                now,
+            )
+            .unwrap_err(),
+            "release sequence not provisioned"
+        );
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn request_urls_require_https_and_allowlisted_exact_hosts() {
+        let allowed = |url: &str| {
+            let parsed = ureq::get(url).request_url().unwrap();
+            allowed_url(&parsed, crate::network::GITHUB_RELEASE_HOSTS)
+        };
+        assert!(allowed(
+            "https://github.com/owner/repo/releases/download/v1/asset"
+        ));
+        assert!(allowed(
+            "https://release-assets.githubusercontent.com/object?token=x"
+        ));
+        assert!(!allowed("http://github.com/owner/repo"));
+        assert!(!allowed("https://github.com.evil.example/owner/repo"));
+        assert!(!allowed("https://user@github.com/owner/repo"));
+        assert!(!allowed("https://github.com:444/owner/repo"));
+        assert!(!allowed("https://github.com/owner/repo#fragment"));
+    }
+
+    #[test]
+    fn bounded_reads_reject_max_plus_one_without_reading_further() {
+        assert_eq!(
+            read_bounded(std::io::Cursor::new(b"1234"), 4),
+            Ok(b"1234".to_vec())
+        );
+        assert!(read_bounded(std::io::Cursor::new(b"123456"), 4).is_err());
+        assert!(read_string_bounded(std::io::Cursor::new(b"12345"), 4).is_err());
+    }
+
+    #[test]
+    fn candidate_file_is_created_only_after_signed_byte_checks_pass() {
+        let candidate = b"MZsigned candidate";
+        let digest = sha256_reader(std::io::Cursor::new(candidate)).unwrap();
+        let mut release = Release {
+            tag: "v9.9.9".into(),
+            version: (9, 9, 9),
+            expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+            asset_name: format!("claudometer-v9.9.9-windows-{RELEASE_ARCH}.exe"),
+            asset_size: candidate.len() as u64,
+            asset_sha256: digest,
+            exe_url: String::new(),
+            sha_url: String::new(),
+            page_url: String::new(),
+        };
+        let path =
+            std::env::temp_dir().join(format!("claudometer-candidate-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        release.asset_size += 1;
+        assert!(write_candidate(&path, candidate, &release).is_err());
+        assert!(!path.exists());
+
+        release.asset_size -= 1;
+        release.asset_sha256 = "00".repeat(32);
+        assert!(write_candidate(&path, candidate, &release).is_err());
+        assert!(!path.exists());
+
+        release.asset_sha256 = sha256_reader(std::io::Cursor::new(candidate)).unwrap();
+        write_candidate(&path, candidate, &release).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), candidate);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn install_channel_requires_all_managed_signals_to_agree() {
+        let exe_dir = Path::new(r"C:\Users\me\AppData\Local\Programs\Claudometer");
+        let same_with_case = PathBuf::from(r"c:\users\me\appdata\local\programs\claudometer\");
+        assert_eq!(
+            classify_install_channel(exe_dir, exe_dir, ChannelMarker::Managed, || Some(
+                same_with_case
+            )),
+            InstallChannel::Managed
+        );
+        assert_eq!(
+            classify_install_channel(exe_dir, exe_dir, ChannelMarker::Missing, || Some(
+                exe_dir.into()
+            )),
+            InstallChannel::Ambiguous
+        );
+        assert_eq!(
+            classify_install_channel(
+                Path::new(r"D:\Tools"),
+                exe_dir,
+                ChannelMarker::Missing,
+                || panic!("portable classification must not inspect managed registration")
+            ),
+            InstallChannel::Portable
+        );
+        assert_eq!(
+            classify_install_channel(
+                Path::new(r"D:\Tools"),
+                exe_dir,
+                ChannelMarker::Managed,
+                || Some(PathBuf::from(r"D:\Tools"))
+            ),
+            InstallChannel::Ambiguous
+        );
+    }
+
+    static NEXT_UPDATE_TEST_DIRECTORY: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+
+    struct UpdateTestDirectory(PathBuf);
+
+    impl UpdateTestDirectory {
+        fn new() -> Self {
+            let unique = NEXT_UPDATE_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "claudometer-update-test-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn setup(&self) -> (UpdateOperation, OperationPaths) {
+            let canonical = self.0.join("app.exe");
+            std::fs::write(&canonical, b"verified current executable").unwrap();
+            let operation = UpdateOperation::new(
+                &canonical,
+                "11".repeat(ATTEMPT_ID_BYTES),
+                sha256_of(&canonical).unwrap(),
+                sha256_reader(std::io::Cursor::new(b"verified candidate executable")).unwrap(),
+                (9, 9, 9),
+            )
+            .unwrap();
+            let paths = operation_paths(&self.0, &operation).unwrap();
+            std::fs::write(&paths.candidate, b"verified candidate executable").unwrap();
+            (operation, paths)
+        }
+    }
+
+    impl Drop for UpdateTestDirectory {
+        fn drop(&mut self) {
+            let temp = std::env::temp_dir();
+            assert!(self.0.starts_with(&temp));
+            assert!(self.0.file_name().is_some_and(|name| name
+                .to_string_lossy()
+                .starts_with("claudometer-update-test-")));
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct CrashAfter(UpdateBoundary);
+
+    impl UpdateBoundaryHook for CrashAfter {
+        fn after(&mut self, boundary: UpdateBoundary) {
+            if boundary == self.0 {
+                panic!("injected crash after {boundary:?}");
+            }
+        }
+    }
+
+    fn assert_recovery_complete(paths: &OperationPaths, expected: &[u8]) {
+        assert_eq!(std::fs::read(&paths.canonical).unwrap(), expected);
+        assert!(!paths.candidate.exists());
+        assert!(!paths.backup.exists());
+        assert!(!paths.journal.exists());
+        assert!(!paths.journal_backup.exists());
+    }
+
+    #[test]
+    fn every_pre_ready_journal_write_and_rename_boundary_recovers() {
+        for (boundary, candidate_was_installed) in [
+            (UpdateBoundary::VerifiedPersisted, false),
+            (UpdateBoundary::CurrentRenamed, false),
+            (UpdateBoundary::CurrentMovedPersisted, false),
+            (UpdateBoundary::CandidateRenamed, true),
+            (UpdateBoundary::CandidateInstalledPersisted, true),
+        ] {
+            let directory = UpdateTestDirectory::new();
+            let (mut operation, paths) = directory.setup();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                start_handover(&directory.0, &mut operation, &mut CrashAfter(boundary)).unwrap();
+            }));
+            assert!(result.is_err(), "boundary {boundary:?}");
+            assert!(
+                [&paths.canonical, &paths.backup]
+                    .iter()
+                    .any(|path| std::fs::read(path)
+                        .is_ok_and(|bytes| bytes == b"verified current executable")),
+                "last verified executable lost at {boundary:?}"
+            );
+
+            let running = if candidate_was_installed || paths.canonical.exists() {
+                &paths.canonical
+            } else {
+                &paths.backup
+            };
+            recover_update(running, &mut NoUpdateHook).unwrap();
+            let expected: &[u8] = if candidate_was_installed {
+                b"verified candidate executable"
+            } else {
+                b"verified current executable"
+            };
+            assert_recovery_complete(&paths, expected);
+        }
+    }
+
+    #[test]
+    fn candidate_ready_and_committed_writes_are_retryable() {
+        for boundary in [
+            UpdateBoundary::CandidateReadyPersisted,
+            UpdateBoundary::CommittedPersisted,
+        ] {
+            let directory = UpdateTestDirectory::new();
+            let (mut operation, paths) = directory.setup();
+            start_handover(&directory.0, &mut operation, &mut NoUpdateHook).unwrap();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                recover_update(&paths.canonical, &mut CrashAfter(boundary)).unwrap();
+            }));
+            assert!(result.is_err(), "boundary {boundary:?}");
+            assert_eq!(
+                std::fs::read(&paths.backup).unwrap(),
+                b"verified current executable",
+                "the last verified executable must survive until commit"
+            );
+
+            recover_update(&paths.canonical, &mut NoUpdateHook).unwrap();
+            assert_recovery_complete(&paths, b"verified candidate executable");
+        }
+    }
+
+    #[test]
+    fn every_rollback_rename_boundary_is_idempotent() {
+        for boundary in [
+            UpdateBoundary::CandidateReturned,
+            UpdateBoundary::BackupRestored,
+        ] {
+            let directory = UpdateTestDirectory::new();
+            let (mut operation, paths) = directory.setup();
+            start_handover(&directory.0, &mut operation, &mut NoUpdateHook).unwrap();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                recover_update(&paths.backup, &mut CrashAfter(boundary)).unwrap();
+            }));
+            assert!(result.is_err(), "boundary {boundary:?}");
+            recover_update(&paths.backup, &mut NoUpdateHook).unwrap();
+            assert_recovery_complete(&paths, b"verified current executable");
+        }
+    }
+
+    #[test]
+    fn attempt_names_are_unique_and_journal_paths_cannot_escape() {
+        let first = update_names("app.exe", &"11".repeat(ATTEMPT_ID_BYTES)).unwrap();
+        let second = update_names("app.exe", &"22".repeat(ATTEMPT_ID_BYTES)).unwrap();
+        assert_ne!(first, second);
+        assert!(update_names(r"..\app.exe", &"11".repeat(ATTEMPT_ID_BYTES)).is_err());
+        assert!(update_names("app.exe", &"GG".repeat(ATTEMPT_ID_BYTES)).is_err());
+    }
+
+    #[test]
+    fn journal_phase_names_are_the_v1_contract() {
+        for (phase, expected) in [
+            (UpdatePhase::Verified, "verified"),
+            (UpdatePhase::CurrentMoved, "current_moved"),
+            (UpdatePhase::CandidateInstalled, "candidate_installed"),
+            (UpdatePhase::CandidateReady, "candidate_ready"),
+            (UpdatePhase::Committed, "committed"),
+        ] {
+            assert_eq!(serde_json::to_value(phase).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn preserved_corrupt_update_journal_blocks_later_handover_attempts() {
+        let directory = UpdateTestDirectory::new();
+        let canonical = directory.0.join("app.exe");
+        std::fs::write(&canonical, b"verified current executable").unwrap();
+        std::fs::write(directory.0.join(UPDATE_JOURNAL), b"{malformed").unwrap();
+
+        assert!(recover_update(&canonical, &mut NoUpdateHook).is_err());
+        assert!(!directory.0.join(UPDATE_JOURNAL).exists());
+        assert!(has_preserved_update_journal(&directory.0));
+        assert!(recover_update(&canonical, &mut NoUpdateHook).is_err());
     }
 }

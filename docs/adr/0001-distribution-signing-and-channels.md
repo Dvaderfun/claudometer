@@ -20,6 +20,22 @@ Signing also has two independent trust roots:
 
 Neither trust root substitutes for the other.
 
+The exact Ed25519 wire format, replay/downgrade policy, and cross-signing
+transition are specified in [`../release-manifest-v1.md`](../release-manifest-v1.md).
+
+### Existing-user trust bootstrap
+
+Versions without an embedded trust root—including all published versions
+through 0.7.3—cannot authenticate a newly supplied Ed25519 public key. The first
+trust-root-enabled release is therefore a manual migration boundary: existing
+users must download it themselves and verify its published SHA-256 and
+Authenticode identity before installation. The old updater must not download a
+key, accept a consent-based exception, or automatically install across this
+boundary. The bootstrap release omits the legacy `claudometer.exe` and
+`claudometer.exe.sha256` aliases recognized by 0.7.x clients. The verification
+procedure and production provisioning record live in
+[`../release-manifest-v1.md`](../release-manifest-v1.md#trust-root-bootstrap).
+
 ## Decision
 
 ### Installer
@@ -34,6 +50,12 @@ does not add a runtime to Claudometer. Configuration must include:
   `arm64` and carries only the ARM64 application binary.
 - No service, scheduled task, daemon, browser runtime, or global PATH edit.
 - A stable uninstall entry and install-channel marker owned by Claudometer.
+- The uninstall entry key is
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Claudometer_is1`;
+  its `InstallLocation` must equal the executable directory.
+- The managed install root contains `claudometer.install-channel` with the exact
+  UTF-8 value `managed`. The marker, expected install root, and uninstall
+  registration must all agree before the app treats itself as managed.
 - Installer code must stop when the maintenance handshake or safety recovery
   cannot be verified. It must never force-kill past an unresolved power journal.
 
@@ -59,6 +81,11 @@ v1.0 acceptance benefit. Revisit only through a superseding ADR.
 The install-channel marker is advisory input only. Before mutation, the updater
 must also verify that the executable path and uninstall registration agree. An
 ambiguous installation fails closed to a manual signed-download action.
+
+Release downloads start at fixed `github.com` repository/tag/asset URLs and
+may redirect only to GitHub's documented `release-assets.githubusercontent.com`
+release-asset host. See GitHub's
+[self-hosted runner network reference](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#communication-requirements).
 
 ### Signing provider and custody
 
