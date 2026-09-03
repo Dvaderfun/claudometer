@@ -16,6 +16,7 @@ const KEY_SCHEMA: &str = "schema_version";
 const KEY_POLL: &str = "poll_interval_seconds";
 const KEY_CODEX: &str = "codex_enabled";
 const KEY_ALERTS: &str = "alerts_enabled";
+const KEY_UPDATE_CHECKS: &str = "update_checks_enabled";
 const KEY_WAKE_LOCK: &str = "wake_lock_enabled";
 const KEY_PERSISTENT_LID_OVERRIDE: &str = "persistent_lid_override_enabled";
 
@@ -31,6 +32,7 @@ pub struct SettingsV1 {
     pub poll_interval_seconds: u32,
     pub codex_enabled: bool,
     pub alerts_enabled: bool,
+    pub update_checks_enabled: bool,
     pub wake_lock_enabled: bool,
     pub persistent_lid_override_enabled: bool,
 }
@@ -41,6 +43,7 @@ impl Default for SettingsV1 {
             poll_interval_seconds: DEFAULT_POLL_INTERVAL_SECONDS,
             codex_enabled: true,
             alerts_enabled: true,
+            update_checks_enabled: false,
             wake_lock_enabled: false,
             persistent_lid_override_enabled: false,
         }
@@ -195,6 +198,10 @@ pub fn set_alerts_enabled(enabled: bool) -> Result<(), ConfigError> {
     update_settings(|settings| settings.alerts_enabled = enabled)
 }
 
+pub fn set_update_checks_enabled(enabled: bool) -> Result<(), ConfigError> {
+    update_settings(|settings| settings.update_checks_enabled = enabled)
+}
+
 pub fn set_wake_lock_enabled(enabled: bool) -> Result<(), ConfigError> {
     update_settings(|settings| settings.wake_lock_enabled = enabled)
 }
@@ -253,17 +260,19 @@ impl<F: FaultInjector> Runtime<F> {
         };
 
         let outcome = store.load::<Map<String, Value>>();
-        let (raw, source_status, had_document) = match outcome {
-            Ok(LoadOutcome::Loaded(raw)) => (raw, ConfigStatus::Ready, true),
+        let (raw, source_status, had_document, existing_install) = match outcome {
+            Ok(LoadOutcome::Loaded(raw)) => (raw, ConfigStatus::Ready, true, true),
             Ok(LoadOutcome::RecoveredFromBackup(raw)) => {
-                (raw, ConfigStatus::RecoveredFromBackup, true)
+                (raw, ConfigStatus::RecoveredFromBackup, true, true)
             }
-            Ok(LoadOutcome::Missing) => (Map::new(), ConfigStatus::Ready, false),
-            Ok(LoadOutcome::CorruptPreserved) => (Map::new(), ConfigStatus::CorruptDefaults, false),
-            Err(error) => (Map::new(), ConfigStatus::ReadFailed(error), false),
+            Ok(LoadOutcome::Missing) => (Map::new(), ConfigStatus::Ready, false, false),
+            Ok(LoadOutcome::CorruptPreserved) => {
+                (Map::new(), ConfigStatus::CorruptDefaults, false, true)
+            }
+            Err(error) => (Map::new(), ConfigStatus::ReadFailed(error), false, true),
         };
 
-        let decoded = decode(raw);
+        let decoded = decode(raw, existing_install);
         let mut runtime = Self {
             backend,
             state: ConfigState {
@@ -358,7 +367,7 @@ struct Decoded {
     needs_migration: bool,
 }
 
-fn decode(raw: Map<String, Value>) -> Decoded {
+fn decode(raw: Map<String, Value>, existing_install: bool) -> Decoded {
     let schema = raw.get(KEY_SCHEMA);
     let (access, legacy_schema) = match schema {
         None => (AccessMode::Writable, true),
@@ -380,6 +389,10 @@ fn decode(raw: Map<String, Value>) -> Decoded {
         alerts_enabled: bool_value(raw.get(KEY_ALERTS))
             .or_else(|| bool_value(raw.get(LEGACY_ALERTS)))
             .unwrap_or(true),
+        // A pre-control document represents an installation that already
+        // received automatic checks. Even a corrupt/unreadable document proves
+        // this is not a genuinely new install; only absence opts out.
+        update_checks_enabled: bool_value(raw.get(KEY_UPDATE_CHECKS)).unwrap_or(existing_install),
         wake_lock_enabled: bool_value(raw.get(KEY_WAKE_LOCK))
             .or_else(|| bool_value(raw.get(LEGACY_WAKE_LOCK)))
             .unwrap_or(false),
@@ -407,6 +420,10 @@ fn encode(raw: &Map<String, Value>, settings: &SettingsV1) -> Map<String, Value>
     );
     encoded.insert(KEY_CODEX.to_string(), Value::from(settings.codex_enabled));
     encoded.insert(KEY_ALERTS.to_string(), Value::from(settings.alerts_enabled));
+    encoded.insert(
+        KEY_UPDATE_CHECKS.to_string(),
+        Value::from(settings.update_checks_enabled),
+    );
     encoded.insert(
         KEY_WAKE_LOCK.to_string(),
         Value::from(settings.wake_lock_enabled),
@@ -554,6 +571,7 @@ mod tests {
                 poll_interval_seconds: 120,
                 codex_enabled: false,
                 alerts_enabled: false,
+                update_checks_enabled: true,
                 wake_lock_enabled: true,
                 persistent_lid_override_enabled: false,
             }
@@ -571,6 +589,7 @@ mod tests {
         assert_eq!(saved.get(LEGACY_POLL), Some(&Value::from(120)));
         assert_eq!(saved.get(KEY_CODEX), Some(&Value::from(false)));
         assert_eq!(saved.get(LEGACY_CODEX), Some(&Value::from(false)));
+        assert_eq!(saved.get(KEY_UPDATE_CHECKS), Some(&Value::from(true)));
         assert_eq!(saved.get("future_unknown"), legacy.get("future_unknown"));
         assert_eq!(
             saved.get(LEGACY_LID_RECOVERY),
@@ -580,6 +599,45 @@ mod tests {
             saved.get(LEGACY_ALERT_RECEIPTS),
             legacy.get(LEGACY_ALERT_RECEIPTS)
         );
+    }
+
+    #[test]
+    fn genuinely_new_install_defaults_update_checks_off_without_writing() {
+        let directory = TestDirectory::new();
+        let path = directory.settings_path();
+
+        let runtime = load_runtime(&path);
+
+        assert_eq!(runtime.state.status, ConfigStatus::Ready);
+        assert!(!runtime.state.settings.update_checks_enabled);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn existing_v1_install_migrates_with_update_checks_enabled() {
+        let directory = TestDirectory::new();
+        let path = directory.settings_path();
+        let existing = serde_json::json!({
+            "schema_version": 1,
+            "poll_interval_seconds": 60,
+            "codex_enabled": true,
+            "alerts_enabled": true,
+            "wake_lock_enabled": false,
+            "persistent_lid_override_enabled": false,
+            "poll_secs": 60,
+            "show_codex": true,
+            "alerts": true,
+            "vibecode": false
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&existing).unwrap()).unwrap();
+
+        let runtime = load_runtime(&path);
+
+        assert_eq!(runtime.state.status, ConfigStatus::MigratedLegacy);
+        assert!(runtime.state.settings.update_checks_enabled);
+        let saved: Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.get(KEY_UPDATE_CHECKS), Some(&Value::from(true)));
     }
 
     #[test]
@@ -670,7 +728,13 @@ mod tests {
 
         let runtime = load_runtime(&path);
         assert_eq!(runtime.state.status, ConfigStatus::CorruptDefaults);
-        assert_eq!(runtime.state.settings, SettingsV1::default());
+        assert_eq!(
+            runtime.state.settings,
+            SettingsV1 {
+                update_checks_enabled: true,
+                ..SettingsV1::default()
+            }
+        );
         assert!(!path.exists());
         assert_eq!(
             std::fs::read_dir(&directory.0)

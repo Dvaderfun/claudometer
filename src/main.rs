@@ -11,6 +11,7 @@ mod codex;
 mod config;
 mod demo;
 mod gfx;
+mod network;
 pub mod provider;
 pub mod runtime_state;
 mod state_policy;
@@ -861,8 +862,8 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
             }
             util::CapsLedState::Unavailable => {}
         },
-        2 => util::set_autostart(!util::autostart_enabled()),
-        3 => {
+        gfx::CARD_AUTOSTART => util::set_autostart(!util::autostart_enabled()),
+        gfx::CARD_CODEX => {
             let on = !config::settings().codex_enabled;
             if config::set_codex_enabled(on).is_ok() {
                 if on {
@@ -873,9 +874,15 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
                 update_tray(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
             }
         }
-        4 => {
+        gfx::CARD_ALERTS => {
             let enabled = !config::settings().alerts_enabled;
             let _ = config::set_alerts_enabled(enabled);
+        }
+        gfx::CARD_UPDATE_CHECKS => {
+            let enabled = !config::settings().update_checks_enabled;
+            if config::set_update_checks_enabled(enabled).is_ok() && enabled {
+                updater::maybe_check();
+            }
         }
         gfx::CARD_LID => {
             match vibecode::persistent_status() {
@@ -910,9 +917,9 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
             updater::Status::Available(_) => updater::install(),
             updater::Status::Installing => {}
             updater::Status::Failed(_, page) => {
-                updater::open_url(page.as_deref().unwrap_or(updater::REPO_URL));
+                updater::open_url(page.as_deref().unwrap_or(network::GITHUB_REPOSITORY_URL));
             }
-            updater::Status::UpToDate => updater::open_url(updater::REPO_URL),
+            updater::Status::UpToDate => updater::open_url(network::GITHUB_REPOSITORY_URL),
         },
         gfx::CARD_QUIT => {
             let _ = DestroyWindow(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
@@ -933,7 +940,7 @@ fn activate_claude_account() {
     }
     match snap.connection {
         Some(auth::ClaudeConnection::CliUnavailable) => {
-            updater::open_url("https://docs.anthropic.com/en/docs/claude-code/getting-started");
+            updater::open_url(network::CLAUDE_CODE_GETTING_STARTED_URL);
         }
         // An initial click retries status; every known account state starts
         // the official browser flow so expired and switched accounts recover.
@@ -1591,6 +1598,7 @@ unsafe fn render_settings(hwnd: HWND) {
             autostart: util::autostart_enabled(),
             codex_on: config::settings().codex_enabled,
             alerts_on: config::settings().alerts_enabled,
+            update_checks_on: config::settings().update_checks_enabled,
             lid_label: lid_label.to_string(),
             lid_caption: lid_caption.to_string(),
             lid_on: vibecode::persistent_status() == vibecode::PersistentStatus::Applied,

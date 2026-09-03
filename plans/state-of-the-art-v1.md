@@ -553,7 +553,7 @@ Abort a rollout immediately if any of these occurs:
   - State explicitly that bearer tokens are held in memory and sent only to the corresponding provider.
   - State explicitly that no telemetry, analytics, response logging, or crash upload exists.
 
-- [ ] **PRIV-02 — Add update-check control and enforcement.**
+- [x] **PRIV-02 — Add update-check control and enforcement.**
   - Preserve automatic checks for migrated existing installations, but default them off for genuinely new installs until the Welcome flow can disclose and offer the choice.
   - Provide the control in Settings immediately; `ONBOARD-01` later presents the same choice during first run rather than creating a second onboarding flow.
   - Centralize network destination constants.

@@ -110,7 +110,9 @@ Legacy `settings.json.vibecode_lid` has no scheme GUID, so it blocks new overrid
 
 ## Updater (`updater.rs`)
 
-Passive, transparent, user-initiated. Check: `releases/latest` once per day and once at launch (worker thread, silent failures, drafts/prereleases and non-semver tags skipped). Surfaces: the settings About card ("Claudometer X.Y.Z · GitHub" → "Update vX.Y.Z available · Install") and an accent dot on the flyout gear. Deliberately **no** update toast — toasts are reserved for usage limits.
+Passive, transparent, user-initiated. When **Automatically check for updates** is enabled, `releases/latest` is checked once per day and once at launch (worker thread, silent failures, drafts/prereleases and non-semver tags skipped). The setting defaults off for genuinely new installs and migrates on for existing settings documents. Surfaces: the Settings toggle and About card ("Claudometer X.Y.Z · GitHub" → "Update vX.Y.Z available · Install"), plus an accent dot on the flyout gear. Deliberately **no** update toast — toasts are reserved for usage limits.
+
+All fixed provider, updater, repository, and help destinations live in `network.rs`; direct GET construction also passes through that module. The CI privacy allowlist compares those constants and request sites with `PRIVACY.md`.
 
 Install (only on click), all failure paths falling back to opening the release page:
 

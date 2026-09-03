@@ -20,11 +20,9 @@ use crate::provider::model::{
     derive_account_context, AccountContext, AccountKey, ProviderId, SecretString,
 };
 
-const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// Authoritative plan/identity. `.credentials.json`'s `subscriptionType` is
 /// written once at login and survives plan changes unchanged, so it reports
 /// "max" long after a downgrade — this endpoint is the only source that moves.
-const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 /// The plan changes at most monthly; one profile round-trip per hour is plenty.
 const PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
@@ -400,8 +398,7 @@ fn fetch_inner(request: PreparedRequest) -> Result<UsageSnapshot, FetchErr> {
         .build();
     let authorization = SecretString::new(format!("Bearer {}", request.access_token.expose()));
     let response = || -> Result<ureq::Response, RequestFailure> {
-        agent
-            .get(USAGE_URL)
+        crate::network::get(&agent, crate::network::ANTHROPIC_USAGE_URL)
             .set("Authorization", authorization.expose())
             .set("anthropic-beta", "oauth-2025-04-20")
             .set(
@@ -473,8 +470,7 @@ fn cached_plan(
 
 fn fetch_plan(agent: &ureq::Agent, access_token: &SecretString) -> Option<String> {
     let authorization = SecretString::new(format!("Bearer {}", access_token.expose()));
-    let response = agent
-        .get(PROFILE_URL)
+    let response = crate::network::get(agent, crate::network::ANTHROPIC_PROFILE_URL)
         .set("Authorization", authorization.expose())
         .set("anthropic-beta", "oauth-2025-04-20")
         .set(

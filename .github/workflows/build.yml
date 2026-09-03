@@ -38,6 +38,9 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --locked --workspace --all-targets --all-features
+      - name: Privacy network allowlist
+        shell: pwsh
+        run: ./ci/check-privacy.ps1
       - name: Dependency source and license policy
         shell: pwsh
         run: ./ci/check-dependencies.ps1

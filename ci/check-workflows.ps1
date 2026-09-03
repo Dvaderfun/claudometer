@@ -24,6 +24,7 @@ $requiredCommands = @(
     'cargo fmt --all -- --check',
     'cargo clippy --locked --workspace --all-targets --all-features -- -D warnings',
     'cargo test --locked --workspace --all-targets --all-features',
+    './ci/check-privacy.ps1',
     'cargo build --locked --release --target ${{ matrix.target }}'
 )
 foreach ($command in $requiredCommands) {

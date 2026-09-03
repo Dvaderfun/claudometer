@@ -33,7 +33,7 @@ request time.
 | `https://api.anthropic.com/api/oauth/usage` | Startup, an eligible automatic refresh, or an eligible manual refresh | Claude OAuth access token in `Authorization: Bearer`, the `anthropic-beta: oauth-2025-04-20` header, and `claudometer/<version>` user agent; no request body | The configured refresh interval, from 30 seconds to 5 minutes (default 1 minute). Manual refresh uses the same debounce and rate-limit cooldown. | The interval is configurable. There is currently no Claude-provider off switch; exiting Claudometer or blocking the destination stops requests. |
 | `https://api.anthropic.com/api/oauth/profile` | After a successful Claude usage request when the in-memory plan cache is missing or expired | The same Claude bearer token, beta header, and user agent; no request body | On the first successful usage fetch for the active account, then no more than hourly while its entry remains cached. An account switch can cause another request. | No separate control; it follows Claude refresh activity. |
 | `https://chatgpt.com/backend-api/wham/usage` | Startup, an eligible automatic refresh, or an eligible manual refresh when the Codex section is enabled and a ChatGPT-login Codex credential is available | Codex OAuth access token in `Authorization: Bearer`, the Codex account ID in `chatgpt-account-id`, and `claudometer/<version>` user agent; no request body | The configured refresh interval, subject to the same debounce and rate-limit cooldown as Claude | The **Codex section** setting enables or disables these requests. It is enabled by default. |
-| `https://api.github.com/repos/Dvaderfun/claudometer/releases/latest` | Normal startup and later polling ticks | `claudometer/<version>` user agent and GitHub JSON accept header; no credential and no request body | Once at startup, then at most once every 24 hours per running process | There is currently no update-check setting. Exiting Claudometer or blocking the destination stops checks. |
+| `https://api.github.com/repos/Dvaderfun/claudometer/releases/latest` | Normal startup and later polling ticks, only when automatic update checks are enabled | `claudometer/<version>` user agent and GitHub JSON accept header; no credential and no request body | Once at startup, then at most once every 24 hours per running process | The **Automatically check for updates** setting controls metadata requests. It defaults off for a genuinely new install; an existing settings document that predates the setting migrates to enabled. |
 | Update asset URLs returned as `browser_download_url` by the GitHub release response | The user clicks **Install** for an available update | `claudometer/<version>` user agent; no credential and no request body | One executable download and, when advertised, one SHA-256 file download per install attempt | The download requires an explicit **Install** click. In this version the asset URL host and redirects are not allowlisted. |
 
 The HTTP client can follow redirects. This version does not enforce a redirect
@@ -44,12 +44,36 @@ program:
 
 | Owner of subsequent network activity | Trigger | Behavior and control |
 | --- | --- | --- |
-| Default browser | The user opens the About link, asks for Claude Code setup help, clicks a failed update's GitHub action, or an explicitly requested update install fails | Windows opens the repository, Anthropic documentation, or a release-page URL. Release-page URLs can come from GitHub release metadata and are not host-validated in this version. The browser, not Claudometer, owns any resulting requests, cookies, and history. |
+| Default browser | The user opens the About link, asks for Claude Code setup help, clicks a failed update's GitHub action, or an explicitly requested update install fails | Windows opens `https://github.com/Dvaderfun/claudometer`, `https://docs.anthropic.com/en/docs/claude-code/getting-started`, or a release-page URL. Release-page URLs can come from GitHub release metadata and are not host-validated in this version. The browser, not Claudometer, owns any resulting requests, cookies, and history. |
 | Claude Code CLI and default browser | The user explicitly chooses Connect/Reconnect | Claudometer launches `claude auth login`. Claude Code owns the authentication requests, browser flow, callback-code handling, refresh-token rotation, and credential writes. Claudometer creates no loopback listener. Clicking the account card again cancels the launched process tree. |
 
 No other direct network request site exists in this source tree. In particular,
 there is no telemetry, product analytics, advertising, response logging, remote
 diagnostics, or crash upload.
+
+### CI network allowlist
+
+Fixed network and browser destinations are centralized in `src/network.rs`.
+The source gate fails if a runtime URL appears elsewhere, if a destination
+constant is not named and documented here, or if the direct HTTP request sites
+stop matching this list. Adding a URL or request site therefore requires a
+reviewable update to this contract.
+
+| Constant | Destination or delegated browser target |
+| --- | --- |
+| `ANTHROPIC_USAGE_URL` | `https://api.anthropic.com/api/oauth/usage` |
+| `ANTHROPIC_PROFILE_URL` | `https://api.anthropic.com/api/oauth/profile` |
+| `CODEX_USAGE_URL` | `https://chatgpt.com/backend-api/wham/usage` |
+| `GITHUB_LATEST_RELEASE_URL` | `https://api.github.com/repos/Dvaderfun/claudometer/releases/latest` |
+| `GITHUB_REPOSITORY_URL` | `https://github.com/Dvaderfun/claudometer` |
+| `CLAUDE_CODE_GETTING_STARTED_URL` | `https://docs.anthropic.com/en/docs/claude-code/getting-started` |
+
+<!-- PRIVACY_REQUEST src/api.rs|ANTHROPIC_USAGE_URL -->
+<!-- PRIVACY_REQUEST src/api.rs|ANTHROPIC_PROFILE_URL -->
+<!-- PRIVACY_REQUEST src/codex.rs|CODEX_USAGE_URL -->
+<!-- PRIVACY_REQUEST src/updater.rs|GITHUB_LATEST_RELEASE_URL -->
+<!-- PRIVACY_REQUEST src/updater.rs|sha_url -->
+<!-- PRIVACY_REQUEST src/updater.rs|url -->
 
 ## Local files
 
@@ -59,7 +83,7 @@ delete-data command or remove all application data on exit.
 
 | Path | Reads and writes | Retention and deletion behavior |
 | --- | --- | --- |
-| `%APPDATA%\Claudometer\settings.json` | Reads preferences and legacy migration data. Writes the refresh interval; Codex, alert, wake-lock, and lid-override settings; and legacy alert receipts. Unknown JSON fields are preserved. | Retained until manually deleted. A new installation may have no settings file until a setting or legacy receipt is first saved. |
+| `%APPDATA%\Claudometer\settings.json` | Reads preferences and legacy migration data. Writes the refresh interval; Codex, alert, automatic update-check, wake-lock, and lid-override settings; and legacy alert receipts. Unknown JSON fields are preserved. | Retained until manually deleted. A new installation may have no settings file until a setting or legacy receipt is first saved. |
 | `%APPDATA%\Claudometer\state.json` | Created on first normal startup. Stores a random 32-byte installation salt, salted SHA-256 account digests, provider/limit identifiers, the 75% alert threshold, reset timestamps, re-arm flags, and migration markers. It stores no access token or raw provider account ID. | Retained until manually deleted. Deleting it causes a new salt and empty receipt state to be created on the next startup. |
 | `settings.json.bak`, `state.json.bak` | Verified previous versions maintained by the atomic JSON writer. | At most one normal backup per primary file; replaced by later successful writes. Retained until manually deleted. |
 | `settings.json.corrupt.*`, `state.json.corrupt.*` | A malformed primary file is renamed to a timestamped preservation copy before backup recovery or safe defaults are used. | Preserved indefinitely for manual inspection or deletion. There is no automatic retention limit. |

@@ -4,7 +4,13 @@
 
 At normal startup, `config.rs` loads `settings.json` once through
 `AtomicJsonStore` and validates it into `SettingsV1`. Missing settings use
-defaults in memory and do not create a file until a preference changes.
+defaults in memory and do not create a file until a preference changes. A
+genuinely missing settings document defaults `update_checks_enabled` to
+`false`. Any readable existing settings document that predates this field
+migrates it to `true`, preserving the automatic checks those installations
+already received. A corrupt or unreadable settings document also proves the
+installation is not genuinely new, so it uses `true` in memory without
+overwriting the source.
 
 An unversioned v0.7.x object is expanded atomically with these canonical keys:
 
@@ -18,6 +24,10 @@ An unversioned v0.7.x object is expanded atomically with these canonical keys:
 `persistent_lid_override_enabled` is an additive v1-only Advanced preference;
 old binaries ignore it. It is never treated as evidence that the override is
 active—the power journal and read-back verification are authoritative.
+
+`update_checks_enabled` is also additive and v1-only. Its default depends on
+install history as described above, and Settings writes an explicit boolean
+after migration or when the user changes the toggle.
 
 `schema_version: 1` and both columns are written on every successful settings
 change. New readers prefer the canonical key and fall back to the legacy key.

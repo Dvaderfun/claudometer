@@ -14,8 +14,6 @@ use crate::api::{
 };
 use crate::provider::model::{derive_account_context, AccountContext, ProviderId, SecretString};
 
-const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-
 // ---------- credentials (~/.codex/auth.json) ----------
 
 #[derive(Deserialize)]
@@ -171,8 +169,7 @@ fn fetch_inner(request: PreparedRequest) -> Result<UsageSnapshot, FetchErr> {
         .timeout(std::time::Duration::from_secs(10))
         .build();
     let authorization = SecretString::new(format!("Bearer {}", request.access_token.expose()));
-    let resp = agent
-        .get(USAGE_URL)
+    let resp = crate::network::get(&agent, crate::network::CODEX_USAGE_URL)
         .set("Authorization", authorization.expose())
         .set("chatgpt-account-id", request.account_id.expose())
         .set(

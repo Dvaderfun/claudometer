@@ -79,6 +79,7 @@ pub struct SettingsView {
     pub autostart: bool,
     pub codex_on: bool,
     pub alerts_on: bool,
+    pub update_checks_on: bool,
     pub lid_label: String,
     pub lid_caption: String,
     pub lid_on: bool,
@@ -93,6 +94,18 @@ pub struct SettingsView {
     pub refresh_label: String,
     pub hover: i32, // card index, -1 = none
     pub focus: i32, // keyboard focus card index, -1 = none
+}
+
+impl SettingsView {
+    fn toggle_for(&self, card: usize) -> Option<bool> {
+        match card {
+            CARD_AUTOSTART => Some(self.autostart),
+            CARD_CODEX => Some(self.codex_on),
+            CARD_ALERTS => Some(self.alerts_on),
+            CARD_UPDATE_CHECKS => Some(self.update_checks_on),
+            _ => None,
+        }
+    }
 }
 
 pub const INTERVALS: [(u32, &str); 4] = [(30, "30s"), (60, "1m"), (120, "2m"), (300, "5m")];
@@ -185,15 +198,20 @@ pub const SET_W: f32 = 400.0;
 const SET_PAD: f32 = 24.0;
 const CARD_H: f32 = 56.0;
 const CARD_GAP: f32 = 4.0;
-pub const N_CARDS: usize = 10;
+pub const N_CARDS: usize = 11;
 pub const CARD_ACCOUNT: usize = 0;
 pub const CARD_CAPS: usize = 1;
-pub const CARD_LID: usize = 5;
+pub const CARD_AUTOSTART: usize = 2;
+pub const CARD_CODEX: usize = 3;
+pub const CARD_ALERTS: usize = 4;
+pub const CARD_UPDATE_CHECKS: usize = 5;
+pub const UPDATE_CHECKS_LABEL: &str = "Automatically check for updates";
+pub const CARD_LID: usize = 6;
 /// Card index of the auto-refresh interval row (pills, ←/→ keyboard handling).
-pub const CARD_INTERVAL: usize = 6;
-pub const CARD_REFRESH: usize = 7;
-pub const CARD_ABOUT: usize = 8;
-pub const CARD_QUIT: usize = 9;
+pub const CARD_INTERVAL: usize = 7;
+pub const CARD_REFRESH: usize = 8;
+pub const CARD_ABOUT: usize = 9;
+pub const CARD_QUIT: usize = 10;
 
 pub fn settings_height() -> f32 {
     let cards = N_CARDS as f32 * CARD_H + (N_CARDS as f32 - 1.0) * CARD_GAP;
@@ -815,6 +833,7 @@ impl Surface {
                 "Start with Windows",
                 "Show Codex usage",
                 "Alert at 75% usage",
+                UPDATE_CHECKS_LABEL,
                 st.lid_label.as_str(),
                 "Auto-refresh",
                 st.refresh_label.as_str(),
@@ -822,11 +841,11 @@ impl Surface {
                 "Quit Claudometer",
             ];
             // Segoe Fluent Icons: account, keyboard, power, command prompt,
-            // bell (EA8F Ringer — E7ED is the muted bell), clock, refresh,
-            // info, cancel
+            // bell (EA8F Ringer — E7ED is the muted bell), download, clock,
+            // refresh, info, cancel
             let icons = [
-                "\u{E77B}", "\u{E765}", "\u{E7E8}", "\u{E756}", "\u{EA8F}", "\u{E7BA}", "\u{E823}",
-                "\u{E72C}", "\u{E946}", "\u{E711}",
+                "\u{E77B}", "\u{E765}", "\u{E7E8}", "\u{E756}", "\u{EA8F}", "\u{E895}", "\u{E7BA}",
+                "\u{E823}", "\u{E72C}", "\u{E946}", "\u{E711}",
             ];
             let cards = settings_rects();
             for (i, card) in cards.iter().enumerate() {
@@ -906,28 +925,29 @@ impl Surface {
                 }
 
                 let cy = (card.top + card.bottom) / 2.0;
-                match i {
-                    CARD_ACCOUNT => self.button(card.right - 16.0, cy, st.account_action)?,
-                    CARD_CAPS => match st.caps_control {
-                        CapsControl::Unavailable => {}
-                        CapsControl::Toggle(on) => self.toggle(card.right - 16.0, cy, on)?,
-                        CapsControl::Retry => self.button(card.right - 16.0, cy, "Retry")?,
-                    },
-                    2 => self.toggle(card.right - 16.0, cy, st.autostart)?,
-                    3 => self.toggle(card.right - 16.0, cy, st.codex_on)?,
-                    4 => self.toggle(card.right - 16.0, cy, st.alerts_on)?,
-                    CARD_LID => {
-                        if let Some(action) = st.lid_action {
-                            self.button(card.right - 16.0, cy, action)?;
-                        } else {
-                            self.toggle(card.right - 16.0, cy, st.lid_on)?;
+                if let Some(on) = st.toggle_for(i) {
+                    self.toggle(card.right - 16.0, cy, on)?;
+                } else {
+                    match i {
+                        CARD_ACCOUNT => self.button(card.right - 16.0, cy, st.account_action)?,
+                        CARD_CAPS => match st.caps_control {
+                            CapsControl::Unavailable => {}
+                            CapsControl::Toggle(on) => self.toggle(card.right - 16.0, cy, on)?,
+                            CapsControl::Retry => self.button(card.right - 16.0, cy, "Retry")?,
+                        },
+                        CARD_LID => {
+                            if let Some(action) = st.lid_action {
+                                self.button(card.right - 16.0, cy, action)?;
+                            } else {
+                                self.toggle(card.right - 16.0, cy, st.lid_on)?;
+                            }
                         }
+                        CARD_INTERVAL => self.interval_row(card, st.poll_secs)?,
+                        CARD_REFRESH => self.button(card.right - 16.0, cy, "Refresh")?,
+                        CARD_ABOUT => self.button(card.right - 16.0, cy, st.about_btn)?,
+                        CARD_QUIT => self.button(card.right - 16.0, cy, "Quit")?,
+                        _ => {}
                     }
-                    CARD_INTERVAL => self.interval_row(card, st.poll_secs)?,
-                    CARD_REFRESH => self.button(card.right - 16.0, cy, "Refresh")?,
-                    CARD_ABOUT => self.button(card.right - 16.0, cy, st.about_btn)?,
-                    CARD_QUIT => self.button(card.right - 16.0, cy, "Quit")?,
-                    _ => {}
                 }
 
                 if st.focus == i as i32 {
@@ -1274,5 +1294,49 @@ fn relative_time(unix: i64) -> String {
         format!("{}m ago", diff / 60)
     } else {
         format!("at {}", crate::api::fmt_unix_hhmm(unix))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings_view(update_checks_on: bool) -> SettingsView {
+        SettingsView {
+            account_caption: String::new(),
+            account_action: "",
+            account_connected: false,
+            caps_caption: String::new(),
+            caps_control: CapsControl::Unavailable,
+            autostart: false,
+            codex_on: false,
+            alerts_on: false,
+            update_checks_on,
+            lid_label: String::new(),
+            lid_caption: String::new(),
+            lid_on: false,
+            lid_action: None,
+            about: String::new(),
+            about_btn: "",
+            update_ready: false,
+            poll_secs: 60,
+            refresh_label: String::new(),
+            hover: -1,
+            focus: -1,
+        }
+    }
+
+    #[test]
+    fn settings_exposes_update_checks_as_a_toggle_card() {
+        assert_eq!(UPDATE_CHECKS_LABEL, "Automatically check for updates");
+        assert_eq!(CARD_UPDATE_CHECKS + 1, CARD_LID);
+        assert_eq!(
+            settings_view(false).toggle_for(CARD_UPDATE_CHECKS),
+            Some(false)
+        );
+        assert_eq!(
+            settings_view(true).toggle_for(CARD_UPDATE_CHECKS),
+            Some(true)
+        );
     }
 }

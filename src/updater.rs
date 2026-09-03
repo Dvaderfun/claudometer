@@ -1,9 +1,9 @@
 //! Self-update from GitHub Releases — passive, transparent, user-initiated.
 //!
-//! Check: `releases/latest` once per day (and once at launch), in a worker
-//! thread; failures are silent and drafts/prereleases are skipped. No config,
-//! no nag, no toast — the only surfaces are the settings About card and a dot
-//! on the flyout gear.
+//! Check: `releases/latest` when enabled, at most once per day (and once at
+//! launch), in a worker thread; failures are silent and drafts/prereleases are
+//! skipped. No nag or toast — the only surfaces are the Settings toggle, About
+//! card, and a dot on the flyout gear.
 //!
 //! Install (only when the user clicks): download the exe asset next to the
 //! current exe, verify it (PE magic, VERSIONINFO == release tag, SHA256 via
@@ -27,9 +27,6 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-// Owner/name also live in Cargo.toml `repository` — keep in sync.
-const API_LATEST: &str = "https://api.github.com/repos/Dvaderfun/claudometer/releases/latest";
-pub const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
 const UA: &str = concat!("claudometer/", env!("CARGO_PKG_VERSION"));
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
 
@@ -74,13 +71,16 @@ fn set_status(s: Status) {
     }
 }
 
-/// Called on every poll tick — actually checks at most once per CHECK_EVERY.
+fn check_due(enabled: bool, last_check: Option<Duration>) -> bool {
+    enabled && last_check.is_none_or(|elapsed| elapsed >= CHECK_EVERY)
+}
+
+/// Called at startup and on every poll tick. Disabled means no request; when
+/// enabled, checks happen at most once per CHECK_EVERY.
 pub fn maybe_check() {
-    {
-        let last = LAST_CHECK.lock().unwrap();
-        if last.map(|t| t.elapsed() < CHECK_EVERY).unwrap_or(false) {
-            return;
-        }
+    let last_check = LAST_CHECK.lock().unwrap().map(|checked| checked.elapsed());
+    if !check_due(crate::config::settings().update_checks_enabled, last_check) {
+        return;
     }
     if BUSY.swap(true, Ordering::SeqCst) {
         return;
@@ -132,8 +132,7 @@ fn agent(timeout_secs: u64) -> Option<ureq::Agent> {
 
 fn check_inner() -> Result<Option<Release>, ()> {
     let agent = agent(10).ok_or(())?;
-    let resp = agent
-        .get(API_LATEST)
+    let resp = crate::network::get(&agent, crate::network::GITHUB_LATEST_RELEASE_URL)
         .set("User-Agent", UA)
         .set("Accept", "application/vnd.github+json")
         .call()
@@ -167,7 +166,10 @@ fn pick_release(rel: &ApiRelease, current: (u16, u16, u16)) -> Option<Release> {
         version,
         exe_url: url_of("claudometer.exe")?,
         sha_url: url_of("claudometer.exe.sha256"),
-        page_url: rel.html_url.clone().unwrap_or_else(|| REPO_URL.to_string()),
+        page_url: rel
+            .html_url
+            .clone()
+            .unwrap_or_else(|| crate::network::GITHUB_REPOSITORY_URL.to_string()),
         tag,
     })
 }
@@ -248,8 +250,7 @@ fn install_inner(rel: &Release) -> Result<(), String> {
         return Err(cleanup_new("downloaded exe version mismatch"));
     }
     if let Some(sha_url) = &rel.sha_url {
-        let expected = agent
-            .get(sha_url)
+        let expected = crate::network::get(&agent, sha_url)
             .set("User-Agent", UA)
             .call()
             .map_err(|_| cleanup_new("hash download failed"))?
@@ -275,8 +276,7 @@ fn install_inner(rel: &Release) -> Result<(), String> {
 }
 
 fn download(agent: &ureq::Agent, url: &str, dest: &Path) -> Result<(), String> {
-    let resp = agent
-        .get(url)
+    let resp = crate::network::get(agent, url)
         .set("User-Agent", UA)
         .call()
         .map_err(|e| match e {
@@ -405,6 +405,15 @@ fn parse_certutil(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_checks_require_opt_in_and_respect_daily_gate() {
+        assert!(!check_due(false, None));
+        assert!(!check_due(false, Some(CHECK_EVERY)));
+        assert!(check_due(true, None));
+        assert!(!check_due(true, Some(CHECK_EVERY - Duration::from_secs(1))));
+        assert!(check_due(true, Some(CHECK_EVERY)));
+    }
 
     #[test]
     fn version_parsing() {
