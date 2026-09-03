@@ -546,7 +546,7 @@ Abort a rollout immediately if any of these occurs:
 
 ### 8.6 Accurate privacy contract
 
-- [ ] **PRIV-01 — Add `PRIVACY.md`.**
+- [x] **PRIV-01 — Add `PRIVACY.md`.**
   - Network table: destination, trigger, transmitted data, frequency, and control.
   - Local file table: reads, writes, retention, and deletion behavior.
   - Registry keys, child processes, toast registration, update files, power changes, and Caps marker.

@@ -36,8 +36,8 @@ A tiny native Windows app that shows how much of your Claude (and optionally Ope
 
 - Reads the OAuth access token from `%USERPROFILE%\.claude\.credentials.json`, or `$CLAUDE_CONFIG_DIR\.credentials.json` when configured (and, if present, `%USERPROFILE%\.codex\auth.json`) — **read-only**. Claudometer never writes either file and never receives or rotates a refresh token.
 - Uses the installed Claude Code CLI only for an explicit Connect/Reconnect. It opens `claude auth login` in a console window so the browser flow's fallback code can be pasted if needed; click the card again to cancel. Current native and npm installs are resolved to the real `claude.exe`, avoiding a CMD shim. Claude Code alone owns token refresh and durable credential storage.
-- Calls `https://api.anthropic.com/api/oauth/usage` — the same endpoint Claude Code's `/usage` command uses — and, when Codex is signed in, `https://chatgpt.com/backend-api/wham/usage` — the same endpoint the Codex CLI polls for its own status bar. Nothing else is contacted; no telemetry, no analytics.
-- Settings live in `%APPDATA%\Claudometer\settings.json`.
+- Calls the Anthropic usage/profile APIs and, when Codex is signed in, the ChatGPT usage API. It also checks GitHub Releases for updates. There is no telemetry or analytics; the complete network, file, registry, process, notification, and power inventory is in [PRIVACY.md](PRIVACY.md).
+- Settings and runtime state live under `%APPDATA%\Claudometer`.
 
 ⚠️ Both usage endpoints are **unofficial**. Anthropic/OpenAI can change them any time, at which point the flyout will tell you it can't parse the response until this app is updated.
 
