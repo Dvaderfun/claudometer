@@ -113,6 +113,7 @@ struct ConfigState {
     raw: Map<String, Value>,
     access: AccessMode,
     status: ConfigStatus,
+    pending_migration_status: Option<ConfigStatus>,
 }
 
 enum Backend<F> {
@@ -139,14 +140,31 @@ fn config_path() -> Option<PathBuf> {
 }
 
 pub fn initialize() -> ConfigStatus {
+    initialize_with_migrations(true)
+}
+
+/// Loads settings without persisting schema normalization. Update candidates
+/// use this until the watchdog has durably committed their executable.
+pub fn initialize_compatibility() -> ConfigStatus {
+    initialize_with_migrations(false)
+}
+
+fn initialize_with_migrations(allow_migrations: bool) -> ConfigStatus {
     let runtime = RUNTIME.get_or_init(|| {
         let backend = config_path()
             .map(AtomicJsonStore::new)
             .map(Backend::Store)
             .unwrap_or(Backend::Unavailable);
-        Mutex::new(Runtime::load(backend))
+        Mutex::new(Runtime::load_with_migrations(backend, allow_migrations))
     });
     runtime.lock().unwrap().state.status
+}
+
+pub fn commit_pending_migration() -> ConfigStatus {
+    let Some(runtime) = RUNTIME.get() else {
+        return ConfigStatus::PathUnavailable;
+    };
+    runtime.lock().unwrap().commit_pending_migration()
 }
 
 pub fn settings() -> SettingsV1 {
@@ -246,7 +264,7 @@ fn update_raw(update: impl FnOnce(&mut Map<String, Value>)) -> Result<(), Config
 }
 
 impl<F: FaultInjector> Runtime<F> {
-    fn load(backend: Backend<F>) -> Self {
+    fn load_with_migrations(backend: Backend<F>, allow_migrations: bool) -> Self {
         let Backend::Store(store) = &backend else {
             return Self {
                 backend,
@@ -255,6 +273,7 @@ impl<F: FaultInjector> Runtime<F> {
                     raw: Map::new(),
                     access: AccessMode::Writable,
                     status: ConfigStatus::PathUnavailable,
+                    pending_migration_status: None,
                 },
             };
         };
@@ -280,27 +299,48 @@ impl<F: FaultInjector> Runtime<F> {
                 raw: decoded.raw,
                 access: decoded.access,
                 status: status_for_access(decoded.access, source_status),
+                pending_migration_status: None,
             },
         };
 
         if had_document && decoded.needs_migration && decoded.access == AccessMode::Writable {
             let recovered = source_status == ConfigStatus::RecoveredFromBackup;
-            match runtime.persist_current() {
-                Ok(()) => {
-                    runtime.state.status = if recovered {
-                        ConfigStatus::RecoveredAndMigrated
-                    } else {
-                        ConfigStatus::MigratedLegacy
-                    };
+            let migration_status = if recovered {
+                ConfigStatus::RecoveredAndMigrated
+            } else {
+                ConfigStatus::MigratedLegacy
+            };
+            if allow_migrations {
+                match runtime.persist_current() {
+                    Ok(()) => runtime.state.status = migration_status,
+                    Err(ConfigError::Store(error)) => {
+                        runtime.state.status = ConfigStatus::WriteFailed(error);
+                    }
+                    Err(_) => {}
                 }
-                Err(ConfigError::Store(error)) => {
-                    runtime.state.status = ConfigStatus::WriteFailed(error);
-                }
-                Err(_) => {}
+            } else {
+                runtime.state.pending_migration_status = Some(migration_status);
             }
         }
 
         runtime
+    }
+
+    fn commit_pending_migration(&mut self) -> ConfigStatus {
+        let Some(success_status) = self.state.pending_migration_status else {
+            return self.state.status;
+        };
+        match self.persist_current() {
+            Ok(()) => {
+                self.state.status = success_status;
+                self.state.pending_migration_status = None;
+            }
+            Err(ConfigError::Store(error)) => {
+                self.state.status = ConfigStatus::WriteFailed(error);
+            }
+            Err(_) => {}
+        }
+        self.state.status
     }
 
     fn update_settings(&mut self, update: impl FnOnce(&mut SettingsV1)) -> Result<(), ConfigError> {
@@ -545,7 +585,7 @@ mod tests {
     }
 
     fn load_runtime(path: &Path) -> Runtime<NoFaults> {
-        Runtime::load(Backend::Store(AtomicJsonStore::new(path)))
+        Runtime::load_with_migrations(Backend::Store(AtomicJsonStore::new(path)), true)
     }
 
     #[test]
@@ -599,6 +639,34 @@ mod tests {
             saved.get(LEGACY_ALERT_RECEIPTS),
             legacy.get(LEGACY_ALERT_RECEIPTS)
         );
+    }
+
+    #[test]
+    fn compatibility_startup_defers_settings_migration_until_commit() {
+        let directory = TestDirectory::new();
+        let path = directory.settings_path();
+        let legacy = serde_json::json!({
+            "poll_secs": 120,
+            "show_codex": false,
+            "future_unknown": true
+        });
+        let original = serde_json::to_vec_pretty(&legacy).unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        let mut runtime =
+            Runtime::load_with_migrations(Backend::Store(AtomicJsonStore::new(&path)), false);
+        assert_eq!(runtime.state.settings.poll_interval_seconds, 120);
+        assert_eq!(runtime.state.status, ConfigStatus::Ready);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        assert_eq!(
+            runtime.commit_pending_migration(),
+            ConfigStatus::MigratedLegacy
+        );
+        let saved: Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.get(KEY_SCHEMA), Some(&Value::from(1)));
+        assert_eq!(saved.get("future_unknown"), Some(&Value::Bool(true)));
     }
 
     #[test]
@@ -701,9 +769,10 @@ mod tests {
             FailurePoint::WriteTemporary,
             io::ErrorKind::StorageFull,
         ))));
-        let mut runtime = Runtime::load(Backend::Store(AtomicJsonStore::with_fault_injector(
-            &path, faults,
-        )));
+        let mut runtime = Runtime::load_with_migrations(
+            Backend::Store(AtomicJsonStore::with_fault_injector(&path, faults)),
+            true,
+        );
         let before = runtime.state.settings.clone();
 
         let error = runtime
