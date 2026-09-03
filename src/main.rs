@@ -23,7 +23,7 @@ mod vibecode;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -44,7 +44,7 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use provider::model::{
-    AccountContext, AccountKey, FetchCompletion, Generation, ProviderId, RequestId,
+    AccountContext, AccountKey, CompletionEvent, FetchCompletion, Generation, ProviderId, RequestId,
 };
 use state_policy::{Clock, ClockReading, RefreshGate, RefreshTrigger, SystemClock};
 
@@ -79,6 +79,7 @@ static TASKBAR_MSG: AtomicU32 = AtomicU32::new(0);
 static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
 static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
 static POLL_SECS: AtomicU32 = AtomicU32::new(60);
+static MANUAL_COOLDOWN_NOTICES: AtomicU32 = AtomicU32::new(0);
 
 /// Per-provider fetch state; both providers share the resilience rules
 /// (recent stale data beats errors, strict 429 backoff, 3 s debounce).
@@ -412,7 +413,9 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             }
             WM_DATA_READY => {
                 update_tray(hwnd);
-                run_alert_checks();
+                if let Some(event) = completion_event_from_message(wparam, lparam) {
+                    run_alert_check(event);
+                }
                 if IsWindowVisible(flyout_hwnd()).as_bool() {
                     show_flyout(
                         ANCHOR_X.load(Ordering::SeqCst),
@@ -846,7 +849,18 @@ unsafe fn step_interval(dir: i32) {
 unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
     match i {
         gfx::CARD_ACCOUNT => activate_claude_account(),
-        1 => util::set_caps_led_enabled(!util::caps_led_enabled()),
+        gfx::CARD_CAPS => match util::caps_led_state() {
+            util::CapsLedState::InstalledDisabled => {
+                let _ = util::set_caps_led_enabled(true);
+            }
+            util::CapsLedState::InstalledEnabled => {
+                let _ = util::set_caps_led_enabled(false);
+            }
+            util::CapsLedState::Error(_) => {
+                let _ = util::retry_caps_led();
+            }
+            util::CapsLedState::Unavailable => {}
+        },
         2 => util::set_autostart(!util::autostart_enabled()),
         3 => {
             let on = !config::settings().codex_enabled;
@@ -1023,15 +1037,22 @@ unsafe fn apply_flyout_theme(h: HWND) {
 fn current_view() -> gfx::View {
     let (c_snap, c_err) = effective(ProviderId::Claude);
     let codex_on = codex_active();
+    let refresh_note = manual_cooldown_note();
 
     // Claude-only path — identical to the single-provider behavior
     if !codex_on {
         return match (c_snap, c_err) {
             (None, None) => gfx::View::Loading,
-            (None, Some(msg)) => gfx::View::Error(msg),
+            (None, Some(mut msg)) => {
+                if let Some(note) = refresh_note {
+                    msg.push('\n');
+                    msg.push_str(&note);
+                }
+                gfx::View::Error(msg)
+            }
             (Some(s), err) => gfx::View::Data(gfx::FlyoutData {
                 fetched_unix: Some(s.fetched_unix),
-                note: err.as_deref().map(err_head),
+                note: join_notes(err.as_deref().map(err_head), refresh_note),
                 sections: vec![section("Claude", s)],
             }),
         };
@@ -1073,6 +1094,9 @@ fn current_view() -> gfx::View {
             }),
         }
     }
+    if let Some(note) = refresh_note {
+        notes.push(note);
+    }
     gfx::View::Data(gfx::FlyoutData {
         sections,
         fetched_unix: fetched,
@@ -1082,6 +1106,63 @@ fn current_view() -> gfx::View {
             Some(notes.join(" · "))
         },
     })
+}
+
+fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first} · {second}")),
+        (Some(note), None) | (None, Some(note)) => Some(note),
+        (None, None) => None,
+    }
+}
+
+fn manual_cooldown_deadlines() -> Vec<(ProviderId, i64)> {
+    let requested = MANUAL_COOLDOWN_NOTICES.load(Ordering::SeqCst);
+    if requested == 0 {
+        return Vec::new();
+    }
+    let now = SystemClock.read();
+    let mut active = 0;
+    let mut deadlines = Vec::new();
+    for provider in [ProviderId::Claude, ProviderId::Codex] {
+        let bit = 1 << provider.index();
+        if requested & bit == 0 {
+            continue;
+        }
+        let cooldown_until = *slot(provider).cooldown_until.lock().unwrap();
+        if let Some(deadline) = state_policy::cooldown_deadline_unix(now, cooldown_until) {
+            active |= bit;
+            deadlines.push((provider, deadline));
+        }
+    }
+    MANUAL_COOLDOWN_NOTICES.store(active, Ordering::SeqCst);
+    deadlines
+}
+
+fn manual_cooldown_note() -> Option<String> {
+    let notices: Vec<_> = manual_cooldown_deadlines()
+        .into_iter()
+        .map(|(provider, deadline)| {
+            format!(
+                "{} refresh available at {}",
+                match provider {
+                    ProviderId::Claude => "Claude",
+                    ProviderId::Codex => "Codex",
+                },
+                api::fmt_unix_hhmm(deadline)
+            )
+        })
+        .collect();
+    (!notices.is_empty()).then(|| notices.join(" · "))
+}
+
+fn manual_refresh_label() -> String {
+    manual_cooldown_deadlines()
+        .into_iter()
+        .map(|(_, deadline)| deadline)
+        .min()
+        .map(|deadline| format!("Refresh available at {}", api::fmt_unix_hhmm(deadline)))
+        .unwrap_or_else(|| "Refresh usage now".to_string())
 }
 
 fn section(title: &'static str, s: api::UsageSnapshot) -> gfx::Section {
@@ -1123,13 +1204,8 @@ unsafe fn show_flyout(cx: i32, cy: i32) {
         ui.fly_focus = -1;
     });
 
-    let now = SystemClock.read();
-    let stale =
-        |p: ProviderId| state_policy::flyout_refresh_due(now, *slot(p).last_fetch.lock().unwrap());
-    if stale(ProviderId::Claude) {
-        spawn_fetch(ProviderId::Claude, RefreshTrigger::Flyout);
-    }
-    if codex_active() && stale(ProviderId::Codex) {
+    spawn_fetch(ProviderId::Claude, RefreshTrigger::Flyout);
+    if codex_active() {
         spawn_fetch(ProviderId::Codex, RefreshTrigger::Flyout);
     }
 
@@ -1488,11 +1564,30 @@ unsafe fn render_settings(hwnd: HWND) {
                 None => ("Checking connection…".to_string(), "…", false),
             }
         };
+        let (caps_caption, caps_control) = match util::caps_led_state() {
+            util::CapsLedState::Unavailable => (
+                "Unavailable · hook isn't installed".to_string(),
+                gfx::CapsControl::Unavailable,
+            ),
+            util::CapsLedState::InstalledDisabled => (
+                "Installed · disabled".to_string(),
+                gfx::CapsControl::Toggle(false),
+            ),
+            util::CapsLedState::InstalledEnabled => (
+                "Installed · enabled".to_string(),
+                gfx::CapsControl::Toggle(true),
+            ),
+            util::CapsLedState::Error(error) => (
+                format!("Error · {}", error.message()),
+                gfx::CapsControl::Retry,
+            ),
+        };
         let st = gfx::SettingsView {
             account_caption,
             account_action,
             account_connected,
-            caps_on: util::caps_led_enabled(),
+            caps_caption,
+            caps_control,
             autostart: util::autostart_enabled(),
             codex_on: config::settings().codex_enabled,
             alerts_on: config::settings().alerts_enabled,
@@ -1504,6 +1599,7 @@ unsafe fn render_settings(hwnd: HWND) {
             about_btn,
             update_ready: updater::has_update(),
             poll_secs: POLL_SECS.load(Ordering::SeqCst),
+            refresh_label: manual_refresh_label(),
             hover: ui.set_hover,
             focus: ui.set_focus,
         };
@@ -1753,25 +1849,27 @@ unsafe fn show_menu(owner: HWND, x: i32, y: i32) {
 
 // ---------- alerts ----------
 
-/// After every fetch: hand *fresh* snapshots to the alert engine. Stale
-/// (error-preserved) data must never alert — only a just-succeeded fetch.
-fn run_alert_checks() {
-    let fresh = |p: ProviderId| alert_candidate(slot(p));
-    if let Some((account, snapshot)) = fresh(ProviderId::Claude) {
-        alerts::check(ProviderId::Claude, &account, &snapshot);
+/// Hand only the successful completion named by this event to the alert engine.
+/// Stale/error-preserved data and unrelated stored successes remain ineligible.
+fn run_alert_check(event: CompletionEvent) {
+    if event.provider == ProviderId::Codex && !codex_active() {
+        return;
     }
-    if codex_active() {
-        if let Some((account, snapshot)) = fresh(ProviderId::Codex) {
-            alerts::check(ProviderId::Codex, &account, &snapshot);
-        }
+    if let Some((account, snapshot)) = alert_candidate(slot(event.provider), event) {
+        alerts::check(event.provider, &account, &snapshot);
     }
 }
 
-fn alert_candidate(s: &Slot) -> Option<(AccountContext, api::UsageSnapshot)> {
+fn alert_candidate(
+    s: &Slot,
+    event: CompletionEvent,
+) -> Option<(AccountContext, api::UsageSnapshot)> {
     let identity = s.identity.lock().unwrap();
     match &*s.state.lock().unwrap() {
         Some(completion)
-            if completion.generation == identity.generation
+            if completion.provider == event.provider
+                && completion.request_id == event.request_id
+                && completion.generation == identity.generation
                 && identity
                     .account
                     .as_ref()
@@ -1804,6 +1902,9 @@ impl PreparedFetch {
     }
 
     fn execute(self) -> api::FetchOutcome {
+        // One prepared request executes one selected source. In particular,
+        // authentication and 429 failures return directly; they never trigger
+        // an immediate request to another source.
         match self {
             Self::Claude(request) => api::fetch(request),
             Self::Codex(request) => codex::fetch(request),
@@ -1840,7 +1941,16 @@ fn spawn_fetch(p: ProviderId, trigger: RefreshTrigger) {
         *s.cooldown_until.lock().unwrap(),
         *s.last_fetch.lock().unwrap(),
         s.fetching.load(Ordering::SeqCst),
+        Duration::from_secs(u64::from(POLL_SECS.load(Ordering::SeqCst))),
     );
+    if trigger == RefreshTrigger::Manual {
+        let bit = 1 << p.index();
+        if matches!(gate, RefreshGate::Cooldown { .. }) {
+            MANUAL_COOLDOWN_NOTICES.fetch_or(bit, Ordering::SeqCst);
+        } else {
+            MANUAL_COOLDOWN_NOTICES.fetch_and(!bit, Ordering::SeqCst);
+        }
+    }
     if gate != RefreshGate::Ready {
         return;
     }
@@ -1855,7 +1965,10 @@ fn spawn_fetch(p: ProviderId, trigger: RefreshTrigger) {
                 let accepted =
                     record_preparation_failure(slot(p), p, request_id, failure, SystemClock.read());
                 if accepted {
-                    post_data_ready();
+                    post_data_ready(CompletionEvent {
+                        provider: p,
+                        request_id,
+                    });
                 }
                 return;
             }
@@ -1872,19 +1985,40 @@ fn spawn_fetch(p: ProviderId, trigger: RefreshTrigger) {
             account: account.key,
             payload: prepared.execute(),
         };
+        let event = CompletionEvent {
+            provider: completion.provider,
+            request_id: completion.request_id,
+        };
         if record_fetch_completion(s, p, completion, SystemClock.read()) {
-            post_data_ready();
+            post_data_ready(event);
         }
     });
 }
 
-fn post_data_ready() {
+fn post_data_ready(event: CompletionEvent) {
     let handle = MAIN_HWND.load(Ordering::SeqCst);
     if handle != 0 {
         unsafe {
-            let _ = PostMessageW(HWND(handle as *mut _), WM_DATA_READY, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(
+                HWND(handle as *mut _),
+                WM_DATA_READY,
+                WPARAM(event.provider.index()),
+                LPARAM(event.request_id.0 as isize),
+            );
         }
     }
+}
+
+fn completion_event_from_message(wparam: WPARAM, lparam: LPARAM) -> Option<CompletionEvent> {
+    let provider = match wparam.0 {
+        0 => ProviderId::Claude,
+        1 => ProviderId::Codex,
+        _ => return None,
+    };
+    Some(CompletionEvent {
+        provider,
+        request_id: RequestId(lparam.0 as u64),
+    })
 }
 
 fn reserve_request(s: &Slot) -> RequestId {
@@ -1962,6 +2096,13 @@ fn record_preparation_failure(
     identity.pending_request_id = None;
     *s.preparation_error.lock().unwrap() = Some(failure.message.to_string());
     *s.last_fetch.lock().unwrap() = Some(completed_at.monotonic);
+    s.rl_streak.store(
+        state_policy::next_rate_limit_streak(
+            s.rl_streak.load(Ordering::SeqCst),
+            state_policy::CompletionKind::OtherFailure,
+        ),
+        Ordering::SeqCst,
+    );
     s.fetching.store(false, Ordering::SeqCst);
     drop(identity);
     if invalidated {
@@ -2125,6 +2266,57 @@ mod state_characterization_tests {
     }
 
     #[test]
+    fn every_non_rate_limited_result_resets_the_429_streak() {
+        let slot = Slot::new();
+        let now = Instant::now();
+        let current = account(1);
+        let (request_id, generation, _) = start_request(&slot, current.clone());
+        assert!(record_fetch_completion(
+            &slot,
+            ProviderId::Claude,
+            completion(
+                ProviderId::Claude,
+                request_id,
+                generation,
+                &current,
+                failure(true, None),
+            ),
+            reading(now, 100),
+        ));
+        assert_eq!(slot.rl_streak.load(Ordering::SeqCst), 1);
+
+        let (request_id, generation, _) = start_request(&slot, current.clone());
+        assert!(record_fetch_completion(
+            &slot,
+            ProviderId::Claude,
+            completion(
+                ProviderId::Claude,
+                request_id,
+                generation,
+                &current,
+                failure(false, None),
+            ),
+            reading(now + Duration::from_secs(60), 160),
+        ));
+        assert_eq!(slot.rl_streak.load(Ordering::SeqCst), 0);
+
+        slot.rl_streak.store(2, Ordering::SeqCst);
+        slot.fetching.store(true, Ordering::SeqCst);
+        let request_id = reserve_request(&slot);
+        assert!(record_preparation_failure(
+            &slot,
+            ProviderId::Claude,
+            request_id,
+            api::PreparationFailure {
+                kind: api::PreparationFailureKind::TemporarilyUnreadable,
+                message: "temporary",
+            },
+            reading(now + Duration::from_secs(120), 220),
+        ));
+        assert_eq!(slot.rl_streak.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn stale_data_expires_at_the_characterized_boundary() {
         let slot = Slot::new();
         let (request_id, generation, current) = start_request(&slot, account(1));
@@ -2152,7 +2344,7 @@ mod state_characterization_tests {
     }
 
     #[test]
-    fn stored_success_is_currently_an_alert_candidate_on_later_data_ready() {
+    fn only_the_exact_success_completion_is_an_alert_candidate() {
         let slot = Slot::new();
         let (request_id, generation, current) = start_request(&slot, account(1));
         assert!(record_fetch_completion(
@@ -2168,8 +2360,30 @@ mod state_characterization_tests {
             reading(Instant::now(), 123),
         ));
 
-        assert_eq!(alert_candidate(&slot).unwrap().1.fetched_unix, 123);
-        assert_eq!(alert_candidate(&slot).unwrap().1.fetched_unix, 123);
+        let accepted = CompletionEvent {
+            provider: ProviderId::Claude,
+            request_id,
+        };
+        assert_eq!(
+            alert_candidate(&slot, accepted).unwrap().1.fetched_unix,
+            123
+        );
+        assert!(alert_candidate(
+            &slot,
+            CompletionEvent {
+                provider: ProviderId::Codex,
+                request_id,
+            }
+        )
+        .is_none());
+        assert!(alert_candidate(
+            &slot,
+            CompletionEvent {
+                provider: ProviderId::Claude,
+                request_id: RequestId(request_id.0 + 1),
+            }
+        )
+        .is_none());
     }
 
     #[test]
@@ -2277,7 +2491,14 @@ mod state_characterization_tests {
         let (visible, error) = effective_at(&slot, reading(now, 101));
         assert!(visible.is_none());
         assert_eq!(error.as_deref(), Some("sanitized failure"));
-        assert!(alert_candidate(&slot).is_none());
+        assert!(alert_candidate(
+            &slot,
+            CompletionEvent {
+                provider: ProviderId::Claude,
+                request_id: request_b,
+            }
+        )
+        .is_none());
     }
 
     #[test]

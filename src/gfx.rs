@@ -63,11 +63,19 @@ pub enum FlyHover {
     Vibe,
 }
 
+#[derive(Clone, Copy)]
+pub enum CapsControl {
+    Unavailable,
+    Toggle(bool),
+    Retry,
+}
+
 pub struct SettingsView {
     pub account_caption: String,
     pub account_action: &'static str,
     pub account_connected: bool,
-    pub caps_on: bool,
+    pub caps_caption: String,
+    pub caps_control: CapsControl,
     pub autostart: bool,
     pub codex_on: bool,
     pub alerts_on: bool,
@@ -82,6 +90,7 @@ pub struct SettingsView {
     /// accent-tint the About icon when an update is ready
     pub update_ready: bool,
     pub poll_secs: u32,
+    pub refresh_label: String,
     pub hover: i32, // card index, -1 = none
     pub focus: i32, // keyboard focus card index, -1 = none
 }
@@ -178,6 +187,7 @@ const CARD_H: f32 = 56.0;
 const CARD_GAP: f32 = 4.0;
 pub const N_CARDS: usize = 10;
 pub const CARD_ACCOUNT: usize = 0;
+pub const CARD_CAPS: usize = 1;
 pub const CARD_LID: usize = 5;
 /// Card index of the auto-refresh interval row (pills, ←/→ keyboard handling).
 pub const CARD_INTERVAL: usize = 6;
@@ -807,7 +817,7 @@ impl Surface {
                 "Alert at 75% usage",
                 st.lid_label.as_str(),
                 "Auto-refresh",
-                "Refresh usage now",
+                st.refresh_label.as_str(),
                 st.about.as_str(),
                 "Quit Claudometer",
             ];
@@ -857,7 +867,7 @@ impl Surface {
                 } else {
                     card.right - 120.0
                 };
-                if i == CARD_ACCOUNT || i == CARD_LID {
+                if i == CARD_ACCOUNT || i == CARD_CAPS || i == CARD_LID {
                     self.text(
                         labels[i],
                         &self.fmt_body,
@@ -871,10 +881,10 @@ impl Surface {
                         false,
                     )?;
                     self.text(
-                        if i == CARD_ACCOUNT {
-                            &st.account_caption
-                        } else {
-                            &st.lid_caption
+                        match i {
+                            CARD_ACCOUNT => &st.account_caption,
+                            CARD_CAPS => &st.caps_caption,
+                            _ => &st.lid_caption,
                         },
                         &self.fmt_caption_1,
                         rect(
@@ -898,7 +908,11 @@ impl Surface {
                 let cy = (card.top + card.bottom) / 2.0;
                 match i {
                     CARD_ACCOUNT => self.button(card.right - 16.0, cy, st.account_action)?,
-                    1 => self.toggle(card.right - 16.0, cy, st.caps_on)?,
+                    CARD_CAPS => match st.caps_control {
+                        CapsControl::Unavailable => {}
+                        CapsControl::Toggle(on) => self.toggle(card.right - 16.0, cy, on)?,
+                        CapsControl::Retry => self.button(card.right - 16.0, cy, "Retry")?,
+                    },
                     2 => self.toggle(card.right - 16.0, cy, st.autostart)?,
                     3 => self.toggle(card.right - 16.0, cy, st.codex_on)?,
                     4 => self.toggle(card.right - 16.0, cy, st.alerts_on)?,

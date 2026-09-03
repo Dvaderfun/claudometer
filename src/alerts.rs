@@ -112,35 +112,42 @@ pub fn check(provider: ProviderId, account: &AccountContext, snap: &UsageSnapsho
     let state = guard.get_or_insert_with(AlertState::load);
     state.persistence[provider.index()] = Some(account.persistence);
 
-    let crossed: Vec<&LimitRow> = snap
-        .rows
-        .iter()
-        .filter(|r| {
-            r.kind != "extra" // pay-as-you-go bucket, not a limit window
-                && LimitId::new(r.kind.clone()).is_some_and(|limit| {
-                    should_fire(
-                        &mut state.receipts,
-                        provider,
-                        &account.key,
-                        limit,
-                        r.percent,
-                        r.resets_unix,
-                    )
-                })
-        })
-        .collect();
+    let mut receipts_changed = false;
+    let mut crossed = Vec::new();
+    for row in &snap.rows {
+        if row.kind == "extra" {
+            continue;
+        }
+        let Some(limit) = LimitId::new(row.kind.clone()) else {
+            continue;
+        };
+        let decision = apply_observation(
+            &mut state.receipts,
+            provider,
+            &account.key,
+            limit,
+            row.percent,
+            row.resets_unix,
+        );
+        receipts_changed |= decision.receipts_changed;
+        if decision.fire {
+            crossed.push(row);
+        }
+    }
+    if receipts_changed {
+        let persistent: Vec<_> = state
+            .receipts
+            .iter()
+            .filter(|receipt| {
+                state.persistence[receipt.provider.index()] == Some(IdentityPersistence::Persistent)
+            })
+            .cloned()
+            .collect();
+        let _ = crate::runtime_state::persist_alert_receipts(&persistent);
+    }
     if crossed.is_empty() {
         return;
     }
-    let persistent: Vec<_> = state
-        .receipts
-        .iter()
-        .filter(|receipt| {
-            state.persistence[receipt.provider.index()] == Some(IdentityPersistence::Persistent)
-        })
-        .cloned()
-        .collect();
-    let _ = crate::runtime_state::persist_alert_receipts(&persistent);
 
     // Downgrade compatibility only. New code never reads this map after the
     // provider's one-time account-scoped migration marker is set.
@@ -186,30 +193,54 @@ fn provider_name(provider: ProviderId) -> &'static str {
 /// within-slop match, so repeated small drifts can't creep past the slop.
 const EPOCH_SLOP: i64 = 30 * 60;
 
-/// Pure dedup decision: fire when over threshold AND this window instance
-/// (identified by its resets_at epoch, drift-tolerant) hasn't fired before.
-/// Marks on fire.
-fn should_fire(
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AlertDecision {
+    fire: bool,
+    receipts_changed: bool,
+}
+
+/// Apply one fresh observation to account/provider/limit/threshold-scoped
+/// receipts. A timestamp identifies the reset instance directly. Without one,
+/// only an observed below-threshold state can re-arm the receipt.
+fn apply_observation(
     receipts: &mut Vec<AlertReceiptV1>,
     provider: ProviderId,
     account: &AccountKey,
     limit: LimitId,
     pct: f64,
     reset_instance_unix: Option<i64>,
-) -> bool {
-    if pct < WARN_AT {
-        return false;
-    }
+) -> AlertDecision {
     let same_limit = |receipt: &AlertReceiptV1| {
         receipt.provider == provider
             && &receipt.account == account
             && receipt.limit == limit
             && receipt.threshold_percent == WARN_AT as u8
     };
-    if receipts
-        .iter()
+
+    if pct < WARN_AT {
+        if reset_instance_unix.is_none() {
+            let mut changed = false;
+            for receipt in receipts
+                .iter_mut()
+                .filter(|receipt| same_limit(receipt) && receipt.reset_instance_unix.is_none())
+            {
+                if !receipt.below_threshold_observed {
+                    receipt.below_threshold_observed = true;
+                    changed = true;
+                }
+            }
+            return AlertDecision {
+                receipts_changed: changed,
+                ..AlertDecision::default()
+            };
+        }
+        return AlertDecision::default();
+    }
+
+    if let Some(receipt) = receipts
+        .iter_mut()
         .filter(|receipt| same_limit(receipt))
-        .any(
+        .find(
             |receipt| match (receipt.reset_instance_unix, reset_instance_unix) {
                 (Some(previous), Some(current)) => (current - previous).abs() <= EPOCH_SLOP,
                 (None, None) => true,
@@ -217,8 +248,16 @@ fn should_fire(
             },
         )
     {
-        return false;
+        if reset_instance_unix.is_none() && receipt.below_threshold_observed {
+            receipt.below_threshold_observed = false;
+            return AlertDecision {
+                fire: true,
+                receipts_changed: true,
+            };
+        }
+        return AlertDecision::default();
     }
+
     receipts.retain(|receipt| !same_limit(receipt));
     receipts.push(AlertReceiptV1 {
         provider,
@@ -228,7 +267,22 @@ fn should_fire(
         reset_instance_unix,
         below_threshold_observed: false,
     });
-    true
+    AlertDecision {
+        fire: true,
+        receipts_changed: true,
+    }
+}
+
+#[cfg(test)]
+fn should_fire(
+    receipts: &mut Vec<AlertReceiptV1>,
+    provider: ProviderId,
+    account: &AccountKey,
+    limit: LimitId,
+    pct: f64,
+    reset_instance_unix: Option<i64>,
+) -> bool {
+    apply_observation(receipts, provider, account, limit, pct, reset_instance_unix).fire
 }
 
 fn notify(provider: &str, rows: &[&LimitRow]) {
@@ -514,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_epoch_fires_once() {
+    fn missing_epoch_rearms_only_after_observed_below_threshold() {
         let mut seen = Vec::new();
         let account = account(1);
         assert!(should_fire(
@@ -541,15 +595,53 @@ mod tests {
             20.0,
             None,
         ));
-        // Current behavior: a below-threshold observation does not re-arm a
-        // missing-reset limit. ALERT-02 deliberately changes this later.
-        assert!(!should_fire(
+        assert!(seen[0].below_threshold_observed);
+        assert!(should_fire(
             &mut seen,
             ProviderId::Claude,
             &account,
             limit("other"),
             90.0,
             None,
+        ));
+        assert!(!seen[0].below_threshold_observed);
+        assert!(!should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("other"),
+            92.0,
+            None,
+        ));
+    }
+
+    #[test]
+    fn below_threshold_does_not_rearm_a_known_reset_instance() {
+        let mut seen = Vec::new();
+        let account = account(1);
+        assert!(should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("session"),
+            80.0,
+            Some(100_000),
+        ));
+        assert!(!should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("session"),
+            20.0,
+            Some(100_000),
+        ));
+        assert!(!should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("session"),
+            80.0,
+            Some(100_000),
         ));
     }
 }

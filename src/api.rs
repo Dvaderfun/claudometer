@@ -11,6 +11,10 @@ use std::io::{BufReader, Read};
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
+use windows::Win32::Foundation::SYSTEMTIME;
+use windows::Win32::System::Time::{
+    SystemTimeToTzSpecificLocalTimeEx, DYNAMIC_TIME_ZONE_INFORMATION,
+};
 
 use crate::provider::model::{
     derive_account_context, AccountContext, AccountKey, ProviderId, SecretString,
@@ -649,8 +653,10 @@ pub fn fmt_unix_hhmm(unix: i64) -> String {
     let Ok(dt) = OffsetDateTime::from_unix_timestamp(unix) else {
         return String::new();
     };
-    let local = dt.to_offset(local_offset());
-    format!("{:02}:{:02}", local.hour(), local.minute())
+    let Some(local) = windows_local_time(dt, None) else {
+        return String::new();
+    };
+    format!("{:02}:{:02}", local.wHour, local.wMinute)
 }
 
 pub(crate) fn prettify(s: &str) -> String {
@@ -694,10 +700,6 @@ pub(crate) fn clamp_percent(value: f64) -> f64 {
     }
 }
 
-fn local_offset() -> UtcOffset {
-    UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC)
-}
-
 /// Same formatting for unix-seconds reset stamps (Codex API shape).
 pub(crate) fn fmt_reset_unix(unix: i64) -> String {
     let Ok(dt) = OffsetDateTime::from_unix_timestamp(unix) else {
@@ -708,14 +710,49 @@ pub(crate) fn fmt_reset_unix(unix: i64) -> String {
 
 /// "resets 18:59" if today (local), otherwise "resets Sat 19:59"
 fn fmt_reset_dt(dt: OffsetDateTime) -> String {
-    let local = dt.to_offset(local_offset());
-    let today = OffsetDateTime::now_utc().to_offset(local_offset()).date();
-    if local.date() == today {
-        format!("resets {:02}:{:02}", local.hour(), local.minute())
+    let Some(local) = windows_local_time(dt, None) else {
+        return String::new();
+    };
+    let today = windows_local_time(OffsetDateTime::now_utc(), None);
+    if today.is_some_and(|today| {
+        (local.wYear, local.wMonth, local.wDay) == (today.wYear, today.wMonth, today.wDay)
+    }) {
+        format!("resets {:02}:{:02}", local.wHour, local.wMinute)
     } else {
-        let wd = &local.date().weekday().to_string()[..3];
-        format!("resets {} {:02}:{:02}", wd, local.hour(), local.minute())
+        const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        let weekday = WEEKDAYS
+            .get(usize::from(local.wDayOfWeek))
+            .copied()
+            .unwrap_or("");
+        format!("resets {} {:02}:{:02}", weekday, local.wHour, local.wMinute)
     }
+}
+
+fn windows_local_time(
+    utc: OffsetDateTime,
+    timezone: Option<&DYNAMIC_TIME_ZONE_INFORMATION>,
+) -> Option<SYSTEMTIME> {
+    let utc = utc.to_offset(UtcOffset::UTC);
+    let utc = SYSTEMTIME {
+        wYear: u16::try_from(utc.year()).ok()?,
+        wMonth: utc.month() as u16,
+        wDay: u16::from(utc.day()),
+        wHour: u16::from(utc.hour()),
+        wMinute: u16::from(utc.minute()),
+        wSecond: u16::from(utc.second()),
+        wMilliseconds: u16::try_from(utc.nanosecond() / 1_000_000).ok()?,
+        ..SYSTEMTIME::default()
+    };
+    let mut local = SYSTEMTIME::default();
+    unsafe {
+        SystemTimeToTzSpecificLocalTimeEx(
+            timezone.map(std::ptr::from_ref),
+            std::ptr::from_ref(&utc),
+            std::ptr::from_mut(&mut local),
+        )
+        .ok()?;
+    }
+    Some(local)
 }
 
 #[cfg(test)]
@@ -725,6 +762,78 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    fn pacific_timezone() -> DYNAMIC_TIME_ZONE_INFORMATION {
+        for index in 0.. {
+            let mut timezone = DYNAMIC_TIME_ZONE_INFORMATION::default();
+            let status = unsafe {
+                windows::Win32::System::Time::EnumDynamicTimeZoneInformation(
+                    index,
+                    std::ptr::from_mut(&mut timezone),
+                )
+            };
+            if status == windows::Win32::Foundation::ERROR_NO_MORE_ITEMS.0 {
+                break;
+            }
+            assert_eq!(status, windows::Win32::Foundation::ERROR_SUCCESS.0);
+            let key_len = timezone
+                .TimeZoneKeyName
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(timezone.TimeZoneKeyName.len());
+            if String::from_utf16_lossy(&timezone.TimeZoneKeyName[..key_len])
+                == "Pacific Standard Time"
+            {
+                return timezone;
+            }
+        }
+        panic!("Windows Pacific Standard Time definition is unavailable")
+    }
+
+    #[test]
+    fn weekly_resets_use_target_offset_across_spring_dst() {
+        let timezone = pacific_timezone();
+        let before = windows_local_time(
+            time::macros::datetime!(2026-03-07 09:00 UTC),
+            Some(&timezone),
+        )
+        .unwrap();
+        let after = windows_local_time(
+            time::macros::datetime!(2026-03-14 09:00 UTC),
+            Some(&timezone),
+        )
+        .unwrap();
+
+        assert_eq!((before.wMonth, before.wDay, before.wHour), (3, 7, 1));
+        assert_eq!((after.wMonth, after.wDay, after.wHour), (3, 14, 2));
+    }
+
+    #[test]
+    fn windows_conversion_normalizes_rfc3339_offsets_to_utc() {
+        let timezone = pacific_timezone();
+        let timestamp = OffsetDateTime::parse("2026-03-07T01:00:00-08:00", &Rfc3339).unwrap();
+        let local = windows_local_time(timestamp, Some(&timezone)).unwrap();
+
+        assert_eq!((local.wMonth, local.wDay, local.wHour), (3, 7, 1));
+    }
+
+    #[test]
+    fn weekly_resets_use_target_offset_across_fall_dst() {
+        let timezone = pacific_timezone();
+        let before = windows_local_time(
+            time::macros::datetime!(2026-10-31 09:00 UTC),
+            Some(&timezone),
+        )
+        .unwrap();
+        let after = windows_local_time(
+            time::macros::datetime!(2026-11-07 09:00 UTC),
+            Some(&timezone),
+        )
+        .unwrap();
+
+        assert_eq!((before.wMonth, before.wDay, before.wHour), (10, 31, 2));
+        assert_eq!((after.wMonth, after.wDay, after.wHour), (11, 7, 1));
+    }
 
     const OBSERVED_AT: i64 = 1_788_400_000;
 

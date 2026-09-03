@@ -518,27 +518,27 @@ Abort a rollout immediately if any of these occurs:
 
 ### 8.5 Correctness fixes
 
-- [ ] **ALERT-01 — Deliver provider-specific fresh events.**
+- [x] **ALERT-01 — Deliver provider-specific fresh events.**
   - Include provider/request identity in completion events.
   - Evaluate alerts only for the newly accepted successful result.
   - A completion for one provider can never reclassify another provider’s stored result as fresh.
 
-- [ ] **ALERT-02 — Fix missing-reset deduplication.**
+- [x] **ALERT-02 — Fix missing-reset deduplication.**
   - With no reset timestamp, re-arm only after an observed below-threshold state; do not invent a reset boundary from wall-clock time.
   - Scope receipts by account, provider, stable limit ID, threshold, and reset instance.
 
-- [ ] **CAPS-01 — Replace the Caps LED boolean with a real state.**
+- [x] **CAPS-01 — Replace the Caps LED boolean with a real state.**
   - States: unavailable, installed-disabled, installed-enabled, and error.
   - Check that the script and relevant hook configuration exist.
   - Honor `CLAUDE_CONFIG_DIR` consistently.
   - Return and display write/launch errors.
   - Never show enabled on a clean installation.
 
-- [ ] **TIME-01 — Format reset time at the target instant.**
+- [x] **TIME-01 — Format reset time at the target instant.**
   - Use a timezone-aware Windows conversion for the reset timestamp.
   - Test weekly resets crossing both DST boundaries.
 
-- [ ] **POLL-01 — Define one freshness rule.**
+- [x] **POLL-01 — Define one freshness rule.**
   - Opening the flyout does not bypass the chosen refresh interval after 15 seconds.
   - Manual refresh during cooldown shows its next eligible time.
   - Non-429 results reset the consecutive 429 streak.

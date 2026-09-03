@@ -226,6 +226,12 @@ pub struct Generation(pub u64);
 #[serde(transparent)]
 pub struct RequestId(pub u64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompletionEvent {
+    pub provider: ProviderId,
+    pub request_id: RequestId,
+}
+
 #[derive(Clone)]
 pub struct FetchCompletion<T> {
     pub provider: ProviderId,

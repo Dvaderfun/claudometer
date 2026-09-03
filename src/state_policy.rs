@@ -2,7 +2,6 @@ use std::time::{Duration, Instant};
 
 pub const DEBOUNCE: Duration = Duration::from_secs(3);
 pub const STALE_WINDOW_SECS: i64 = 10 * 60;
-pub const FLYOUT_REFRESH_AFTER: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug)]
 pub struct ClockReading {
@@ -35,45 +34,73 @@ pub enum RefreshTrigger {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshGate {
     Ready,
-    Cooldown { remaining: Duration },
-    Debounced { remaining: Duration },
+    Cooldown {
+        remaining: Duration,
+        next_eligible_unix: i64,
+    },
+    NotDue {
+        remaining: Duration,
+    },
+    Debounced {
+        remaining: Duration,
+    },
     InFlight,
 }
 
 pub fn refresh_gate(
-    _trigger: RefreshTrigger,
+    trigger: RefreshTrigger,
     now: ClockReading,
     cooldown_until: Option<Instant>,
     last_fetch: Option<Instant>,
     fetching: bool,
+    refresh_interval: Duration,
 ) -> RefreshGate {
     if let Some(until) = cooldown_until.filter(|until| now.monotonic < *until) {
+        let remaining = until.saturating_duration_since(now.monotonic);
         return RefreshGate::Cooldown {
-            remaining: until.saturating_duration_since(now.monotonic),
+            remaining,
+            next_eligible_unix: deadline_unix(now, remaining),
         };
-    }
-    if let Some(last) = last_fetch {
-        let elapsed = now.monotonic.saturating_duration_since(last);
-        if elapsed < DEBOUNCE {
-            return RefreshGate::Debounced {
-                remaining: DEBOUNCE - elapsed,
-            };
-        }
     }
     if fetching {
         return RefreshGate::InFlight;
     }
+    if let Some(last) = last_fetch {
+        let elapsed = now.monotonic.saturating_duration_since(last);
+        match trigger {
+            RefreshTrigger::Manual if elapsed < DEBOUNCE => {
+                return RefreshGate::Debounced {
+                    remaining: DEBOUNCE - elapsed,
+                };
+            }
+            RefreshTrigger::Automatic | RefreshTrigger::Flyout if elapsed < refresh_interval => {
+                return RefreshGate::NotDue {
+                    remaining: refresh_interval - elapsed,
+                };
+            }
+            RefreshTrigger::Manual | RefreshTrigger::Automatic | RefreshTrigger::Flyout => {}
+        }
+    }
     RefreshGate::Ready
+}
+
+pub fn cooldown_deadline_unix(now: ClockReading, cooldown_until: Option<Instant>) -> Option<i64> {
+    let remaining = cooldown_until?
+        .checked_duration_since(now.monotonic)
+        .filter(|remaining| !remaining.is_zero())?;
+    Some(deadline_unix(now, remaining))
+}
+
+fn deadline_unix(now: ClockReading, remaining: Duration) -> i64 {
+    let seconds = remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() != 0));
+    now.unix_seconds
+        .saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX))
 }
 
 pub fn within_stale_window(now: ClockReading, fetched_unix: i64) -> bool {
     now.unix_seconds - fetched_unix < STALE_WINDOW_SECS
-}
-
-pub fn flyout_refresh_due(now: ClockReading, last_fetch: Option<Instant>) -> bool {
-    last_fetch
-        .map(|last| now.monotonic.saturating_duration_since(last) > FLYOUT_REFRESH_AFTER)
-        .unwrap_or(true)
 }
 
 pub fn rate_limit_delay(retry_after: Option<u64>, consecutive: u32) -> Duration {
@@ -92,9 +119,8 @@ pub enum CompletionKind {
 
 pub fn next_rate_limit_streak(current: u32, completion: CompletionKind) -> u32 {
     match completion {
-        CompletionKind::Success => 0,
+        CompletionKind::Success | CompletionKind::OtherFailure => 0,
         CompletionKind::RateLimited => current.saturating_add(1),
-        CompletionKind::OtherFailure => current,
     }
 }
 
@@ -139,7 +165,8 @@ mod tests {
                 clock.read(),
                 None,
                 Some(last),
-                false
+                false,
+                Duration::from_secs(60),
             ),
             RefreshGate::Debounced {
                 remaining: Duration::from_millis(1)
@@ -152,7 +179,8 @@ mod tests {
                 clock.read(),
                 None,
                 Some(last),
-                false
+                false,
+                Duration::from_secs(60),
             ),
             RefreshGate::Ready
         );
@@ -164,6 +192,7 @@ mod tests {
         let until = clock.read().monotonic + Duration::from_secs(90);
         let expected = RefreshGate::Cooldown {
             remaining: Duration::from_secs(90),
+            next_eligible_unix: 1090,
         };
         assert_eq!(
             refresh_gate(
@@ -171,7 +200,8 @@ mod tests {
                 clock.read(),
                 Some(until),
                 None,
-                false
+                false,
+                Duration::from_secs(60),
             ),
             expected
         );
@@ -181,23 +211,83 @@ mod tests {
                 clock.read(),
                 Some(until),
                 None,
-                false
+                false,
+                Duration::from_secs(60),
+            ),
+            expected
+        );
+        assert_eq!(
+            refresh_gate(
+                RefreshTrigger::Flyout,
+                clock.read(),
+                Some(until),
+                None,
+                false,
+                Duration::from_secs(60),
             ),
             expected
         );
     }
 
     #[test]
-    fn stale_and_flyout_boundaries_match_current_behavior() {
+    fn flyout_and_automatic_refresh_share_the_selected_interval() {
         let mut clock = FakeClock::new(10_000);
         assert!(within_stale_window(clock.read(), 9_401));
         assert!(!within_stale_window(clock.read(), 9_400));
 
         let last = clock.read().monotonic;
         clock.advance(Duration::from_secs(15));
-        assert!(!flyout_refresh_due(clock.read(), Some(last)));
-        clock.advance(Duration::from_millis(1));
-        assert!(flyout_refresh_due(clock.read(), Some(last)));
+        let not_due = RefreshGate::NotDue {
+            remaining: Duration::from_secs(45),
+        };
+        for trigger in [RefreshTrigger::Flyout, RefreshTrigger::Automatic] {
+            assert_eq!(
+                refresh_gate(
+                    trigger,
+                    clock.read(),
+                    None,
+                    Some(last),
+                    false,
+                    Duration::from_secs(60),
+                ),
+                not_due
+            );
+        }
+        assert_eq!(
+            refresh_gate(
+                RefreshTrigger::Manual,
+                clock.read(),
+                None,
+                Some(last),
+                false,
+                Duration::from_secs(60),
+            ),
+            RefreshGate::Ready
+        );
+        clock.advance(Duration::from_secs(45));
+        assert_eq!(
+            refresh_gate(
+                RefreshTrigger::Flyout,
+                clock.read(),
+                None,
+                Some(last),
+                false,
+                Duration::from_secs(60),
+            ),
+            RefreshGate::Ready
+        );
+    }
+
+    #[test]
+    fn cooldown_deadline_uses_fake_wall_and_monotonic_clocks() {
+        let mut clock = FakeClock::new(20_000);
+        let until = clock.read().monotonic + Duration::from_millis(90_001);
+        assert_eq!(
+            cooldown_deadline_unix(clock.read(), Some(until)),
+            Some(20_091)
+        );
+        clock.advance(Duration::from_secs(91));
+        assert_eq!(cooldown_deadline_unix(clock.read(), Some(until)), None);
     }
 
     #[test]
@@ -211,6 +301,6 @@ mod tests {
 
         assert_eq!(next_rate_limit_streak(3, CompletionKind::Success), 0);
         assert_eq!(next_rate_limit_streak(3, CompletionKind::RateLimited), 4);
-        assert_eq!(next_rate_limit_streak(3, CompletionKind::OtherFailure), 3);
+        assert_eq!(next_rate_limit_streak(3, CompletionKind::OtherFailure), 0);
     }
 }
