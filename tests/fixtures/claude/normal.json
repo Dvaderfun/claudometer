@@ -1,0 +1,19 @@
+{
+  "limits": [
+    {
+      "kind": "session",
+      "percent": 42.5,
+      "severity": "normal",
+      "resets_at": "2026-09-03T12:00:00Z"
+    },
+    {
+      "kind": "weekly_all",
+      "percent": 65,
+      "resets_at": "2026-09-07T00:00:00Z"
+    }
+  ],
+  "extra_usage": {
+    "is_enabled": true,
+    "utilization": 12.5
+  }
+}

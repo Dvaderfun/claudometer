@@ -26,15 +26,8 @@ pub fn build(style: &Style, dark: bool) -> Option<HICON> {
         bmi.bmiHeader.biCompression = BI_RGB.0;
 
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let hbm = CreateDIBSection(
-            HDC::default(),
-            &bmi,
-            DIB_RGB_COLORS,
-            &mut bits,
-            None,
-            0,
-        )
-        .ok()?;
+        let hbm =
+            CreateDIBSection(HDC::default(), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
         let px = bits as *mut u32;
 
         rasterize(px, s as usize, style, dark);

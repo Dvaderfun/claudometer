@@ -5,9 +5,10 @@ Claudometer — Claude + Codex usage limits in the Windows 11 tray. Native Win32
 ## Commands
 
 ```powershell
-cargo build --release          # output: target/release/claudometer.exe (~640 KB)
-cargo clippy --release         # CI gates on -D warnings — keep zero warnings
-.\target\release\claudometer.exe
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets --all-features
+cargo build --locked --release --target x86_64-pc-windows-msvc
 ```
 
 - **Kill before rebuild** — running instance locks the exe: `Stop-Process -Name claudometer -Force`
@@ -21,12 +22,12 @@ Drive the flyout programmatically: find the hidden window by class `Claudometer.
 
 Toast alerts: `.\target\release\claudometer.exe --test-alert` fires the whole pipeline with fake data; read `%APPDATA%\Claudometer\alert-test.txt` ("ok" or the error). Delivered toasts are queryable from Windows PowerShell 5.1 (not pwsh): `[Windows.UI.Notifications.ToastNotificationManager]::History.GetHistory('Claudometer')` after loading the WinRT type.
 
-Expected budgets: **~3.5 MB fresh, ~9 MB flyout open (two sections), ~7–8.5 MB after close (updater's TLS session adds ~1), ~0.02% avg CPU, GDI count stable (~18 once settings was opened)**. A regression here is a bug.
+Foundation runtime baseline on the reference x64 machine: **1.53 MiB hidden and 4.45 MiB with the two-provider flyout visible (p95 private working set), below 0.002% idle CPU, 10/13 GDI handles, and 50.387 ms median / 76.551 ms p95 tray readiness in the slower 50-start run**. The current unsigned x64 artifact is 941,056 bytes; per-slice sizes are in `docs/performance/artifact-ledger.md`. The controlled runtime mode excludes provider refresh/TLS work; methodology and both ten-minute runs are in `docs/performance/foundation-baseline.md`. Investigate a greater-than-10% per-slice regression.
 
 ## Hard-won gotchas (do not re-learn these)
 
 - **windows crate is pinned to 0.58.** API churns between minors. Known holes: `NIN_SELECT`/`NIN_KEYSELECT`/`WM_MOUSELEAVE` not exported (local consts in `main.rs`); COM methods vanish silently if a param type's cargo feature is off — `CreateSolidColorBrush` needs `Foundation_Numerics`.
-- **D3D device must stay `D3D_DRIVER_TYPE_WARP`.** Hardware device = ~40 MB of driver user-mode heaps that survive device release. WARP renders the ~330px surface in microseconds; DWM still composes on GPU. Measured: 57 MB vs 7 MB.
+- **D3D device must stay `D3D_DRIVER_TYPE_WARP`.** Historical v0.2 hardware-driver testing measured 57 MB versus 7 MB for WARP; those figures compare driver choices, not the current Foundation process baseline. WARP renders the ~330px surface in microseconds; DWM still composes on GPU.
 - **Flyout acrylic = undocumented accent policy** (`SetWindowCompositionAttribute`, `util::apply_acrylic`). `DWMWA_SYSTEMBACKDROP_TYPE` renders only its opaque fallback on borderless `WS_EX_NOREDIRECTIONBITMAP` popups — don't "modernize" back to it without testing on real hardware.
 - **`LoadIconW` id-1 pointer:** clippy suggests `std::ptr::dangling::<u16>()` — that's address 2, wrong resource id. The `#[allow]` there is load-bearing.
 - **Never perform or broker the token exchange.** `api.rs` and `codex.rs` keep both credential files strictly read-only. Claude Code alone reads its refresh token, rotates it, and rewrites `.credentials.json`; a second refresh-token user can invalidate active CLI sessions. On 401/403, tell the user to open Claude Code once. Only an explicit Connect/Reconnect may run `claude auth login`.
@@ -39,7 +40,7 @@ Expected budgets: **~3.5 MB fresh, ~9 MB flyout open (two sections), ~7–8.5 MB
 - **Codex windows aren't positional.** `wham/usage` may deliver the weekly (168 h) window as `primary_window`; kind/label must derive from `limit_window_seconds`, never from primary/secondary position.
 - Tray icon must be re-added on the `TaskbarCreated` broadcast (explorer restart) — already handled, keep it.
 - **Toasts need the AUMID registry key AND a live `ToastNotification` object.** Unpackaged exes toast via `HKCU\Software\Classes\AppUserModelId\Claudometer` (`alerts::init`); the OS routes the `Activated` (click) event through the shown `ToastNotification` — `alerts.rs` keeps recent ones in a thread_local on purpose. `IconUri` must be a real file on disk (ico extracted to `%APPDATA%\Claudometer`), not an exe resource path.
-- **Vibecode mode must always be able to put the lid setting back.** The original (AC, DC) lid-close indices go into settings.json *before* the first override and are only cleared when the user turns the mode off — arming again never overwrites them (that would save our own "Do nothing" as the original). Quit restores the system state but keeps the flag, so the next launch re-arms. The wake lock is per-*thread*: arm/drop it on the UI thread only.
+- **Vibecode has two independent controls.** The flyout toggle is only the per-thread wake lock. The Advanced lid override may write power policy only after `power-override.v1.json` is durably `prepared`; every write/activation/read-back is checked, and recovery operates on the exact recorded GUID without overwriting external changes or activating an inactive scheme. Drop wake first on every exit path. Never delete a live/corrupt journal manually. Legacy `vibecode_lid` values are applied to the current scheme only after the explicit Restore action and are cleared only after verification.
 - Alert dedup is per window instance (`resets_unix`), persisted in settings.json — never key on the formatted `reset_text` ("resets 18:59" recurs daily) and never alert from stale/error-preserved snapshots.
 - **Updater swap relies on Windows allowing a *rename* of the running exe** (delete/overwrite are forbidden): exe → `.old`, new → exe, spawn `--swap-wait`, quit. `--swap-wait` waits on the single-instance mutex (WAIT_ABANDONED = old died = proceed) then deletes the `.old`. Downloaded exe is verified via VERSIONINFO == tag + `certutil -hashfile` vs the `.sha256` release asset — keep release.yml attaching that asset or hash verification silently stops.
 

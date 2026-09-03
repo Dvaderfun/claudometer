@@ -140,7 +140,10 @@ fn check_inner() -> Result<Option<Release>, ()> {
         .map_err(|_| ())?;
     let body = resp.into_string().map_err(|_| ())?;
     let rel: ApiRelease = serde_json::from_str(&body).map_err(|_| ())?;
-    Ok(pick_release(&rel, parse_ver(env!("CARGO_PKG_VERSION")).ok_or(())?))
+    Ok(pick_release(
+        &rel,
+        parse_ver(env!("CARGO_PKG_VERSION")).ok_or(())?,
+    ))
 }
 
 /// Newer, non-draft, non-prerelease release with a claudometer.exe asset.
@@ -189,7 +192,9 @@ fn parse_ver(s: &str) -> Option<(u16, u16, u16)> {
 /// and repaints via WM_UPDATE. On success the thread posts WM_UPDATE with
 /// wparam 1 — the UI thread quits and the freshly spawned exe takes over.
 pub fn install() {
-    let Status::Available(rel) = status() else { return };
+    let Status::Available(rel) = status() else {
+        return;
+    };
     if BUSY.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -258,7 +263,8 @@ fn install_inner(rel: &Release) -> Result<(), String> {
         }
     }
 
-    swap_files(&exe, &new, &old).map_err(|_| cleanup_new("couldn't replace exe (folder read-only?)"))?;
+    swap_files(&exe, &new, &old)
+        .map_err(|_| cleanup_new("couldn't replace exe (folder read-only?)"))?;
 
     // hand over: new instance waits for our mutex, then cleans up the .old
     std::process::Command::new(&exe)
@@ -298,7 +304,9 @@ fn swap_files(exe: &Path, new: &Path, old: &Path) -> std::io::Result<()> {
 
 /// Post-update startup: drop the previous exe once its process is gone.
 pub fn cleanup_old() {
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
     let Some(dir) = exe.parent() else { return };
     let old = dir.join("claudometer.old.exe");
     if old.exists() {
@@ -457,7 +465,10 @@ mod tests {
         assert!(pick_release(&rel, (10, 0, 0)).is_none());
 
         // prerelease → skipped
-        let pre = ApiRelease { prerelease: Some(true), ..rel };
+        let pre = ApiRelease {
+            prerelease: Some(true),
+            ..rel
+        };
         assert!(pick_release(&pre, (0, 4, 0)).is_none());
     }
 

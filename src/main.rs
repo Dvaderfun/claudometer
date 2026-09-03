@@ -8,7 +8,13 @@ mod alerts;
 mod api;
 mod auth;
 mod codex;
+mod config;
+mod demo;
 mod gfx;
+pub mod provider;
+pub mod runtime_state;
+mod state_policy;
+pub mod store;
 mod trayicon;
 mod updater;
 mod util;
@@ -25,7 +31,9 @@ use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
+};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -34,6 +42,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+use provider::model::{
+    AccountContext, AccountKey, FetchCompletion, Generation, ProviderId, RequestId,
+};
+use state_policy::{Clock, ClockReading, RefreshGate, RefreshTrigger, SystemClock};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_DATA_READY: u32 = WM_APP + 2;
@@ -67,17 +80,13 @@ static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
 static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
 static POLL_SECS: AtomicU32 = AtomicU32::new(60);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Provider {
-    Claude = 0,
-    Codex = 1,
-}
-
 /// Per-provider fetch state; both providers share the resilience rules
 /// (recent stale data beats errors, strict 429 backoff, 3 s debounce).
 struct Slot {
-    state: Mutex<Option<api::FetchOutcome>>,
-    last_good: Mutex<Option<api::UsageSnapshot>>,
+    identity: Mutex<SlotIdentity>,
+    state: Mutex<Option<FetchCompletion<api::FetchOutcome>>>,
+    last_good: Mutex<Option<AccountSnapshot>>,
+    preparation_error: Mutex<Option<String>>,
     last_fetch: Mutex<Option<Instant>>,
     /// No requests before this instant (server Retry-After or exponential
     /// backoff). Manual refresh respects it: retries can extend a 429 cooldown.
@@ -87,11 +96,31 @@ struct Slot {
     fetching: AtomicBool,
 }
 
+struct SlotIdentity {
+    account: Option<AccountContext>,
+    generation: Generation,
+    next_request_id: u64,
+    pending_request_id: Option<RequestId>,
+}
+
+#[derive(Clone)]
+struct AccountSnapshot {
+    account: AccountKey,
+    snapshot: api::UsageSnapshot,
+}
+
 impl Slot {
     const fn new() -> Self {
         Self {
+            identity: Mutex::new(SlotIdentity {
+                account: None,
+                generation: Generation(0),
+                next_request_id: 1,
+                pending_request_id: None,
+            }),
             state: Mutex::new(None),
             last_good: Mutex::new(None),
+            preparation_error: Mutex::new(None),
             last_fetch: Mutex::new(None),
             cooldown_until: Mutex::new(None),
             rl_streak: AtomicU32::new(0),
@@ -102,8 +131,8 @@ impl Slot {
 
 static SLOTS: [Slot; 2] = [Slot::new(), Slot::new()];
 
-fn slot(p: Provider) -> &'static Slot {
-    &SLOTS[p as usize]
+fn slot(provider: ProviderId) -> &'static Slot {
+    &SLOTS[provider.index()]
 }
 
 fn any_fetching() -> bool {
@@ -112,23 +141,49 @@ fn any_fetching() -> bool {
 
 /// Codex section is live: toggle on AND a ChatGPT-login auth file on disk.
 fn codex_active() -> bool {
-    util::show_codex() && codex::available()
+    config::settings().codex_enabled && codex::available()
 }
 
 /// Snapshot to display for a provider (fresh, or stale on error) plus the
 /// current error message when the last fetch failed.
-fn effective(p: Provider) -> (Option<api::UsageSnapshot>, Option<String>) {
-    let s = slot(p);
+fn effective(p: ProviderId) -> (Option<api::UsageSnapshot>, Option<String>) {
+    effective_at(slot(p), SystemClock.read())
+}
+
+fn effective_at(s: &Slot, now: ClockReading) -> (Option<api::UsageSnapshot>, Option<String>) {
+    let identity = s.identity.lock().unwrap();
+    let current_account = identity.account.as_ref().map(|account| &account.key);
+    let matching_last_good = || {
+        s.last_good
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|last| current_account.is_some_and(|account| account == &last.account))
+            .map(|last| last.snapshot.clone())
+    };
+    if let Some(error) = s.preparation_error.lock().unwrap().clone() {
+        let recent = matching_last_good()
+            .filter(|snapshot| state_policy::within_stale_window(now, snapshot.fetched_unix));
+        return (recent, Some(error));
+    }
     let state = s.state.lock().unwrap();
     match &*state {
-        Some(api::FetchOutcome::Ok(snap)) => (Some(snap.clone()), None),
-        Some(api::FetchOutcome::Err { msg, .. }) => {
-            let recent = s.last_good.lock().unwrap().clone().filter(|snapshot| {
-                time::OffsetDateTime::now_utc().unix_timestamp() - snapshot.fetched_unix < 10 * 60
-            });
-            (recent, Some(msg.clone()))
+        Some(completion)
+            if current_account.is_some_and(|account| account == &completion.account)
+                && completion.generation == identity.generation =>
+        {
+            match &completion.payload {
+                api::FetchOutcome::Ok(snapshot) => (Some(snapshot.clone()), None),
+                api::FetchOutcome::Err { msg, .. } => {
+                    let recent = matching_last_good().filter(|snapshot| {
+                        state_policy::within_stale_window(now, snapshot.fetched_unix)
+                    });
+                    (recent, Some(msg.clone()))
+                }
+            }
         }
-        None => (s.last_good.lock().unwrap().clone(), None),
+        Some(_) => (None, None),
+        None => (matching_last_good(), None),
     }
 }
 
@@ -166,38 +221,67 @@ thread_local! {
 }
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let demo_request =
+        demo::parse_request(&args).map_err(|message| Error::new(E_INVALIDARG, message))?;
+    if let Some(request) = demo_request {
+        demo::activate(request, SystemClock.read().unix_seconds)
+            .map_err(|message| Error::new(E_UNEXPECTED, message))?;
+    }
+
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
+        if !demo::is_active() && args.iter().any(|argument| argument == "--recover-vibecode") {
+            config::initialize();
+            return if vibecode::recover_command() {
+                Ok(())
+            } else {
+                Err(Error::new(E_FAIL, "Vibecode recovery remains unresolved"))
+            };
+        }
+
         // hidden verification hook: fire a fake 75% toast and exit
-        if std::env::args().any(|a| a == "--test-alert") {
+        if !demo::is_active() && args.iter().any(|argument| argument == "--test-alert") {
             alerts::init();
             alerts::show_test();
             std::thread::sleep(std::time::Duration::from_secs(2));
             return Ok(());
         }
 
-        let mutex = CreateMutexW(None, true, w!("Local\\Claudometer.SingleInstance"))?;
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            // normal double-launch: exit silently. `--swap-wait` = we're the
-            // fresh exe of an update handover — the old instance is exiting;
-            // its mutex signals abandoned once its process dies.
-            if !std::env::args().any(|a| a == "--swap-wait") {
-                return Ok(());
+        let _instance_mutex = if demo::is_active() {
+            None
+        } else {
+            let mutex = CreateMutexW(None, true, w!("Local\\Claudometer.SingleInstance"))?;
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                // normal double-launch: exit silently. `--swap-wait` = we're the
+                // fresh exe of an update handover — the old instance is exiting;
+                // its mutex signals abandoned once its process dies.
+                if !args.iter().any(|argument| argument == "--swap-wait") {
+                    return Ok(());
+                }
+                let wait = WaitForSingleObject(mutex, 15_000);
+                if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+                    return Ok(());
+                }
             }
-            let w = WaitForSingleObject(mutex, 15_000);
-            if w != WAIT_OBJECT_0 && w != WAIT_ABANDONED {
-                return Ok(());
-            }
-        }
-        std::thread::spawn(updater::cleanup_old);
+            Some(mutex)
+        };
 
-        util::enable_dark_context_menus();
-        alerts::init();
+        if !demo::is_active() {
+            std::thread::spawn(updater::cleanup_old);
+            config::initialize();
+            runtime_state::initialize();
+            util::enable_dark_context_menus();
+            alerts::init();
+        }
 
         let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
-        TASKBAR_MSG.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::SeqCst);
+        TASKBAR_MSG.store(
+            RegisterWindowMessageW(w!("TaskbarCreated")),
+            Ordering::SeqCst,
+        );
 
         // hidden main window (tray owner + broadcast receiver)
         let cls = w!("Claudometer.Main");
@@ -214,8 +298,14 @@ fn main() -> Result<()> {
             cls,
             w!("Claudometer"),
             WS_POPUP,
-            0, 0, 0, 0,
-            None, None, hinst, None,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            hinst,
+            None,
         )?;
         MAIN_HWND.store(main.0 as isize, Ordering::SeqCst);
 
@@ -236,8 +326,14 @@ fn main() -> Result<()> {
             fcls,
             w!("Claude usage"),
             WS_POPUP,
-            0, 0, 10, 10,
-            None, None, hinst, None,
+            0,
+            0,
+            10,
+            10,
+            None,
+            None,
+            hinst,
+            None,
         )?;
         FLYOUT_HWND.store(flyout.0 as isize, Ordering::SeqCst);
         style_flyout(flyout);
@@ -260,14 +356,26 @@ fn main() -> Result<()> {
         RegisterClassExW(&swc);
 
         add_tray_icon(main);
-        // wake lock is per-thread — must be armed (and dropped) on this thread
-        vibecode::init();
-        POLL_SECS.store(util::load_poll_secs(), Ordering::SeqCst);
-        SetTimer(main, TIMER_POLL, POLL_SECS.load(Ordering::SeqCst) * 1000, None);
-        // TIMER_TICK runs only while the flyout is visible (started in show_flyout)
-        spawn_claude_account(false);
-        spawn_fetch_all();
-        updater::maybe_check();
+        if let Some(state) = demo::active() {
+            signal_demo_ready(state);
+            if !state.hidden {
+                show_demo_flyout(flyout, state);
+            }
+        } else {
+            // wake lock is per-thread — must be armed (and dropped) on this thread
+            vibecode::init();
+            POLL_SECS.store(config::settings().poll_interval_seconds, Ordering::SeqCst);
+            SetTimer(
+                main,
+                TIMER_POLL,
+                POLL_SECS.load(Ordering::SeqCst) * 1000,
+                None,
+            );
+            // TIMER_TICK runs only while the flyout is visible (started in show_flyout)
+            spawn_claude_account(false);
+            spawn_fetch_all(RefreshTrigger::Automatic);
+            updater::maybe_check();
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {
@@ -306,7 +414,10 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 update_tray(hwnd);
                 run_alert_checks();
                 if IsWindowVisible(flyout_hwnd()).as_bool() {
-                    show_flyout(ANCHOR_X.load(Ordering::SeqCst), ANCHOR_Y.load(Ordering::SeqCst));
+                    show_flyout(
+                        ANCHOR_X.load(Ordering::SeqCst),
+                        ANCHOR_Y.load(Ordering::SeqCst),
+                    );
                 }
                 let sh = settings_hwnd();
                 if !sh.is_invalid() && IsWindowVisible(sh).as_bool() {
@@ -315,6 +426,11 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 LRESULT(0)
             }
             WM_AUTH_READY => {
+                if wparam.0 == 1 {
+                    // Interactive login may have replaced the account. Invalidate
+                    // before any replacement fetch so an old worker cannot land.
+                    invalidate_account(slot(ProviderId::Claude), ProviderId::Claude);
+                }
                 let sh = settings_hwnd();
                 if !sh.is_invalid() && IsWindowVisible(sh).as_bool() {
                     render_settings(sh);
@@ -325,8 +441,7 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 ) {
                     // An explicit login may have replaced the credential that
                     // just failed; do not let the normal debounce delay it.
-                    *slot(Provider::Claude).last_fetch.lock().unwrap() = None;
-                    spawn_fetch(Provider::Claude);
+                    spawn_fetch(ProviderId::Claude, RefreshTrigger::Automatic);
                 } else {
                     update_tray(hwnd);
                     render_flyout_current();
@@ -366,7 +481,8 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_POLL => {
-                spawn_fetch_all();
+                vibecode::reconcile_active_scheme();
+                spawn_fetch_all(RefreshTrigger::Automatic);
                 updater::maybe_check(); // no-op unless 24h passed
                 LRESULT(0)
             }
@@ -377,11 +493,14 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             WM_SETTINGCHANGE => {
                 // React only to theme/accent broadcasts — wallpaper changes and
                 // random SPI updates also land here and are noise.
-                if setting_change_is_theme(lparam) {
+                if !demo::is_active() && setting_change_is_theme(lparam) {
                     update_tray(hwnd);
                     apply_flyout_theme(flyout_hwnd());
                     if IsWindowVisible(flyout_hwnd()).as_bool() {
-                        show_flyout(ANCHOR_X.load(Ordering::SeqCst), ANCHOR_Y.load(Ordering::SeqCst));
+                        show_flyout(
+                            ANCHOR_X.load(Ordering::SeqCst),
+                            ANCHOR_Y.load(Ordering::SeqCst),
+                        );
                     }
                     let sh = settings_hwnd();
                     if !sh.is_invalid() {
@@ -393,10 +512,37 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
+            WM_POWERBROADCAST => {
+                if !demo::is_active() {
+                    vibecode::reconcile_active_scheme();
+                    render_flyout_current();
+                    let settings = settings_hwnd();
+                    if !settings.is_invalid() && IsWindowVisible(settings).as_bool() {
+                        render_settings(settings);
+                    }
+                }
+                LRESULT(1)
+            }
+            WM_QUERYENDSESSION => {
+                if !demo::is_active() {
+                    vibecode::restore_for_exit();
+                }
+                LRESULT(1)
+            }
+            WM_ENDSESSION => {
+                if !demo::is_active() {
+                    if wparam.0 != 0 {
+                        vibecode::restore_for_exit();
+                    } else {
+                        vibecode::init();
+                    }
+                }
+                LRESULT(0)
+            }
             WM_DESTROY => {
-                // put the lid-close action back before we go — the preference
-                // itself survives and re-arms on the next launch
-                vibecode::restore_for_exit();
+                if !demo::is_active() {
+                    vibecode::restore_for_exit();
+                }
                 remove_tray(hwnd);
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -415,7 +561,7 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     unsafe {
         match msg {
             WM_ACTIVATE => {
-                if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                if !demo::is_active() && (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
                     hide_flyout();
                 }
                 LRESULT(0)
@@ -423,13 +569,22 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_KEYDOWN => {
                 let vk = wparam.0 as u16;
                 if vk == VK_ESCAPE.0 {
-                    hide_flyout();
+                    if demo::is_active() {
+                        let owner = HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _);
+                        let _ = DestroyWindow(owner);
+                    } else {
+                        hide_flyout();
+                    }
                 } else if vk == VK_TAB.0 {
                     let back = GetKeyState(VK_SHIFT.0 as i32) < 0;
                     UI.with(|ui| {
                         let mut ui = ui.borrow_mut();
                         ui.fly_focus = if ui.fly_focus < 0 {
-                            if back { FLY_FOCUS_N - 1 } else { 0 }
+                            if back {
+                                FLY_FOCUS_N - 1
+                            } else {
+                                0
+                            }
                         } else if back {
                             (ui.fly_focus - 1 + FLY_FOCUS_N) % FLY_FOCUS_N
                         } else {
@@ -440,7 +595,7 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 } else if vk == VK_RETURN.0 || vk == VK_SPACE.0 {
                     match UI.with(|ui| ui.borrow().fly_focus) {
                         0 => {
-                            spawn_fetch_all();
+                            spawn_fetch_all(RefreshTrigger::Manual);
                             render_flyout_current();
                         }
                         1 => {
@@ -491,7 +646,7 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (x, y) = mouse_dip(hwnd, lparam);
                 match fly_hit(x, y) {
                     gfx::FlyHover::Refresh => {
-                        spawn_fetch_all();
+                        spawn_fetch_all(RefreshTrigger::Manual);
                         render_flyout_current(); // spinner starts immediately
                     }
                     gfx::FlyHover::Gear => {
@@ -515,7 +670,12 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
-extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+extern "system" fn settings_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     unsafe {
         match msg {
             WM_MOUSEMOVE => {
@@ -578,7 +738,11 @@ extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                         let mut ui = ui.borrow_mut();
                         let n = gfx::N_CARDS as i32;
                         ui.set_focus = if ui.set_focus < 0 {
-                            if back { n - 1 } else { 0 }
+                            if back {
+                                n - 1
+                            } else {
+                                0
+                            }
                         } else if back {
                             (ui.set_focus - 1 + n) % n
                         } else {
@@ -660,8 +824,10 @@ unsafe fn hide_settings(hwnd: HWND) {
 // ---------- settings actions (shared by mouse + keyboard) ----------
 
 unsafe fn apply_interval(secs: u32) {
+    if config::set_poll_interval_seconds(secs).is_err() {
+        return;
+    }
     POLL_SECS.store(secs, Ordering::SeqCst);
-    util::save_poll_secs(secs);
     let mh = HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _);
     let _ = KillTimer(mh, TIMER_POLL);
     SetTimer(mh, TIMER_POLL, secs * 1000, None);
@@ -669,7 +835,10 @@ unsafe fn apply_interval(secs: u32) {
 
 unsafe fn step_interval(dir: i32) {
     let cur = POLL_SECS.load(Ordering::SeqCst);
-    let idx = gfx::INTERVALS.iter().position(|(s, _)| *s == cur).unwrap_or(1) as i32;
+    let idx = gfx::INTERVALS
+        .iter()
+        .position(|(s, _)| *s == cur)
+        .unwrap_or(1) as i32;
     let next = (idx + dir).clamp(0, gfx::INTERVALS.len() as i32 - 1) as usize;
     apply_interval(gfx::INTERVALS[next].0);
 }
@@ -680,22 +849,50 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
         1 => util::set_caps_led_enabled(!util::caps_led_enabled()),
         2 => util::set_autostart(!util::autostart_enabled()),
         3 => {
-            let on = !util::show_codex();
-            util::set_show_codex(on);
-            if on {
-                spawn_fetch(Provider::Codex);
+            let on = !config::settings().codex_enabled;
+            if config::set_codex_enabled(on).is_ok() {
+                if on {
+                    spawn_fetch(ProviderId::Codex, RefreshTrigger::Manual);
+                } else {
+                    invalidate_account(slot(ProviderId::Codex), ProviderId::Codex);
+                }
+                update_tray(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
             }
-            update_tray(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
         }
-        4 => util::set_alerts_enabled(!util::alerts_enabled()),
-        5 => {
+        4 => {
+            let enabled = !config::settings().alerts_enabled;
+            let _ = config::set_alerts_enabled(enabled);
+        }
+        gfx::CARD_LID => {
+            match vibecode::persistent_status() {
+                vibecode::PersistentStatus::LegacyRecoveryPending => {
+                    vibecode::restore_legacy_to_current_scheme();
+                }
+                vibecode::PersistentStatus::RecoveryRequired => {
+                    vibecode::retry_recovery();
+                }
+                vibecode::PersistentStatus::Error if vibecode::persistent_preference_enabled() => {
+                    vibecode::set_persistent_override(false);
+                }
+                status => {
+                    vibecode::set_persistent_override(
+                        status != vibecode::PersistentStatus::Applied,
+                    );
+                }
+            }
+            render_flyout_current();
+        }
+        gfx::CARD_INTERVAL => {
             // keyboard activate on the interval card: cycle to the next option
             let cur = POLL_SECS.load(Ordering::SeqCst);
-            let idx = gfx::INTERVALS.iter().position(|(s, _)| *s == cur).unwrap_or(1);
+            let idx = gfx::INTERVALS
+                .iter()
+                .position(|(s, _)| *s == cur)
+                .unwrap_or(1);
             apply_interval(gfx::INTERVALS[(idx + 1) % gfx::INTERVALS.len()].0);
         }
-        6 => spawn_fetch_all(),
-        7 => match updater::status() {
+        gfx::CARD_REFRESH => spawn_fetch_all(RefreshTrigger::Manual),
+        gfx::CARD_ABOUT => match updater::status() {
             updater::Status::Available(_) => updater::install(),
             updater::Status::Installing => {}
             updater::Status::Failed(_, page) => {
@@ -703,7 +900,7 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
             }
             updater::Status::UpToDate => updater::open_url(updater::REPO_URL),
         },
-        8 => {
+        gfx::CARD_QUIT => {
             let _ = DestroyWindow(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
             return;
         }
@@ -751,7 +948,11 @@ fn fly_hit(x: f32, y: f32) -> gfx::FlyHover {
         gfx::FlyHover::Refresh
     } else if contains(&gear, x, y) {
         gfx::FlyHover::Gear
-    } else if contains(&gfx::vibe_row_at(UI.with(|ui| ui.borrow().fly_vibe_top)), x, y) {
+    } else if contains(
+        &gfx::vibe_row_at(UI.with(|ui| ui.borrow().fly_vibe_top)),
+        x,
+        y,
+    ) {
         gfx::FlyHover::Vibe
     } else {
         gfx::FlyHover::None
@@ -789,7 +990,18 @@ unsafe fn style_flyout(h: HWND) {
     );
     // DWMSBT_TRANSIENTWINDOW only renders its opaque fallback on this
     // borderless DComp popup — accent-policy acrylic instead (util).
-    apply_flyout_theme(h);
+    if demo::is_active() {
+        let dark_bool = BOOL(1);
+        let _ = DwmSetWindowAttribute(
+            h,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark_bool as *const _ as *const _,
+            std::mem::size_of::<BOOL>() as u32,
+        );
+        util::apply_acrylic(h, true);
+    } else {
+        apply_flyout_theme(h);
+    }
 }
 
 unsafe fn apply_flyout_theme(h: HWND) {
@@ -809,7 +1021,7 @@ unsafe fn apply_flyout_theme(h: HWND) {
 /// only appears when nothing was ever fetched from any provider. Per-provider
 /// failures degrade to a dim note line inside that provider's section.
 fn current_view() -> gfx::View {
-    let (c_snap, c_err) = effective(Provider::Claude);
+    let (c_snap, c_err) = effective(ProviderId::Claude);
     let codex_on = codex_active();
 
     // Claude-only path — identical to the single-provider behavior
@@ -825,7 +1037,7 @@ fn current_view() -> gfx::View {
         };
     }
 
-    let (x_snap, x_err) = effective(Provider::Codex);
+    let (x_snap, x_err) = effective(ProviderId::Codex);
     if c_snap.is_none() && c_err.is_none() && x_snap.is_none() && x_err.is_none() {
         return gfx::View::Loading;
     }
@@ -840,14 +1052,19 @@ fn current_view() -> gfx::View {
                 // must not say "Updated just now" over stale Claude rows
                 fetched = Some(fetched.map_or(s.fetched_unix, |f| f.min(s.fetched_unix)));
                 if err.is_some() {
-                    notes.push(format!("{title}: {}", err.as_deref().map(err_head).unwrap_or_default()));
+                    notes.push(format!(
+                        "{title}: {}",
+                        err.as_deref().map(err_head).unwrap_or_default()
+                    ));
                 }
                 sections.push(section(title, s));
             }
             (None, Some(msg)) => sections.push(gfx::Section {
                 title,
                 plan: String::new(),
-                body: gfx::SectionBody::Note(msg.lines().next().unwrap_or("Can't load usage").to_string()),
+                body: gfx::SectionBody::Note(
+                    msg.lines().next().unwrap_or("Can't load usage").to_string(),
+                ),
             }),
             (None, None) => sections.push(gfx::Section {
                 title,
@@ -859,7 +1076,11 @@ fn current_view() -> gfx::View {
     gfx::View::Data(gfx::FlyoutData {
         sections,
         fetched_unix: fetched,
-        note: if notes.is_empty() { None } else { Some(notes.join(" · ")) },
+        note: if notes.is_empty() {
+            None
+        } else {
+            Some(notes.join(" · "))
+        },
     })
 }
 
@@ -890,6 +1111,10 @@ unsafe fn toggle_flyout(x: i32, y: i32) {
 }
 
 unsafe fn show_flyout(cx: i32, cy: i32) {
+    if let Some(state) = demo::active() {
+        show_demo_flyout(flyout_hwnd(), state);
+        return;
+    }
     ANCHOR_X.store(cx, Ordering::SeqCst);
     ANCHOR_Y.store(cy, Ordering::SeqCst);
     UI.with(|ui| {
@@ -898,19 +1123,14 @@ unsafe fn show_flyout(cx: i32, cy: i32) {
         ui.fly_focus = -1;
     });
 
-    let stale = |p: Provider| {
-        slot(p)
-            .last_fetch
-            .lock()
-            .unwrap()
-            .map(|t| t.elapsed().as_secs() > 15)
-            .unwrap_or(true)
-    };
-    if stale(Provider::Claude) {
-        spawn_fetch(Provider::Claude);
+    let now = SystemClock.read();
+    let stale =
+        |p: ProviderId| state_policy::flyout_refresh_due(now, *slot(p).last_fetch.lock().unwrap());
+    if stale(ProviderId::Claude) {
+        spawn_fetch(ProviderId::Claude, RefreshTrigger::Flyout);
     }
-    if codex_active() && stale(Provider::Codex) {
-        spawn_fetch(Provider::Codex);
+    if codex_active() && stale(ProviderId::Codex) {
+        spawn_fetch(ProviderId::Codex, RefreshTrigger::Flyout);
     }
 
     let fh = flyout_hwnd();
@@ -949,7 +1169,80 @@ unsafe fn show_flyout(cx: i32, cy: i32) {
     let _ = ShowWindow(fh, SW_SHOW);
     let _ = SetForegroundWindow(fh);
     // relative "Updated…" label tick — lives only while visible
-    SetTimer(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _), TIMER_TICK, 30_000, None);
+    SetTimer(
+        HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _),
+        TIMER_TICK,
+        30_000,
+        None,
+    );
+}
+
+unsafe fn show_demo_flyout(fh: HWND, state: &demo::State) {
+    UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        ui.fly_hover = gfx::FlyHover::None;
+        ui.fly_focus = -1;
+    });
+
+    let monitor = MonitorFromWindow(fh, MONITOR_DEFAULTTONEAREST);
+    let mut dpi_x = 96;
+    let mut dpi_y = 96;
+    let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+    let dpi = dpi_x as f32;
+    let scale = dpi / 96.0;
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let _ = GetMonitorInfoW(monitor, &mut info);
+    let width = (gfx::FLYOUT_W * scale).round() as i32;
+    let height = (gfx::flyout_height(&state.view) * scale).round() as i32;
+    let x = info.rcWork.left + (info.rcWork.right - info.rcWork.left - width) / 2;
+    let y = info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - height) / 2;
+
+    let _ = SetWindowPos(fh, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
+    render_demo_flyout(fh, state, width as u32, height as u32, dpi);
+    let _ = ShowWindow(fh, SW_SHOW);
+    let _ = SetForegroundWindow(fh);
+}
+
+unsafe fn signal_demo_ready(state: &demo::State) {
+    let Some(name) = state.ready_event.as_deref() else {
+        return;
+    };
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(wide.as_ptr())) {
+        let _ = SetEvent(event);
+        let _ = CloseHandle(event);
+    }
+}
+
+unsafe fn render_demo_flyout(fh: HWND, state: &demo::State, width: u32, height: u32, dpi: f32) {
+    UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        if ui.fly.is_none() {
+            ui.fly = gfx::Surface::new(fh).ok();
+        }
+        ui.fly_vibe_top = gfx::vibe_row(&state.view).top;
+        let hover = ui.fly_hover;
+        let focus = ui.fly_focus;
+        if let Some(surface) = ui.fly.as_mut() {
+            let _ = surface.render_flyout(
+                width,
+                height,
+                dpi,
+                &state.view,
+                true,
+                (96, 159, 255),
+                hover,
+                focus,
+                state.fetching,
+                false,
+                false,
+                "Off · demo mode makes no system changes",
+            );
+        }
+    });
 }
 
 unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f32) {
@@ -967,8 +1260,18 @@ unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f
         let focus = ui.fly_focus;
         if let Some(fx) = ui.fly.as_mut() {
             let _ = fx.render_flyout(
-                w_px, h_px, dpi, view, dark, accent, hover, focus, fetching,
-                updater::has_update(), vibe_on,
+                w_px,
+                h_px,
+                dpi,
+                view,
+                dark,
+                accent,
+                hover,
+                focus,
+                fetching,
+                updater::has_update(),
+                vibe_on,
+                vibecode::flyout_caption(),
             );
         }
     });
@@ -983,6 +1286,16 @@ unsafe fn render_flyout_current() {
     let mut rc = RECT::default();
     let _ = GetClientRect(fh, &mut rc);
     let dpi = GetDpiForWindow(fh) as f32;
+    if let Some(state) = demo::active() {
+        render_demo_flyout(
+            fh,
+            state,
+            (rc.right - rc.left) as u32,
+            (rc.bottom - rc.top) as u32,
+            dpi,
+        );
+        return;
+    }
     let view = current_view();
     render_flyout(
         fh,
@@ -996,6 +1309,9 @@ unsafe fn render_flyout_current() {
 // ---------- settings window ----------
 
 unsafe fn open_settings() {
+    if demo::is_active() {
+        return;
+    }
     UI.with(|ui| ui.borrow_mut().set_focus = -1);
     if auth::snapshot().connection.is_none() {
         spawn_claude_account(false);
@@ -1022,7 +1338,12 @@ unsafe fn open_settings() {
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     let client_w = (gfx::SET_W * scale).round() as i32;
     let client_h = (gfx::settings_height() * scale).round() as i32;
-    let mut rc = RECT { left: 0, top: 0, right: client_w, bottom: client_h };
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: client_w,
+        bottom: client_h,
+    };
     let _ = AdjustWindowRectExForDpi(&mut rc, style, false, WS_EX_NOREDIRECTIONBITMAP, dpix);
     let w = rc.right - rc.left;
     let h = rc.bottom - rc.top;
@@ -1040,8 +1361,14 @@ unsafe fn open_settings() {
         w!("Claudometer.Settings"),
         w!("Claudometer"),
         style,
-        x, y, w, h,
-        None, None, hinst, None,
+        x,
+        y,
+        w,
+        h,
+        None,
+        None,
+        hinst,
+        None,
     ) else {
         return;
     };
@@ -1092,24 +1419,62 @@ unsafe fn render_settings(hwnd: HWND) {
         if ui.set.is_none() {
             ui.set = gfx::Surface::new(hwnd).ok();
         }
-        let (about, about_btn) = match updater::status() {
-            updater::Status::UpToDate => {
-                (concat!("Claudometer ", env!("CARGO_PKG_VERSION")).to_string(), "GitHub")
-            }
+        let (mut about, about_btn) = match updater::status() {
+            updater::Status::UpToDate => (
+                concat!("Claudometer ", env!("CARGO_PKG_VERSION")).to_string(),
+                "GitHub",
+            ),
             updater::Status::Available(r) => (format!("Update {} available", r.tag), "Install"),
             updater::Status::Installing => ("Installing update…".to_string(), "…"),
             updater::Status::Failed(msg, _) => (format!("Update failed — {msg}"), "GitHub"),
+        };
+        if let Some(diagnostic) = config::diagnostic()
+            .or_else(runtime_state::diagnostic)
+            .or_else(vibecode::diagnostic)
+        {
+            about = diagnostic;
+        }
+        let (lid_label, lid_caption, lid_action) = match vibecode::persistent_status() {
+            vibecode::PersistentStatus::LegacyRecoveryPending => (
+                "Advanced · restore legacy lid values",
+                "Applies saved AC/DC values to this scheme",
+                Some("Restore"),
+            ),
+            vibecode::PersistentStatus::RecoveryRequired => (
+                "Advanced · lid recovery required",
+                "New overrides blocked until recovery succeeds",
+                Some("Recover"),
+            ),
+            vibecode::PersistentStatus::Error => (
+                "Advanced · lid override unavailable",
+                "No persistent change is reported active",
+                Some(if vibecode::persistent_preference_enabled() {
+                    "Disable"
+                } else {
+                    "Retry"
+                }),
+            ),
+            vibecode::PersistentStatus::Applied => (
+                "Advanced · ignore lid close",
+                "Applied and verified · restores on exit",
+                None,
+            ),
+            vibecode::PersistentStatus::Disabled => (
+                "Advanced · ignore lid close",
+                "Changes active power scheme · journaled",
+                None,
+            ),
         };
         let account = auth::snapshot();
         let (account_caption, account_action, account_connected) = if account.busy {
             ("Finish sign-in in the console".to_string(), "Cancel", false)
         } else {
             match account.connection {
-                Some(auth::ClaudeConnection::Connected { email, plan }) => {
+                Some(auth::ClaudeConnection::Connected { plan }) => {
                     let caption = if plan.is_empty() {
-                        email
+                        "Connected account".to_string()
                     } else {
-                        format!("{email} · {plan}")
+                        format!("Connected account · {plan}")
                     };
                     (caption, "Reconnect", true)
                 }
@@ -1129,8 +1494,12 @@ unsafe fn render_settings(hwnd: HWND) {
             account_connected,
             caps_on: util::caps_led_enabled(),
             autostart: util::autostart_enabled(),
-            codex_on: util::show_codex(),
-            alerts_on: util::alerts_enabled(),
+            codex_on: config::settings().codex_enabled,
+            alerts_on: config::settings().alerts_enabled,
+            lid_label: lid_label.to_string(),
+            lid_caption: lid_caption.to_string(),
+            lid_on: vibecode::persistent_status() == vibecode::PersistentStatus::Applied,
+            lid_action,
             about,
             about_btn,
             update_ready: updater::has_update(),
@@ -1152,6 +1521,9 @@ unsafe fn render_settings(hwnd: HWND) {
 }
 
 fn spawn_claude_account(login: bool) {
+    if demo::is_active() {
+        return;
+    }
     if !auth::begin_interactive() {
         return;
     }
@@ -1165,7 +1537,12 @@ fn spawn_claude_account(login: bool) {
         auth::finish_interactive(connection);
         if h != 0 {
             unsafe {
-                let _ = PostMessageW(HWND(h as *mut _), WM_AUTH_READY, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(
+                    HWND(h as *mut _),
+                    WM_AUTH_READY,
+                    WPARAM(usize::from(login)),
+                    LPARAM(0),
+                );
             }
         }
     });
@@ -1213,6 +1590,10 @@ pub(crate) fn tray_balloon(title: &str, msg: &str) {
 }
 
 unsafe fn add_tray_icon(owner: HWND) {
+    if let Some(state) = demo::active() {
+        add_demo_tray_icon(owner, state);
+        return;
+    }
     let dark = util::is_dark_theme();
     let icon = trayicon::build(&trayicon::Style::Loading, dark).unwrap_or_default();
     let mut nid = base_nid(owner);
@@ -1225,12 +1606,37 @@ unsafe fn add_tray_icon(owner: HWND) {
     swap_prev_icon(icon);
 }
 
+unsafe fn add_demo_tray_icon(owner: HWND, state: &demo::State) {
+    let style = if let Some(frac) = state.tray_percent {
+        trayicon::Style::Ring {
+            frac,
+            rgb: (96, 159, 255),
+        }
+    } else if matches!(&state.view, gfx::View::Error(_)) {
+        trayicon::Style::Alert
+    } else {
+        trayicon::Style::Loading
+    };
+    let icon = trayicon::build(&style, true).unwrap_or_default();
+    let mut notification = base_nid(owner);
+    notification.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    notification.uCallbackMessage = WM_TRAY;
+    notification.hIcon = icon;
+    set_tip(&mut notification, state.tray_tip);
+    let _ = Shell_NotifyIconW(NIM_ADD, &notification);
+    let _ = Shell_NotifyIconW(NIM_SETVERSION, &notification);
+    swap_prev_icon(icon);
+}
+
 unsafe fn update_tray(owner: HWND) {
+    if demo::is_active() {
+        return;
+    }
     let dark = util::is_dark_theme();
     let accent = util::accent_rgb();
 
     // ring + first tooltip line stay Claude's (stale data beats an error icon)
-    let (c_snap, c_err) = effective(Provider::Claude);
+    let (c_snap, c_err) = effective(ProviderId::Claude);
     let (style, mut tip) = match (&c_snap, &c_err) {
         (Some(s), _) => {
             let session = s.rows.iter().find(|r| r.kind == "session");
@@ -1257,11 +1663,14 @@ unsafe fn update_tray(owner: HWND) {
             trayicon::Style::Alert,
             format!("Claude — {}", msg.replace('\n', " ")),
         ),
-        (None, None) => (trayicon::Style::Loading, "Claude — loading usage…".to_string()),
+        (None, None) => (
+            trayicon::Style::Loading,
+            "Claude — loading usage…".to_string(),
+        ),
     };
 
     if codex_active() {
-        match effective(Provider::Codex) {
+        match effective(ProviderId::Codex) {
             (Some(s), _) => {
                 let mut line = "Codex".to_string();
                 if let Some(row) = s.rows.iter().find(|r| r.kind == "session") {
@@ -1303,12 +1712,20 @@ unsafe fn remove_tray(owner: HWND) {
 // ---------- menu ----------
 
 unsafe fn show_menu(owner: HWND, x: i32, y: i32) {
+    if demo::is_active() {
+        return;
+    }
     let Ok(menu) = CreatePopupMenu() else { return };
     let _ = AppendMenuW(menu, MF_STRING, IDM_REFRESH, w!("Refresh now"));
     let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS, w!("Settings…"));
     let auto = util::autostart_enabled();
     let check = if auto { MF_CHECKED } else { MF_UNCHECKED };
-    let _ = AppendMenuW(menu, MF_STRING | check, IDM_AUTOSTART, w!("Start with Windows"));
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING | check,
+        IDM_AUTOSTART,
+        w!("Start with Windows"),
+    );
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, IDM_QUIT, w!("Quit Claudometer"));
 
@@ -1324,7 +1741,7 @@ unsafe fn show_menu(owner: HWND, x: i32, y: i32) {
     let _ = DestroyMenu(menu);
 
     match cmd.0 as usize {
-        IDM_REFRESH => spawn_fetch_all(),
+        IDM_REFRESH => spawn_fetch_all(RefreshTrigger::Manual),
         IDM_SETTINGS => open_settings(),
         IDM_AUTOSTART => util::set_autostart(!auto),
         IDM_QUIT => {
@@ -1339,85 +1756,576 @@ unsafe fn show_menu(owner: HWND, x: i32, y: i32) {
 /// After every fetch: hand *fresh* snapshots to the alert engine. Stale
 /// (error-preserved) data must never alert — only a just-succeeded fetch.
 fn run_alert_checks() {
-    let fresh = |p: Provider| match &*slot(p).state.lock().unwrap() {
-        Some(api::FetchOutcome::Ok(s)) => Some(s.clone()),
-        _ => None,
-    };
-    if let Some(s) = fresh(Provider::Claude) {
-        alerts::check("Claude", &s);
+    let fresh = |p: ProviderId| alert_candidate(slot(p));
+    if let Some((account, snapshot)) = fresh(ProviderId::Claude) {
+        alerts::check(ProviderId::Claude, &account, &snapshot);
     }
     if codex_active() {
-        if let Some(s) = fresh(Provider::Codex) {
-            alerts::check("Codex", &s);
+        if let Some((account, snapshot)) = fresh(ProviderId::Codex) {
+            alerts::check(ProviderId::Codex, &account, &snapshot);
         }
+    }
+}
+
+fn alert_candidate(s: &Slot) -> Option<(AccountContext, api::UsageSnapshot)> {
+    let identity = s.identity.lock().unwrap();
+    match &*s.state.lock().unwrap() {
+        Some(completion)
+            if completion.generation == identity.generation
+                && identity
+                    .account
+                    .as_ref()
+                    .is_some_and(|account| account.key == completion.account) =>
+        {
+            match &completion.payload {
+                api::FetchOutcome::Ok(snapshot) => {
+                    Some((identity.account.as_ref()?.clone(), snapshot.clone()))
+                }
+                api::FetchOutcome::Err { .. } => None,
+            }
+        }
+        Some(_) | None => None,
     }
 }
 
 // ---------- fetch ----------
 
-/// Refresh every live provider (Claude always, Codex when active). Manual and
-/// periodic requests obey the same debounce and API-mandated cooldown.
-fn spawn_fetch_all() {
-    spawn_fetch(Provider::Claude);
-    if codex_active() {
-        spawn_fetch(Provider::Codex);
+enum PreparedFetch {
+    Claude(api::PreparedRequest),
+    Codex(codex::PreparedRequest),
+}
+
+impl PreparedFetch {
+    fn account(&self) -> &AccountContext {
+        match self {
+            Self::Claude(request) => request.account(),
+            Self::Codex(request) => request.account(),
+        }
+    }
+
+    fn execute(self) -> api::FetchOutcome {
+        match self {
+            Self::Claude(request) => api::fetch(request),
+            Self::Codex(request) => codex::fetch(request),
+        }
     }
 }
 
-fn spawn_fetch(p: Provider) {
-    let s = slot(p);
-    if let Some(until) = *s.cooldown_until.lock().unwrap() {
-        if Instant::now() < until {
-            return;
-        }
+fn prepare_fetch(
+    provider: ProviderId,
+) -> std::result::Result<PreparedFetch, api::PreparationFailure> {
+    match provider {
+        ProviderId::Claude => api::prepare().map(PreparedFetch::Claude),
+        ProviderId::Codex => codex::prepare().map(PreparedFetch::Codex),
     }
-    // debounce: manual refresh spam turns into API 429s
-    if let Some(t) = *s.last_fetch.lock().unwrap() {
-        if t.elapsed().as_secs() < 3 {
-            return;
-        }
+}
+
+/// Refresh every live provider (Claude always, Codex when active). Manual and
+/// periodic requests obey the same debounce and API-mandated cooldown.
+fn spawn_fetch_all(trigger: RefreshTrigger) {
+    spawn_fetch(ProviderId::Claude, trigger);
+    if config::settings().codex_enabled {
+        spawn_fetch(ProviderId::Codex, trigger);
+    }
+}
+
+fn spawn_fetch(p: ProviderId, trigger: RefreshTrigger) {
+    if demo::is_active() {
+        return;
+    }
+    let s = slot(p);
+    let gate = state_policy::refresh_gate(
+        trigger,
+        SystemClock.read(),
+        *s.cooldown_until.lock().unwrap(),
+        *s.last_fetch.lock().unwrap(),
+        s.fetching.load(Ordering::SeqCst),
+    );
+    if gate != RefreshGate::Ready {
+        return;
     }
     if s.fetching.swap(true, Ordering::SeqCst) {
         return;
     }
+    let request_id = reserve_request(s);
     std::thread::spawn(move || {
-        let fetch_once = || match p {
-            Provider::Claude => api::fetch(),
-            Provider::Codex => codex::fetch(),
+        let prepared = match prepare_fetch(p) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                let accepted =
+                    record_preparation_failure(slot(p), p, request_id, failure, SystemClock.read());
+                if accepted {
+                    post_data_ready();
+                }
+                return;
+            }
         };
-        let out = fetch_once();
+        let account = prepared.account().clone();
         let s = slot(p);
-        match &out {
-            api::FetchOutcome::Ok(snap) => {
-                *s.last_good.lock().unwrap() = Some(snap.clone());
-                *s.cooldown_until.lock().unwrap() = None;
-                s.rl_streak.store(0, Ordering::SeqCst);
-            }
-            api::FetchOutcome::Err {
-                rate_limited: true,
-                retry_after,
-                ..
-            } => {
-                let n = s.rl_streak.fetch_add(1, Ordering::SeqCst) + 1;
-                // Never fast-retry a 429. Retry-After: 0 is still a rate-limit
-                // signal, so give the shared endpoint at least a minute. With no
-                // useful server hint, back off 60s → 120s → … → 600s.
-                let secs = retry_after
-                    .map(|seconds| seconds.clamp(60, 900))
-                    .unwrap_or_else(|| (60u64 << (n - 1).min(4)).min(600));
-                *s.cooldown_until.lock().unwrap() =
-                    Some(Instant::now() + std::time::Duration::from_secs(secs));
-            }
-            api::FetchOutcome::Err { .. } => {}
-        }
-        *s.state.lock().unwrap() = Some(out);
-        *s.last_fetch.lock().unwrap() = Some(Instant::now());
-        s.fetching.store(false, Ordering::SeqCst);
-        let h = MAIN_HWND.load(Ordering::SeqCst);
-        if h != 0 {
-            unsafe {
-                let _ = PostMessageW(HWND(h as *mut _), WM_DATA_READY, WPARAM(0), LPARAM(0));
-            }
+        let Some(generation) = begin_request(s, p, request_id, account.clone()) else {
+            return;
+        };
+        let completion = FetchCompletion {
+            provider: p,
+            generation,
+            request_id,
+            account: account.key,
+            payload: prepared.execute(),
+        };
+        if record_fetch_completion(s, p, completion, SystemClock.read()) {
+            post_data_ready();
         }
     });
+}
+
+fn post_data_ready() {
+    let handle = MAIN_HWND.load(Ordering::SeqCst);
+    if handle != 0 {
+        unsafe {
+            let _ = PostMessageW(HWND(handle as *mut _), WM_DATA_READY, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+fn reserve_request(s: &Slot) -> RequestId {
+    let mut identity = s.identity.lock().unwrap();
+    let request_id = RequestId(identity.next_request_id);
+    identity.next_request_id = identity.next_request_id.wrapping_add(1).max(1);
+    identity.pending_request_id = Some(request_id);
+    request_id
+}
+
+fn begin_request(
+    s: &Slot,
+    provider: ProviderId,
+    request_id: RequestId,
+    account: AccountContext,
+) -> Option<Generation> {
+    let mut identity = s.identity.lock().unwrap();
+    if identity.pending_request_id != Some(request_id) {
+        return None;
+    }
+    let changed = identity
+        .account
+        .as_ref()
+        .is_none_or(|current| current.key != account.key);
+    if changed {
+        identity.generation = Generation(identity.generation.0.wrapping_add(1));
+        clear_account_bound_state(s);
+    }
+    identity.account = Some(account.clone());
+    let generation = identity.generation;
+    drop(identity);
+    if changed {
+        alerts::account_changed(provider, Some(&account));
+    }
+    Some(generation)
+}
+
+fn invalidate_account(s: &Slot, provider: ProviderId) {
+    let mut identity = s.identity.lock().unwrap();
+    identity.generation = Generation(identity.generation.0.wrapping_add(1));
+    identity.account = None;
+    identity.pending_request_id = None;
+    clear_account_bound_state(s);
+    s.fetching.store(false, Ordering::SeqCst);
+    drop(identity);
+    alerts::account_changed(provider, None);
+}
+
+fn clear_account_bound_state(s: &Slot) {
+    *s.state.lock().unwrap() = None;
+    *s.last_good.lock().unwrap() = None;
+    *s.preparation_error.lock().unwrap() = None;
+    *s.last_fetch.lock().unwrap() = None;
+    *s.cooldown_until.lock().unwrap() = None;
+    s.rl_streak.store(0, Ordering::SeqCst);
+}
+
+fn record_preparation_failure(
+    s: &Slot,
+    provider: ProviderId,
+    request_id: RequestId,
+    failure: api::PreparationFailure,
+    completed_at: ClockReading,
+) -> bool {
+    let mut identity = s.identity.lock().unwrap();
+    if identity.pending_request_id != Some(request_id) {
+        return false;
+    }
+    let invalidated = failure.invalidates_account();
+    if invalidated {
+        identity.generation = Generation(identity.generation.0.wrapping_add(1));
+        identity.account = None;
+        clear_account_bound_state(s);
+    }
+    identity.pending_request_id = None;
+    *s.preparation_error.lock().unwrap() = Some(failure.message.to_string());
+    *s.last_fetch.lock().unwrap() = Some(completed_at.monotonic);
+    s.fetching.store(false, Ordering::SeqCst);
+    drop(identity);
+    if invalidated {
+        alerts::account_changed(provider, None);
+    }
+    true
+}
+
+fn record_fetch_completion(
+    s: &Slot,
+    expected_provider: ProviderId,
+    completion: FetchCompletion<api::FetchOutcome>,
+    completed_at: ClockReading,
+) -> bool {
+    let mut identity = s.identity.lock().unwrap();
+    let matches = completion.provider == expected_provider
+        && identity.pending_request_id == Some(completion.request_id)
+        && identity.generation == completion.generation
+        && identity
+            .account
+            .as_ref()
+            .is_some_and(|account| account.key == completion.account);
+    if !matches {
+        return false;
+    }
+    identity.pending_request_id = None;
+
+    match &completion.payload {
+        api::FetchOutcome::Ok(snapshot) => {
+            *s.last_good.lock().unwrap() = Some(AccountSnapshot {
+                account: completion.account.clone(),
+                snapshot: snapshot.clone(),
+            });
+            *s.cooldown_until.lock().unwrap() = None;
+            let streak = state_policy::next_rate_limit_streak(
+                s.rl_streak.load(Ordering::SeqCst),
+                state_policy::CompletionKind::Success,
+            );
+            s.rl_streak.store(streak, Ordering::SeqCst);
+        }
+        api::FetchOutcome::Err {
+            rate_limited: true,
+            retry_after,
+            ..
+        } => {
+            let current = s.rl_streak.load(Ordering::SeqCst);
+            let consecutive = state_policy::next_rate_limit_streak(
+                current,
+                state_policy::CompletionKind::RateLimited,
+            );
+            s.rl_streak.store(consecutive, Ordering::SeqCst);
+            let delay = state_policy::rate_limit_delay(*retry_after, consecutive);
+            *s.cooldown_until.lock().unwrap() = Some(completed_at.monotonic + delay);
+        }
+        api::FetchOutcome::Err { .. } => {
+            let streak = state_policy::next_rate_limit_streak(
+                s.rl_streak.load(Ordering::SeqCst),
+                state_policy::CompletionKind::OtherFailure,
+            );
+            s.rl_streak.store(streak, Ordering::SeqCst);
+        }
+    }
+    *s.preparation_error.lock().unwrap() = None;
+    *s.state.lock().unwrap() = Some(completion);
+    *s.last_fetch.lock().unwrap() = Some(completed_at.monotonic);
+    s.fetching.store(false, Ordering::SeqCst);
+    true
+}
+
+#[cfg(test)]
+mod state_characterization_tests {
+    use super::*;
+    use crate::provider::model::IdentityPersistence;
+
+    fn reading(monotonic: Instant, unix_seconds: i64) -> ClockReading {
+        ClockReading {
+            monotonic,
+            unix_seconds,
+        }
+    }
+
+    fn failure(rate_limited: bool, retry_after: Option<u64>) -> api::FetchOutcome {
+        api::FetchOutcome::Err {
+            msg: "sanitized failure".to_string(),
+            retry_after,
+            rate_limited,
+        }
+    }
+
+    fn account(byte: u8) -> AccountContext {
+        AccountContext {
+            key: AccountKey::from_digest([byte; 32]),
+            persistence: IdentityPersistence::Persistent,
+        }
+    }
+
+    fn start_request(
+        slot: &Slot,
+        account: AccountContext,
+    ) -> (RequestId, Generation, AccountContext) {
+        slot.fetching.store(true, Ordering::SeqCst);
+        let request_id = reserve_request(slot);
+        let generation =
+            begin_request(slot, ProviderId::Claude, request_id, account.clone()).unwrap();
+        (request_id, generation, account)
+    }
+
+    fn completion(
+        provider: ProviderId,
+        request_id: RequestId,
+        generation: Generation,
+        account: &AccountContext,
+        payload: api::FetchOutcome,
+    ) -> FetchCompletion<api::FetchOutcome> {
+        FetchCompletion {
+            provider,
+            generation,
+            request_id,
+            account: account.key.clone(),
+            payload,
+        }
+    }
+
+    fn snapshot(fetched_unix: i64) -> api::UsageSnapshot {
+        api::UsageSnapshot {
+            rows: Vec::new(),
+            plan: String::new(),
+            fetched_unix,
+        }
+    }
+
+    #[test]
+    fn provider_completion_state_is_isolated() {
+        let slots = [Slot::new(), Slot::new()];
+        let now = Instant::now();
+        let (request_id, generation, current) = start_request(&slots[0], account(1));
+        assert!(record_fetch_completion(
+            &slots[0],
+            ProviderId::Claude,
+            completion(
+                ProviderId::Claude,
+                request_id,
+                generation,
+                &current,
+                failure(true, Some(120)),
+            ),
+            reading(now, 10_000),
+        ));
+
+        assert_eq!(slots[0].rl_streak.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *slots[0].cooldown_until.lock().unwrap(),
+            Some(now + std::time::Duration::from_secs(120))
+        );
+        assert!(slots[0].state.lock().unwrap().is_some());
+
+        assert_eq!(slots[1].rl_streak.load(Ordering::SeqCst), 0);
+        assert_eq!(*slots[1].cooldown_until.lock().unwrap(), None);
+        assert!(slots[1].state.lock().unwrap().is_none());
+        assert!(slots[1].last_fetch.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_data_expires_at_the_characterized_boundary() {
+        let slot = Slot::new();
+        let (request_id, generation, current) = start_request(&slot, account(1));
+        *slot.last_good.lock().unwrap() = Some(AccountSnapshot {
+            account: current.key.clone(),
+            snapshot: snapshot(9_401),
+        });
+        *slot.state.lock().unwrap() = Some(completion(
+            ProviderId::Claude,
+            request_id,
+            generation,
+            &current,
+            failure(false, None),
+        ));
+        slot.identity.lock().unwrap().pending_request_id = None;
+        slot.fetching.store(false, Ordering::SeqCst);
+
+        let (still_visible, error) = effective_at(&slot, reading(Instant::now(), 10_000));
+        assert!(still_visible.is_some());
+        assert_eq!(error.as_deref(), Some("sanitized failure"));
+
+        let (expired, error) = effective_at(&slot, reading(Instant::now(), 10_001));
+        assert!(expired.is_none());
+        assert_eq!(error.as_deref(), Some("sanitized failure"));
+    }
+
+    #[test]
+    fn stored_success_is_currently_an_alert_candidate_on_later_data_ready() {
+        let slot = Slot::new();
+        let (request_id, generation, current) = start_request(&slot, account(1));
+        assert!(record_fetch_completion(
+            &slot,
+            ProviderId::Claude,
+            completion(
+                ProviderId::Claude,
+                request_id,
+                generation,
+                &current,
+                api::FetchOutcome::Ok(snapshot(123)),
+            ),
+            reading(Instant::now(), 123),
+        ));
+
+        assert_eq!(alert_candidate(&slot).unwrap().1.fetched_unix, 123);
+        assert_eq!(alert_candidate(&slot).unwrap().1.fetched_unix, 123);
+    }
+
+    #[test]
+    fn account_change_clears_all_bound_state_before_replacement_fetch() {
+        let slot = Slot::new();
+        let now = Instant::now();
+        let (request_a, generation_a, account_a) = start_request(&slot, account(1));
+        assert!(record_fetch_completion(
+            &slot,
+            ProviderId::Claude,
+            completion(
+                ProviderId::Claude,
+                request_a,
+                generation_a,
+                &account_a,
+                api::FetchOutcome::Ok(snapshot(100)),
+            ),
+            reading(now, 100),
+        ));
+        *slot.cooldown_until.lock().unwrap() = Some(now + std::time::Duration::from_secs(60));
+        slot.rl_streak.store(2, Ordering::SeqCst);
+
+        let (_, generation_b, account_b) = start_request(&slot, account(2));
+        assert_ne!(generation_b, generation_a);
+        assert!(account_b.key != account_a.key);
+        assert!(slot.state.lock().unwrap().is_none());
+        assert!(slot.last_good.lock().unwrap().is_none());
+        assert!(slot.cooldown_until.lock().unwrap().is_none());
+        assert!(slot.last_fetch.lock().unwrap().is_none());
+        assert_eq!(slot.rl_streak.load(Ordering::SeqCst), 0);
+        assert!(effective_at(&slot, reading(now, 101)).0.is_none());
+    }
+
+    #[test]
+    fn obsolete_completion_cannot_touch_new_account_state_or_fetch_flag() {
+        let slot = Slot::new();
+        let now = Instant::now();
+        let (old_request, old_generation, old_account) = start_request(&slot, account(1));
+        invalidate_account(&slot, ProviderId::Claude);
+        let (new_request, new_generation, new_account) = start_request(&slot, account(2));
+
+        assert!(!record_fetch_completion(
+            &slot,
+            ProviderId::Claude,
+            completion(
+                ProviderId::Claude,
+                old_request,
+                old_generation,
+                &old_account,
+                failure(true, Some(900)),
+            ),
+            reading(now, 100),
+        ));
+        assert!(slot.state.lock().unwrap().is_none());
+        assert!(slot.cooldown_until.lock().unwrap().is_none());
+        assert_eq!(slot.rl_streak.load(Ordering::SeqCst), 0);
+        assert!(slot.fetching.load(Ordering::SeqCst));
+        assert_eq!(
+            slot.identity.lock().unwrap().pending_request_id,
+            Some(new_request)
+        );
+        assert_eq!(slot.identity.lock().unwrap().generation, new_generation);
+        assert!(slot
+            .identity
+            .lock()
+            .unwrap()
+            .account
+            .as_ref()
+            .is_some_and(|current| current.key == new_account.key));
+    }
+
+    #[test]
+    fn failed_first_fetch_after_switch_cannot_restore_previous_snapshot_or_plan() {
+        let slot = Slot::new();
+        let now = Instant::now();
+        let (request_a, generation_a, account_a) = start_request(&slot, account(1));
+        let mut old = snapshot(100);
+        old.plan = "Old plan".to_string();
+        assert!(record_fetch_completion(
+            &slot,
+            ProviderId::Claude,
+            completion(
+                ProviderId::Claude,
+                request_a,
+                generation_a,
+                &account_a,
+                api::FetchOutcome::Ok(old),
+            ),
+            reading(now, 100),
+        ));
+
+        let (request_b, generation_b, account_b) = start_request(&slot, account(2));
+        assert!(record_fetch_completion(
+            &slot,
+            ProviderId::Claude,
+            completion(
+                ProviderId::Claude,
+                request_b,
+                generation_b,
+                &account_b,
+                failure(false, None),
+            ),
+            reading(now, 101),
+        ));
+        let (visible, error) = effective_at(&slot, reading(now, 101));
+        assert!(visible.is_none());
+        assert_eq!(error.as_deref(), Some("sanitized failure"));
+        assert!(alert_candidate(&slot).is_none());
+    }
+
+    #[test]
+    fn invalidating_preparation_failure_clears_account_but_transient_failure_does_not() {
+        let slot = Slot::new();
+        let now = Instant::now();
+        let (request, generation, current) = start_request(&slot, account(1));
+        assert!(record_fetch_completion(
+            &slot,
+            ProviderId::Claude,
+            completion(
+                ProviderId::Claude,
+                request,
+                generation,
+                &current,
+                api::FetchOutcome::Ok(snapshot(100)),
+            ),
+            reading(now, 100),
+        ));
+
+        slot.fetching.store(true, Ordering::SeqCst);
+        let transient_request = reserve_request(&slot);
+        assert!(record_preparation_failure(
+            &slot,
+            ProviderId::Claude,
+            transient_request,
+            api::PreparationFailure {
+                kind: api::PreparationFailureKind::TemporarilyUnreadable,
+                message: "temporary",
+            },
+            reading(now, 101),
+        ));
+        assert!(slot.identity.lock().unwrap().account.is_some());
+        assert!(effective_at(&slot, reading(now, 101)).0.is_some());
+
+        slot.fetching.store(true, Ordering::SeqCst);
+        let missing_request = reserve_request(&slot);
+        assert!(record_preparation_failure(
+            &slot,
+            ProviderId::Claude,
+            missing_request,
+            api::PreparationFailure {
+                kind: api::PreparationFailureKind::Missing,
+                message: "missing",
+            },
+            reading(now, 102),
+        ));
+        assert!(slot.identity.lock().unwrap().account.is_none());
+        assert!(effective_at(&slot, reading(now, 102)).0.is_none());
+    }
 }

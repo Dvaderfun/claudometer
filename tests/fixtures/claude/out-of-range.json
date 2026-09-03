@@ -1,0 +1,12 @@
+{
+  "limits": [
+    {
+      "kind": "session",
+      "percent": -4
+    },
+    {
+      "kind": "weekly_all",
+      "percent": 140
+    }
+  ]
+}

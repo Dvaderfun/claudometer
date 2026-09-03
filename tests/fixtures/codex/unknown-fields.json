@@ -1,0 +1,12 @@
+{
+  "future_top_level": "ignored",
+  "rate_limit": {
+    "primary_window": {
+      "used_percent": 9,
+      "limit_window_seconds": 18000,
+      "future_window_field": {
+        "ignored": true
+      }
+    }
+  }
+}

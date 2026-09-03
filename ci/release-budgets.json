@@ -1,0 +1,15 @@
+{
+  "hard_ceiling_bytes": 1310720,
+  "regression_tolerance_percent": 10,
+  "reference_release_x64_bytes": 815104,
+  "targets": {
+    "x86_64-pc-windows-msvc": {
+      "baseline_bytes": 941056,
+      "baseline_slice": "PR 9 / AUTH-01..03"
+    },
+    "aarch64-pc-windows-msvc": {
+      "baseline_bytes": 889344,
+      "baseline_slice": "PR 9 / AUTH-01..03"
+    }
+  }
+}

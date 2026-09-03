@@ -13,7 +13,6 @@
 //! Balloon fallback (main.rs) only when the WinRT path errors out.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
@@ -29,7 +28,11 @@ use windows::UI::Notifications::{
 };
 
 use crate::api::{LimitRow, UsageSnapshot};
-use crate::util;
+use crate::provider::model::{
+    AccountContext, AccountKey, IdentityPersistence, LimitId, ProviderId,
+};
+use crate::runtime_state::AlertReceiptV1;
+use crate::{config, util};
 
 /// Fire once per window when a limit row reaches this percent.
 pub const WARN_AT: f64 = 75.0;
@@ -37,8 +40,27 @@ pub const WARN_AT: f64 = 75.0;
 const AUMID: PCWSTR = w!("Claudometer");
 const AUMID_KEY: PCWSTR = w!("Software\\Classes\\AppUserModelId\\Claudometer");
 
-/// limit key → resets_at epoch already alerted; lazily seeded from settings.json
-static ALERTED: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+struct AlertState {
+    receipts: Vec<AlertReceiptV1>,
+    persistence: [Option<IdentityPersistence>; 2],
+}
+
+impl AlertState {
+    fn load() -> Self {
+        let receipts = crate::runtime_state::alert_receipts();
+        let mut persistence = [None, None];
+        for receipt in &receipts {
+            persistence[receipt.provider.index()] = Some(IdentityPersistence::Persistent);
+        }
+        Self {
+            receipts,
+            persistence,
+        }
+    }
+}
+
+/// Account-scoped receipts, lazily seeded from sanitized state.json.
+static ALERTED: Mutex<Option<AlertState>> = Mutex::new(None);
 
 thread_local! {
     /// The OS routes Activated through the ToastNotification object that was
@@ -82,32 +104,79 @@ fn ensure_icon() -> Option<std::path::PathBuf> {
 
 /// Evaluate a fresh (just-fetched) snapshot; toast every limit row newly
 /// at/over `WARN_AT` for its current window instance. UI thread only.
-pub fn check(provider: &'static str, snap: &UsageSnapshot) {
-    if !util::alerts_enabled() {
+pub fn check(provider: ProviderId, account: &AccountContext, snap: &UsageSnapshot) {
+    if !config::settings().alerts_enabled {
         return;
     }
     let mut guard = ALERTED.lock().unwrap();
-    let seen = guard.get_or_insert_with(util::load_alerted);
+    let state = guard.get_or_insert_with(AlertState::load);
+    state.persistence[provider.index()] = Some(account.persistence);
 
     let crossed: Vec<&LimitRow> = snap
         .rows
         .iter()
         .filter(|r| {
             r.kind != "extra" // pay-as-you-go bucket, not a limit window
-                && should_fire(
-                    seen,
-                    &format!("{provider}.{}.{}", r.kind, r.label),
-                    r.percent,
-                    r.resets_unix.unwrap_or(0),
-                )
+                && LimitId::new(r.kind.clone()).is_some_and(|limit| {
+                    should_fire(
+                        &mut state.receipts,
+                        provider,
+                        &account.key,
+                        limit,
+                        r.percent,
+                        r.resets_unix,
+                    )
+                })
         })
         .collect();
     if crossed.is_empty() {
         return;
     }
-    util::save_alerted(seen);
+    let persistent: Vec<_> = state
+        .receipts
+        .iter()
+        .filter(|receipt| {
+            state.persistence[receipt.provider.index()] == Some(IdentityPersistence::Persistent)
+        })
+        .cloned()
+        .collect();
+    let _ = crate::runtime_state::persist_alert_receipts(&persistent);
+
+    // Downgrade compatibility only. New code never reads this map after the
+    // provider's one-time account-scoped migration marker is set.
+    let mut legacy = config::legacy_alert_receipts();
+    for row in &crossed {
+        legacy.insert(
+            format!("{}.{}.{}", provider_name(provider), row.kind, row.label),
+            row.resets_unix.unwrap_or(0),
+        );
+    }
+    let _ = config::save_legacy_alert_receipts(&legacy);
     drop(guard);
-    notify(provider, &crossed);
+    notify(provider_name(provider), &crossed);
+}
+
+pub fn account_changed(provider: ProviderId, account: Option<&AccountContext>) {
+    let persisted =
+        crate::runtime_state::select_account(provider, account, &config::legacy_alert_receipts());
+    let mut guard = ALERTED.lock().unwrap();
+    let state = guard.get_or_insert_with(AlertState::load);
+    state
+        .receipts
+        .retain(|receipt| receipt.provider != provider);
+    state.receipts.extend(
+        persisted
+            .into_iter()
+            .filter(|receipt| receipt.provider == provider),
+    );
+    state.persistence[provider.index()] = account.map(|account| account.persistence);
+}
+
+fn provider_name(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::Claude => "Claude",
+        ProviderId::Codex => "Codex",
+    }
 }
 
 /// The API's `resets_at` for an in-flight window drifts by a minute or two
@@ -120,16 +189,45 @@ const EPOCH_SLOP: i64 = 30 * 60;
 /// Pure dedup decision: fire when over threshold AND this window instance
 /// (identified by its resets_at epoch, drift-tolerant) hasn't fired before.
 /// Marks on fire.
-fn should_fire(seen: &mut HashMap<String, i64>, key: &str, pct: f64, epoch: i64) -> bool {
+fn should_fire(
+    receipts: &mut Vec<AlertReceiptV1>,
+    provider: ProviderId,
+    account: &AccountKey,
+    limit: LimitId,
+    pct: f64,
+    reset_instance_unix: Option<i64>,
+) -> bool {
     if pct < WARN_AT {
         return false;
     }
-    if let Some(prev) = seen.get(key) {
-        if (epoch - prev).abs() <= EPOCH_SLOP {
-            return false;
-        }
+    let same_limit = |receipt: &AlertReceiptV1| {
+        receipt.provider == provider
+            && &receipt.account == account
+            && receipt.limit == limit
+            && receipt.threshold_percent == WARN_AT as u8
+    };
+    if receipts
+        .iter()
+        .filter(|receipt| same_limit(receipt))
+        .any(
+            |receipt| match (receipt.reset_instance_unix, reset_instance_unix) {
+                (Some(previous), Some(current)) => (current - previous).abs() <= EPOCH_SLOP,
+                (None, None) => true,
+                _ => false,
+            },
+        )
+    {
+        return false;
     }
-    seen.insert(key.to_string(), epoch);
+    receipts.retain(|receipt| !same_limit(receipt));
+    receipts.push(AlertReceiptV1 {
+        provider,
+        account: account.clone(),
+        limit,
+        threshold_percent: WARN_AT as u8,
+        reset_instance_unix,
+        below_threshold_observed: false,
+    });
     true
 }
 
@@ -175,7 +273,8 @@ fn prettify_reset(s: &str) -> String {
 /// progress bar pinned to the worst limit. Click bounces WM_TOAST_ACTIVATED
 /// to the UI thread, which opens the flyout at the tray icon.
 fn show_toast(title: &str, lines: &[String], bar_label: &str, bar_pct: f64) -> Result<()> {
-    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from("Claudometer"))?;
+    let notifier =
+        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from("Claudometer"))?;
     // The user turned Claudometer off in Windows notification settings —
     // honor that; the balloon fallback must not resurrect the alert.
     if notifier.Setting() == Ok(NotificationSetting::DisabledForApplication)
@@ -185,7 +284,9 @@ fn show_toast(title: &str, lines: &[String], bar_label: &str, bar_pct: f64) -> R
     }
 
     let mut xml = String::with_capacity(512);
-    xml.push_str("<toast activationType=\"foreground\"><visual><binding template=\"ToastGeneric\">");
+    xml.push_str(
+        "<toast activationType=\"foreground\"><visual><binding template=\"ToastGeneric\">",
+    );
     xml.push_str(&format!("<text>{}</text>", esc(title)));
     for l in lines {
         xml.push_str(&format!("<text>{}</text>", esc(l)));
@@ -267,51 +368,188 @@ pub fn show_test() {
 mod tests {
     use super::*;
 
+    fn account(byte: u8) -> AccountKey {
+        AccountKey::from_digest([byte; 32])
+    }
+
+    fn limit(value: &str) -> LimitId {
+        LimitId::new(value).unwrap()
+    }
+
     #[test]
     fn below_threshold_never_fires() {
-        let mut seen = HashMap::new();
-        assert!(!should_fire(&mut seen, "claude.session", 74.9, 100));
+        let mut seen = Vec::new();
+        assert!(!should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account(1),
+            limit("session"),
+            74.9,
+            Some(100),
+        ));
         assert!(seen.is_empty());
     }
 
     #[test]
     fn fires_once_per_window_instance() {
-        let mut seen = HashMap::new();
-        assert!(should_fire(&mut seen, "claude.session", 75.0, 100_000));
+        let mut seen = Vec::new();
+        let account = account(1);
+        assert!(should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("session"),
+            75.0,
+            Some(100_000),
+        ));
         // same window, climbing percent — stays quiet
-        assert!(!should_fire(&mut seen, "claude.session", 82.0, 100_000));
-        assert!(!should_fire(&mut seen, "claude.session", 99.0, 100_000));
+        assert!(!should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("session"),
+            82.0,
+            Some(100_000),
+        ));
+        assert!(!should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("session"),
+            99.0,
+            Some(100_000),
+        ));
         // window rolled over (resets_at jumped 5h) — fires again
-        assert!(should_fire(&mut seen, "claude.session", 76.0, 118_000));
+        assert!(should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("session"),
+            76.0,
+            Some(118_000),
+        ));
     }
 
     #[test]
     fn resets_at_drift_does_not_refire() {
-        let mut seen = HashMap::new();
-        assert!(should_fire(&mut seen, "claude.session", 75.0, 100_000));
+        let mut seen = Vec::new();
+        let account = account(1);
+        assert!(should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("session"),
+            75.0,
+            Some(100_000),
+        ));
         // the observed API behavior: resets_at oscillates by ±60 s per poll
-        assert!(!should_fire(&mut seen, "claude.session", 83.0, 100_060));
-        assert!(!should_fire(&mut seen, "claude.session", 83.0, 99_940));
-        assert!(!should_fire(&mut seen, "claude.session", 91.0, 100_060));
+        for reset in [100_060, 99_940, 100_060] {
+            assert!(!should_fire(
+                &mut seen,
+                ProviderId::Claude,
+                &account,
+                limit("session"),
+                83.0,
+                Some(reset),
+            ));
+        }
         // anti-creep: stored epoch stays first-seen — repeated small drifts
         // in one direction still count as the same window
-        assert!(!should_fire(&mut seen, "claude.session", 92.0, 101_500));
+        assert!(!should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("session"),
+            92.0,
+            Some(101_500),
+        ));
         // a genuine rollover (hours away) fires
-        assert!(should_fire(&mut seen, "claude.session", 76.0, 100_000 + 5 * 3600));
+        assert!(should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("session"),
+            76.0,
+            Some(100_000 + 5 * 3600),
+        ));
     }
 
     #[test]
     fn windows_are_independent() {
-        let mut seen = HashMap::new();
-        assert!(should_fire(&mut seen, "claude.session", 80.0, 100));
-        assert!(should_fire(&mut seen, "claude.weekly_all", 80.0, 500));
-        assert!(should_fire(&mut seen, "codex.session", 80.0, 100));
+        let mut seen = Vec::new();
+        let first = account(1);
+        let second = account(2);
+        assert!(should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &first,
+            limit("session"),
+            80.0,
+            Some(100),
+        ));
+        assert!(should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &first,
+            limit("weekly_all"),
+            80.0,
+            Some(500),
+        ));
+        assert!(should_fire(
+            &mut seen,
+            ProviderId::Codex,
+            &first,
+            limit("session"),
+            80.0,
+            Some(100),
+        ));
+        assert!(should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &second,
+            limit("session"),
+            80.0,
+            Some(100),
+        ));
     }
 
     #[test]
     fn missing_epoch_fires_once() {
-        let mut seen = HashMap::new();
-        assert!(should_fire(&mut seen, "claude.extra", 90.0, 0));
-        assert!(!should_fire(&mut seen, "claude.extra", 95.0, 0));
+        let mut seen = Vec::new();
+        let account = account(1);
+        assert!(should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("other"),
+            90.0,
+            None,
+        ));
+        assert!(!should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("other"),
+            95.0,
+            None,
+        ));
+        assert!(!should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("other"),
+            20.0,
+            None,
+        ));
+        // Current behavior: a below-threshold observation does not re-arm a
+        // missing-reset limit. ALERT-02 deliberately changes this later.
+        assert!(!should_fire(
+            &mut seen,
+            ProviderId::Claude,
+            &account,
+            limit("other"),
+            90.0,
+            None,
+        ));
     }
 }

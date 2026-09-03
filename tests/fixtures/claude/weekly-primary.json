@@ -1,0 +1,9 @@
+{
+  "limits": [
+    {
+      "kind": "weekly_all",
+      "percent": 28,
+      "resets_at": "2026-09-10T00:00:00Z"
+    }
+  ]
+}

@@ -3,9 +3,16 @@
 //! OpenAI rotates refresh tokens, so an external refresh would invalidate the
 //! user's Codex CLI session. Expired = tell user to open Codex.
 
+use std::fs::File;
+
 use serde::Deserialize;
 
-use crate::api::{clamp_percent, fmt_reset_unix, plain, prettify, FetchErr, FetchOutcome, LimitRow, UsageSnapshot};
+use crate::api::{
+    bounded_text, clamp_percent, fmt_reset_unix, plain, prettify, read_bounded,
+    read_json_with_retry, CredentialReadError, FetchErr, FetchOutcome, LimitRow,
+    PreparationFailure, PreparationFailureKind, UsageSnapshot, MAX_LIMIT_ROWS,
+};
+use crate::provider::model::{derive_account_context, AccountContext, ProviderId, SecretString};
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
@@ -18,8 +25,20 @@ struct AuthFile {
 
 #[derive(Deserialize)]
 struct Tokens {
-    access_token: Option<String>,
-    account_id: Option<String>,
+    access_token: Option<SecretString>,
+    account_id: Option<SecretString>,
+}
+
+pub struct PreparedRequest {
+    access_token: SecretString,
+    account_id: SecretString,
+    account: AccountContext,
+}
+
+impl PreparedRequest {
+    pub fn account(&self) -> &AccountContext {
+        &self.account
+    }
 }
 
 fn auth_path() -> Option<std::path::PathBuf> {
@@ -32,20 +51,76 @@ fn auth_path() -> Option<std::path::PathBuf> {
     Some(std::path::Path::new(&home).join(".codex").join("auth.json"))
 }
 
-fn read_tokens() -> Option<(String, String)> {
-    let raw = std::fs::read_to_string(auth_path()?).ok()?;
-    let auth: AuthFile = serde_json::from_str(&raw).ok()?;
-    let t = auth.tokens?;
-    match (t.access_token, t.account_id) {
-        (Some(a), Some(id)) if !a.is_empty() && !id.is_empty() => Some((a, id)),
-        _ => None,
+pub fn prepare() -> Result<PreparedRequest, PreparationFailure> {
+    let path = auth_path().ok_or(PreparationFailure {
+        kind: PreparationFailureKind::Unsupported,
+        message: "Codex config path unavailable.",
+    })?;
+    let auth: AuthFile = match read_json_with_retry(
+        || File::open(&path),
+        || std::thread::sleep(std::time::Duration::from_millis(25)),
+    ) {
+        Ok(auth) => auth,
+        Err(CredentialReadError::Malformed) => {
+            return Err(PreparationFailure {
+                kind: PreparationFailureKind::Malformed,
+                message: "Codex credentials are malformed.",
+            });
+        }
+        Err(CredentialReadError::TemporarilyUnreadable) => {
+            return Err(PreparationFailure {
+                kind: PreparationFailureKind::TemporarilyUnreadable,
+                message: "Codex credentials are temporarily unavailable.",
+            });
+        }
+        Err(CredentialReadError::Missing) => {
+            return Err(PreparationFailure {
+                kind: PreparationFailureKind::Missing,
+                message: "No Codex sign-in — run codex once.",
+            });
+        }
+    };
+    let Some(tokens) = auth.tokens else {
+        return Err(PreparationFailure {
+            kind: PreparationFailureKind::Unsupported,
+            message: "Codex has no ChatGPT quota sign-in.",
+        });
+    };
+    let (Some(token), Some(account_id)) = (tokens.access_token, tokens.account_id) else {
+        return Err(PreparationFailure {
+            kind: PreparationFailureKind::Unsupported,
+            message: "Codex has no ChatGPT quota sign-in.",
+        });
+    };
+    if token.is_empty() || account_id.is_empty() {
+        return Err(PreparationFailure {
+            kind: PreparationFailureKind::Malformed,
+            message: "Codex credentials are malformed.",
+        });
     }
+    let access_token = token;
+    let install_salt = crate::runtime_state::install_salt();
+    let account = derive_account_context(
+        install_salt.as_ref().map(|salt| salt.as_bytes()),
+        ProviderId::Codex,
+        Some(&account_id),
+        &access_token,
+    )
+    .map_err(|_| PreparationFailure {
+        kind: PreparationFailureKind::IdentityUnavailable,
+        message: "Codex account identity is unavailable.",
+    })?;
+    Ok(PreparedRequest {
+        access_token,
+        account_id,
+        account,
+    })
 }
 
 /// ChatGPT-login Codex sign-in present? API-key-only installs have no usage
 /// limits to show and count as absent.
 pub fn available() -> bool {
-    read_tokens().is_some()
+    auth_path().is_some_and(|path| path.is_file())
 }
 
 // ---------- API response ----------
@@ -69,8 +144,8 @@ struct Window {
     reset_at: Option<i64>,
 }
 
-pub fn fetch() -> FetchOutcome {
-    match fetch_inner() {
+pub fn fetch(request: PreparedRequest) -> FetchOutcome {
+    match fetch_inner(request) {
         Ok(s) => FetchOutcome::Ok(s),
         Err((msg, retry_after, rate_limited)) => FetchOutcome::Err {
             msg,
@@ -80,13 +155,10 @@ pub fn fetch() -> FetchOutcome {
     }
 }
 
-fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
-    let (token, account_id) =
-        read_tokens().ok_or_else(|| plain("No Codex sign-in — run codex once."))?;
-
+fn fetch_inner(request: PreparedRequest) -> Result<UsageSnapshot, FetchErr> {
     // Expiry lives in the JWT `exp` claim (auth.json has no expires field).
     // Unparseable claim = skip the check and let the server decide.
-    if let Some(exp) = jwt_exp(&token) {
+    if let Some(exp) = jwt_exp(request.access_token.expose()) {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         if now > exp {
             return Err(plain("Sign-in expired — open Codex to refresh."));
@@ -98,16 +170,18 @@ fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
         .tls_connector(std::sync::Arc::new(tls))
         .timeout(std::time::Duration::from_secs(10))
         .build();
+    let authorization = SecretString::new(format!("Bearer {}", request.access_token.expose()));
     let resp = agent
         .get(USAGE_URL)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("chatgpt-account-id", &account_id)
-        .set("User-Agent", concat!("claudometer/", env!("CARGO_PKG_VERSION")))
+        .set("Authorization", authorization.expose())
+        .set("chatgpt-account-id", request.account_id.expose())
+        .set(
+            "User-Agent",
+            concat!("claudometer/", env!("CARGO_PKG_VERSION")),
+        )
         .call()
         .map_err(|e| match e {
-            ureq::Error::Status(401 | 403, _) => {
-                plain("Sign-in expired — open Codex to refresh.")
-            }
+            ureq::Error::Status(401 | 403, _) => plain("Sign-in expired — open Codex to refresh."),
             ureq::Error::Status(429, resp) => {
                 let retry_after = resp
                     .header("retry-after")
@@ -118,9 +192,13 @@ fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
             _ => plain("Network error."),
         })?;
 
-    let body = resp.into_string().map_err(|_| plain("Bad API response."))?;
+    let body = read_bounded(resp.into_reader())?;
+    parse_usage_json(&body, time::OffsetDateTime::now_utc().unix_timestamp())
+}
+
+fn parse_usage_json(body: &[u8], observed_at_unix: i64) -> Result<UsageSnapshot, FetchErr> {
     let parsed: UsageResp =
-        serde_json::from_str(&body).map_err(|_| plain("Unexpected API response shape."))?;
+        serde_json::from_slice(body).map_err(|_| plain("Unexpected API response shape."))?;
 
     let mut rows: Vec<LimitRow> = Vec::new();
     if let Some(rl) = &parsed.rate_limit {
@@ -146,12 +224,15 @@ fn fetch_inner() -> Result<UsageSnapshot, FetchErr> {
 
     Ok(UsageSnapshot {
         rows,
-        plan,
-        fetched_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+        plan: bounded_text(plan),
+        fetched_unix: observed_at_unix,
     })
 }
 
 fn push_row(rows: &mut Vec<LimitRow>, w: &Window, fallback_kind: &str) {
+    if rows.len() == MAX_LIMIT_ROWS {
+        return;
+    }
     let Some(pct) = w.used_percent else { return };
     let (kind, label) = match w.limit_window_seconds {
         Some(s) if s > 0 && s <= 24 * 3600 => {
@@ -173,12 +254,17 @@ fn push_row(rows: &mut Vec<LimitRow>, w: &Window, fallback_kind: &str) {
         }
         _ => (
             fallback_kind,
-            if fallback_kind == "session" { "Session" } else { "Weekly" }.to_string(),
+            if fallback_kind == "session" {
+                "Session"
+            } else {
+                "Weekly"
+            }
+            .to_string(),
         ),
     };
     rows.push(LimitRow {
         kind: kind.into(),
-        label,
+        label: bounded_text(label),
         percent: clamp_percent(pct),
         severity: String::new(), // no severity field — percent thresholds apply
         reset_text: w.reset_at.map(fmt_reset_unix).unwrap_or_default(),
@@ -217,4 +303,60 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OBSERVED_AT: i64 = 1_788_400_000;
+
+    fn fixture(name: &str) -> &'static [u8] {
+        match name {
+            "normal" => include_bytes!("../tests/fixtures/codex/normal.json"),
+            "partial" => include_bytes!("../tests/fixtures/codex/partial.json"),
+            "unknown-fields" => include_bytes!("../tests/fixtures/codex/unknown-fields.json"),
+            "malformed" => include_bytes!("../tests/fixtures/codex/malformed.json"),
+            "missing-reset" => include_bytes!("../tests/fixtures/codex/missing-reset.json"),
+            "weekly-primary" => {
+                include_bytes!("../tests/fixtures/codex/weekly-primary.json")
+            }
+            "non-finite" => include_bytes!("../tests/fixtures/codex/non-finite.json"),
+            "out-of-range" => include_bytes!("../tests/fixtures/codex/out-of-range.json"),
+            _ => panic!("unknown fixture"),
+        }
+    }
+
+    fn parse_fixture(name: &str) -> Result<UsageSnapshot, FetchErr> {
+        parse_usage_json(fixture(name), OBSERVED_AT)
+    }
+
+    #[test]
+    fn parses_sanitized_codex_fixture_matrix() {
+        let normal = parse_fixture("normal").unwrap();
+        assert_eq!(normal.rows.len(), 2);
+        assert_eq!(normal.rows[0].kind, "session");
+        assert_eq!(normal.rows[1].kind, "weekly_all");
+        assert_eq!(normal.fetched_unix, OBSERVED_AT);
+
+        let partial = parse_fixture("partial").unwrap();
+        assert_eq!(partial.rows.len(), 1);
+        assert_eq!(partial.rows[0].kind, "weekly_all");
+
+        assert_eq!(parse_fixture("unknown-fields").unwrap().rows.len(), 1);
+        assert!(parse_fixture("malformed").is_err());
+        assert!(parse_fixture("non-finite").is_err());
+
+        let missing_reset = parse_fixture("missing-reset").unwrap();
+        assert_eq!(missing_reset.rows[0].resets_unix, None);
+        assert!(missing_reset.rows[0].reset_text.is_empty());
+
+        let weekly = parse_fixture("weekly-primary").unwrap();
+        assert_eq!(weekly.rows[0].kind, "weekly_all");
+        assert_eq!(weekly.rows[0].label, "Weekly");
+
+        let out_of_range = parse_fixture("out-of-range").unwrap();
+        assert_eq!(out_of_range.rows[0].percent, 0.0);
+        assert_eq!(out_of_range.rows[1].percent, 100.0);
+    }
 }

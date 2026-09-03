@@ -71,6 +71,10 @@ pub struct SettingsView {
     pub autostart: bool,
     pub codex_on: bool,
     pub alerts_on: bool,
+    pub lid_label: String,
+    pub lid_caption: String,
+    pub lid_on: bool,
+    pub lid_action: Option<&'static str>,
     /// About-card label ("Claudometer 0.4.0" / "Update v0.5.0 available" / …)
     pub about: String,
     /// About-card button text ("GitHub" / "Install" / "…")
@@ -172,10 +176,14 @@ pub const SET_W: f32 = 400.0;
 const SET_PAD: f32 = 24.0;
 const CARD_H: f32 = 56.0;
 const CARD_GAP: f32 = 4.0;
-pub const N_CARDS: usize = 9;
+pub const N_CARDS: usize = 10;
 pub const CARD_ACCOUNT: usize = 0;
+pub const CARD_LID: usize = 5;
 /// Card index of the auto-refresh interval row (pills, ←/→ keyboard handling).
-pub const CARD_INTERVAL: usize = 5;
+pub const CARD_INTERVAL: usize = 6;
+pub const CARD_REFRESH: usize = 7;
+pub const CARD_ABOUT: usize = 8;
+pub const CARD_QUIT: usize = 9;
 
 pub fn settings_height() -> f32 {
     let cards = N_CARDS as f32 * CARD_H + (N_CARDS as f32 - 1.0) * CARD_GAP;
@@ -284,7 +292,10 @@ impl Surface {
                 Width: 8,
                 Height: 8,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: 2,
                 Scaling: DXGI_SCALING_STRETCH,
@@ -307,7 +318,10 @@ impl Surface {
             dcomp.Commit()?;
 
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let mk = |family: PCWSTR, size: f32, weight: DWRITE_FONT_WEIGHT| -> Result<IDWriteTextFormat> {
+            let mk = |family: PCWSTR,
+                      size: f32,
+                      weight: DWRITE_FONT_WEIGHT|
+             -> Result<IDWriteTextFormat> {
                 dwrite.CreateTextFormat(
                     family,
                     None,
@@ -318,10 +332,26 @@ impl Surface {
                     w!("en-us"),
                 )
             };
-            let fmt_body = mk(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_NORMAL)?;
-            let fmt_body_sb = mk(w!("Segoe UI Variable Text"), SIZE_BODY, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
-            let fmt_caption = mk(w!("Segoe UI Variable Small"), SIZE_CAPTION, DWRITE_FONT_WEIGHT_NORMAL)?;
-            let fmt_caption_1 = mk(w!("Segoe UI Variable Small"), SIZE_CAPTION, DWRITE_FONT_WEIGHT_NORMAL)?;
+            let fmt_body = mk(
+                w!("Segoe UI Variable Text"),
+                SIZE_BODY,
+                DWRITE_FONT_WEIGHT_NORMAL,
+            )?;
+            let fmt_body_sb = mk(
+                w!("Segoe UI Variable Text"),
+                SIZE_BODY,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            )?;
+            let fmt_caption = mk(
+                w!("Segoe UI Variable Small"),
+                SIZE_CAPTION,
+                DWRITE_FONT_WEIGHT_NORMAL,
+            )?;
+            let fmt_caption_1 = mk(
+                w!("Segoe UI Variable Small"),
+                SIZE_CAPTION,
+                DWRITE_FONT_WEIGHT_NORMAL,
+            )?;
             fmt_caption_1.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             let ellipsis = dwrite.CreateEllipsisTrimmingSign(&fmt_caption_1)?;
             fmt_caption_1.SetTrimming(
@@ -362,8 +392,13 @@ impl Surface {
             if self.w != w || self.h != h {
                 self.dc.SetTarget(None);
                 self.target_bmp = None;
-                self.swap
-                    .ResizeBuffers(2, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))?;
+                self.swap.ResizeBuffers(
+                    2,
+                    w,
+                    h,
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    DXGI_SWAP_CHAIN_FLAG(0),
+                )?;
                 self.w = w;
                 self.h = h;
             }
@@ -379,7 +414,9 @@ impl Surface {
                     bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
                     colorContext: std::mem::ManuallyDrop::new(None),
                 };
-                let bmp = self.dc.CreateBitmapFromDxgiSurface(&surface, Some(&props))?;
+                let bmp = self
+                    .dc
+                    .CreateBitmapFromDxgiSurface(&surface, Some(&props))?;
                 self.dc.SetTarget(&bmp);
                 self.target_bmp = Some(bmp);
             }
@@ -449,6 +486,7 @@ impl Surface {
         fetching: bool,
         update_dot: bool,
         vibe_on: bool,
+        vibe_caption: &str,
     ) -> Result<()> {
         self.ensure_size(w_px.max(8), h_px.max(8), dpi)?;
         self.ensure_brushes(dark, accent)?;
@@ -470,7 +508,13 @@ impl Surface {
             }
 
             let vibe = vibe_row(view);
-            self.draw_vibe_row(vibe, vibe_on, hover == FlyHover::Vibe, focus == 2)?;
+            self.draw_vibe_row(
+                vibe,
+                vibe_on,
+                vibe_caption,
+                hover == FlyHover::Vibe,
+                focus == 2,
+            )?;
             if let View::Data(d) = view {
                 self.draw_footer(w_dip, vibe.bottom + FOOTER_GAP_ABOVE, d)?;
             }
@@ -483,7 +527,8 @@ impl Surface {
                 radiusX: 7.5,
                 radiusY: 7.5,
             };
-            self.dc.DrawRoundedRectangle(&rr, &self.cache().stroke, 1.0, None);
+            self.dc
+                .DrawRoundedRectangle(&rr, &self.cache().stroke, 1.0, None);
 
             self.dc.EndDraw(None, None)?;
             self.swap.Present(1, DXGI_PRESENT(0)).ok()?;
@@ -512,7 +557,10 @@ impl Surface {
         if update_dot {
             // an update waits behind the gear — quiet accent dot, no nag
             let e = D2D1_ELLIPSE {
-                point: D2D_POINT_2F { x: r_gear.right - 5.0, y: r_gear.top + 5.0 },
+                point: D2D_POINT_2F {
+                    x: r_gear.right - 5.0,
+                    y: r_gear.top + 5.0,
+                },
                 radiusX: 3.0,
                 radiusY: 3.0,
             };
@@ -539,10 +587,26 @@ impl Surface {
 
             // header: provider name left, plan right — the first section's
             // header shares its row with the refresh/gear buttons
-            let plan_right = if si == 0 { fly_btns().0.left - GAP } else { w - PAD };
-            self.text(sec.title, &self.fmt_body_sb, rect(PAD, y, plan_right, y + TITLE_H), &b.text, false)?;
+            let plan_right = if si == 0 {
+                fly_btns().0.left - GAP
+            } else {
+                w - PAD
+            };
+            self.text(
+                sec.title,
+                &self.fmt_body_sb,
+                rect(PAD, y, plan_right, y + TITLE_H),
+                &b.text,
+                false,
+            )?;
             if !sec.plan.is_empty() {
-                self.text(&sec.plan, &self.fmt_caption, rect(PAD, y + 2.0, plan_right, y + 2.0 + CAPTION_H), &b.dim, true)?;
+                self.text(
+                    &sec.plan,
+                    &self.fmt_caption,
+                    rect(PAD, y + 2.0, plan_right, y + 2.0 + CAPTION_H),
+                    &b.dim,
+                    true,
+                )?;
             }
             y += TITLE_H + SECTION_GAP;
 
@@ -554,28 +618,60 @@ impl Surface {
                         }
                         let fill = self.sev_brush(&row.severity, row.percent);
 
-                        self.text(&row.label, &self.fmt_body, rect(PAD, y, w - PAD - 56.0, y + LABEL_H), &b.text, false)?;
+                        self.text(
+                            &row.label,
+                            &self.fmt_body,
+                            rect(PAD, y, w - PAD - 56.0, y + LABEL_H),
+                            &b.text,
+                            false,
+                        )?;
                         let pct_str = format!("{:.0}%", row.percent);
-                        self.text(&pct_str, &self.fmt_body_sb, rect(w - PAD - 56.0, y, w - PAD, y + LABEL_H), &b.text, true)?;
+                        self.text(
+                            &pct_str,
+                            &self.fmt_body_sb,
+                            rect(w - PAD - 56.0, y, w - PAD, y + LABEL_H),
+                            &b.text,
+                            true,
+                        )?;
 
                         let bar_y = y + LABEL_H + GAP;
                         let bar_w = w - 2.0 * PAD;
-                        self.rounded(rect(PAD, bar_y, PAD + bar_w, bar_y + BAR_H), BAR_H / 2.0, &b.track)?;
+                        self.rounded(
+                            rect(PAD, bar_y, PAD + bar_w, bar_y + BAR_H),
+                            BAR_H / 2.0,
+                            &b.track,
+                        )?;
                         let frac = (row.percent / 100.0).clamp(0.0, 1.0) as f32;
                         if frac > 0.005 {
                             let fw = (bar_w * frac).max(BAR_H);
-                            self.rounded(rect(PAD, bar_y, PAD + fw, bar_y + BAR_H), BAR_H / 2.0, fill)?;
+                            self.rounded(
+                                rect(PAD, bar_y, PAD + fw, bar_y + BAR_H),
+                                BAR_H / 2.0,
+                                fill,
+                            )?;
                         }
 
                         if !row.reset_text.is_empty() {
                             let cap_y = bar_y + BAR_H + GAP;
-                            self.text(&row.reset_text, &self.fmt_caption, rect(PAD, cap_y, w - PAD, cap_y + CAPTION_H), &b.dim, false)?;
+                            self.text(
+                                &row.reset_text,
+                                &self.fmt_caption,
+                                rect(PAD, cap_y, w - PAD, cap_y + CAPTION_H),
+                                &b.dim,
+                                false,
+                            )?;
                         }
                         y += ROW_BLOCK;
                     }
                 }
                 SectionBody::Note(msg) => {
-                    self.text(msg, &self.fmt_caption, rect(PAD, y, w - PAD, y + CAPTION_H), &b.dim, false)?;
+                    self.text(
+                        msg,
+                        &self.fmt_caption,
+                        rect(PAD, y, w - PAD, y + CAPTION_H),
+                        &b.dim,
+                        false,
+                    )?;
                     y += CAPTION_H;
                 }
             }
@@ -599,12 +695,25 @@ impl Surface {
             }
             footer.push_str(n);
         }
-        self.text(&footer, &self.fmt_caption, rect(PAD, foot_y, w - PAD, foot_y + CAPTION_H), &b.dim, false)?;
+        self.text(
+            &footer,
+            &self.fmt_caption,
+            rect(PAD, foot_y, w - PAD, foot_y + CAPTION_H),
+            &b.dim,
+            false,
+        )?;
         Ok(())
     }
 
-    /// Vibecode mode row — settings-style card with a Fluent ToggleSwitch.
-    fn draw_vibe_row(&self, r: D2D_RECT_F, on: bool, hover: bool, focused: bool) -> Result<()> {
+    /// Vibecode wake-lock row — settings-style card with a Fluent ToggleSwitch.
+    fn draw_vibe_row(
+        &self,
+        r: D2D_RECT_F,
+        on: bool,
+        caption: &str,
+        hover: bool,
+        focused: bool,
+    ) -> Result<()> {
         let b = self.cache();
         let bg = if hover { &b.card_hover } else { &b.card_bg };
         self.rounded(r, 4.0, bg)?;
@@ -617,17 +726,33 @@ impl Surface {
 
         let cy = (r.top + r.bottom) / 2.0;
         let icon_brush = if on { &b.accent } else { &b.text };
-        self.icon16("\u{E945}", rect(r.left + 12.0, cy - 10.0, r.left + 32.0, cy + 10.0), icon_brush)?;
+        self.icon16(
+            "\u{E945}",
+            rect(r.left + 12.0, cy - 10.0, r.left + 32.0, cy + 10.0),
+            icon_brush,
+        )?;
 
         let text_left = r.left + 40.0;
         let text_right = r.right - 56.0; // clear of the 40px toggle + margin
-        self.text("Vibecode mode", &self.fmt_body, rect(text_left, r.top + 4.0, text_right, r.top + 4.0 + LABEL_H), &b.text, false)?;
-        let caption = if on {
-            "Awake · lid close ignored"
-        } else {
-            "Sleep and lid close normal"
-        };
-        self.text(caption, &self.fmt_caption, rect(text_left, r.top + 24.0, text_right, r.top + 24.0 + CAPTION_H), &b.dim, false)?;
+        self.text(
+            "Vibecode wake lock",
+            &self.fmt_body,
+            rect(text_left, r.top + 4.0, text_right, r.top + 4.0 + LABEL_H),
+            &b.text,
+            false,
+        )?;
+        self.text(
+            caption,
+            &self.fmt_caption,
+            rect(
+                text_left,
+                r.top + 24.0,
+                text_right,
+                r.top + 24.0 + CAPTION_H,
+            ),
+            &b.dim,
+            false,
+        )?;
 
         self.toggle(r.right - 12.0, cy, on)?;
         if focused {
@@ -638,9 +763,21 @@ impl Surface {
 
     fn draw_message(&self, w: f32, head: &str, body: Option<&str>) -> Result<()> {
         let b = self.cache();
-        self.text(head, &self.fmt_body_sb, rect(PAD, PAD + 8.0, w - PAD, PAD + 28.0), &b.text, false)?;
+        self.text(
+            head,
+            &self.fmt_body_sb,
+            rect(PAD, PAD + 8.0, w - PAD, PAD + 28.0),
+            &b.text,
+            false,
+        )?;
         if let Some(t) = body {
-            self.text(t, &self.fmt_caption, rect(PAD, PAD + 36.0, w - PAD, 108.0), &b.dim, false)?;
+            self.text(
+                t,
+                &self.fmt_caption,
+                rect(PAD, PAD + 36.0, w - PAD, 108.0),
+                &b.dim,
+                false,
+            )?;
         }
         Ok(())
     }
@@ -668,6 +805,7 @@ impl Surface {
                 "Start with Windows",
                 "Show Codex usage",
                 "Alert at 75% usage",
+                st.lid_label.as_str(),
                 "Auto-refresh",
                 "Refresh usage now",
                 st.about.as_str(),
@@ -677,16 +815,25 @@ impl Surface {
             // bell (EA8F Ringer — E7ED is the muted bell), clock, refresh,
             // info, cancel
             let icons = [
-                "\u{E77B}", "\u{E765}", "\u{E7E8}", "\u{E756}", "\u{EA8F}",
-                "\u{E823}", "\u{E72C}", "\u{E946}", "\u{E711}",
+                "\u{E77B}", "\u{E765}", "\u{E7E8}", "\u{E756}", "\u{EA8F}", "\u{E7BA}", "\u{E823}",
+                "\u{E72C}", "\u{E946}", "\u{E711}",
             ];
             let cards = settings_rects();
             for (i, card) in cards.iter().enumerate() {
                 let b = self.cache();
-                let bg = if st.hover == i as i32 { &b.card_hover } else { &b.card_bg };
+                let bg = if st.hover == i as i32 {
+                    &b.card_hover
+                } else {
+                    &b.card_bg
+                };
                 self.rounded(*card, 4.0, bg)?;
                 let rr = D2D1_ROUNDED_RECT {
-                    rect: rect(card.left + 0.5, card.top + 0.5, card.right - 0.5, card.bottom - 0.5),
+                    rect: rect(
+                        card.left + 0.5,
+                        card.top + 0.5,
+                        card.right - 0.5,
+                        card.bottom - 0.5,
+                    ),
                     radiusX: 3.5,
                     radiusY: 3.5,
                 };
@@ -694,31 +841,58 @@ impl Surface {
 
                 let cy0 = (card.top + card.bottom) / 2.0;
                 let icon_brush = if (i == CARD_ACCOUNT && st.account_connected)
-                    || (i == 7 && st.update_ready)
+                    || (i == CARD_ABOUT && st.update_ready)
                 {
                     &b.accent
                 } else {
                     &b.text
                 };
-                self.icon16(icons[i], rect(card.left + 16.0, cy0 - 10.0, card.left + 36.0, cy0 + 10.0), icon_brush)?;
-                let label_right = if i == CARD_INTERVAL { card.right - 200.0 } else { card.right - 120.0 };
-                if i == CARD_ACCOUNT {
+                self.icon16(
+                    icons[i],
+                    rect(card.left + 16.0, cy0 - 10.0, card.left + 36.0, cy0 + 10.0),
+                    icon_brush,
+                )?;
+                let label_right = if i == CARD_INTERVAL {
+                    card.right - 200.0
+                } else {
+                    card.right - 120.0
+                };
+                if i == CARD_ACCOUNT || i == CARD_LID {
                     self.text(
                         labels[i],
                         &self.fmt_body,
-                        rect(card.left + 48.0, card.top + 7.0, label_right, card.top + 27.0),
+                        rect(
+                            card.left + 48.0,
+                            card.top + 7.0,
+                            label_right,
+                            card.top + 27.0,
+                        ),
                         &b.text,
                         false,
                     )?;
                     self.text(
-                        &st.account_caption,
+                        if i == CARD_ACCOUNT {
+                            &st.account_caption
+                        } else {
+                            &st.lid_caption
+                        },
                         &self.fmt_caption_1,
-                        rect(card.left + 48.0, card.top + 29.0, label_right, card.top + 45.0),
+                        rect(
+                            card.left + 48.0,
+                            card.top + 29.0,
+                            label_right,
+                            card.top + 45.0,
+                        ),
                         &b.dim,
                         false,
                     )?;
                 } else {
-                    self.text_v(labels[i], &self.fmt_body, rect(card.left + 48.0, card.top, label_right, card.bottom), &b.text)?;
+                    self.text_v(
+                        labels[i],
+                        &self.fmt_body,
+                        rect(card.left + 48.0, card.top, label_right, card.bottom),
+                        &b.text,
+                    )?;
                 }
 
                 let cy = (card.top + card.bottom) / 2.0;
@@ -728,10 +902,17 @@ impl Surface {
                     2 => self.toggle(card.right - 16.0, cy, st.autostart)?,
                     3 => self.toggle(card.right - 16.0, cy, st.codex_on)?,
                     4 => self.toggle(card.right - 16.0, cy, st.alerts_on)?,
-                    5 => self.interval_row(card, st.poll_secs)?,
-                    6 => self.button(card.right - 16.0, cy, "Refresh")?,
-                    7 => self.button(card.right - 16.0, cy, st.about_btn)?,
-                    8 => self.button(card.right - 16.0, cy, "Quit")?,
+                    CARD_LID => {
+                        if let Some(action) = st.lid_action {
+                            self.button(card.right - 16.0, cy, action)?;
+                        } else {
+                            self.toggle(card.right - 16.0, cy, st.lid_on)?;
+                        }
+                    }
+                    CARD_INTERVAL => self.interval_row(card, st.poll_secs)?,
+                    CARD_REFRESH => self.button(card.right - 16.0, cy, "Refresh")?,
+                    CARD_ABOUT => self.button(card.right - 16.0, cy, st.about_btn)?,
+                    CARD_QUIT => self.button(card.right - 16.0, cy, "Quit")?,
                     _ => {}
                 }
 
@@ -743,7 +924,10 @@ impl Surface {
             let b = self.cache();
             let foot_y = cards[N_CARDS - 1].bottom + 12.0;
             self.text(
-                &format!("Claudometer {} · api.anthropic.com · chatgpt.com", env!("CARGO_PKG_VERSION")),
+                &format!(
+                    "Claudometer {} · api.anthropic.com · chatgpt.com",
+                    env!("CARGO_PKG_VERSION")
+                ),
                 &self.fmt_caption,
                 rect(SET_PAD, foot_y, SET_W - SET_PAD, foot_y + CAPTION_H),
                 &b.dim,
@@ -772,11 +956,17 @@ impl Surface {
                 } else {
                     self.rounded(*pill, 12.0, &b.control_fill)?;
                     let rr = D2D1_ROUNDED_RECT {
-                        rect: rect(pill.left + 0.5, pill.top + 0.5, pill.right - 0.5, pill.bottom - 0.5),
+                        rect: rect(
+                            pill.left + 0.5,
+                            pill.top + 0.5,
+                            pill.right - 0.5,
+                            pill.bottom - 0.5,
+                        ),
                         radiusX: 11.5,
                         radiusY: 11.5,
                     };
-                    self.dc.DrawRoundedRectangle(&rr, &b.control_stroke, 1.0, None);
+                    self.dc
+                        .DrawRoundedRectangle(&rr, &b.control_stroke, 1.0, None);
                 }
                 let brush = if selected { &b.white } else { &b.text };
                 let wide: Vec<u16> = label.encode_utf16().collect();
@@ -803,16 +993,27 @@ impl Surface {
             if on {
                 self.rounded(r, h / 2.0, &b.accent)?;
                 let e = D2D1_ELLIPSE {
-                    point: D2D_POINT_2F { x: r.right - 10.0, y: cy },
+                    point: D2D_POINT_2F {
+                        x: r.right - 10.0,
+                        y: cy,
+                    },
                     radiusX: 7.0,
                     radiusY: 7.0,
                 };
                 self.dc.FillEllipse(&e, &b.white);
             } else {
-                let rr = D2D1_ROUNDED_RECT { rect: r, radiusX: h / 2.0, radiusY: h / 2.0 };
-                self.dc.DrawRoundedRectangle(&rr, &b.strong_stroke, 1.0, None);
+                let rr = D2D1_ROUNDED_RECT {
+                    rect: r,
+                    radiusX: h / 2.0,
+                    radiusY: h / 2.0,
+                };
+                self.dc
+                    .DrawRoundedRectangle(&rr, &b.strong_stroke, 1.0, None);
                 let e = D2D1_ELLIPSE {
-                    point: D2D_POINT_2F { x: r.left + 10.0, y: cy },
+                    point: D2D_POINT_2F {
+                        x: r.left + 10.0,
+                        y: cy,
+                    },
                     radiusX: 6.0,
                     radiusY: 6.0,
                 };
@@ -835,7 +1036,8 @@ impl Surface {
                 radiusX: 3.5,
                 radiusY: 3.5,
             };
-            self.dc.DrawRoundedRectangle(&rr, &b.control_stroke, 1.0, None);
+            self.dc
+                .DrawRoundedRectangle(&rr, &b.control_stroke, 1.0, None);
             let f = &self.fmt_body;
             f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
@@ -862,7 +1064,8 @@ impl Surface {
                 radiusX: radius + 3.0,
                 radiusY: radius + 3.0,
             };
-            self.dc.DrawRoundedRectangle(&rr, &self.cache().accent, 2.0, None);
+            self.dc
+                .DrawRoundedRectangle(&rr, &self.cache().accent, 2.0, None);
             Ok(())
         }
     }
@@ -953,7 +1156,11 @@ impl Surface {
 
     fn rounded(&self, r: D2D_RECT_F, radius: f32, brush: &ID2D1SolidColorBrush) -> Result<()> {
         unsafe {
-            let rr = D2D1_ROUNDED_RECT { rect: r, radiusX: radius, radiusY: radius };
+            let rr = D2D1_ROUNDED_RECT {
+                rect: r,
+                radiusX: radius,
+                radiusY: radius,
+            };
             self.dc.FillRoundedRectangle(&rr, brush);
             Ok(())
         }
@@ -1022,11 +1229,21 @@ fn col(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
 }
 
 fn col_rgb(rgb: (u8, u8, u8), a: f32) -> D2D1_COLOR_F {
-    col(rgb.0 as f32 / 255.0, rgb.1 as f32 / 255.0, rgb.2 as f32 / 255.0, a)
+    col(
+        rgb.0 as f32 / 255.0,
+        rgb.1 as f32 / 255.0,
+        rgb.2 as f32 / 255.0,
+        a,
+    )
 }
 
 fn rect(l: f32, t: f32, r: f32, b: f32) -> D2D_RECT_F {
-    D2D_RECT_F { left: l, top: t, right: r, bottom: b }
+    D2D_RECT_F {
+        left: l,
+        top: t,
+        right: r,
+        bottom: b,
+    }
 }
 
 /// Relative + absolute combined: "just now" → "3m ago" → "at 12:56".

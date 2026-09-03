@@ -32,11 +32,17 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `auth.rs` | Claude account: identity from local files + explicit interactive browser sign-in (own console, cancellable) delegated to the resolved native `claude` executable |
 | `api.rs` | Claude credentials read + usage fetch; shared display model (`UsageSnapshot`, `LimitRow`, `FetchOutcome`), time formatting |
 | `codex.rs` | Codex (OpenAI) credentials read + usage fetch → same `UsageSnapshot` |
+| `provider/model.rs` | stable provider/account/limit/request identities and typed completion envelope |
+| `runtime_state.rs` | atomic optional `state.json` envelope, CNG install salt, and account-scoped receipt schema |
+| `state_policy.rs` | fake-clock-testable debounce, stale, flyout-refresh, and 429 policy |
+| `store.rs` | typed atomic JSON commit, verified `.bak` generation, corruption preservation, and failure injection |
+| `demo.rs` | deterministic provider/view scenarios and guarded no-side-effect launch mode |
 | `trayicon.rs` | CPU-rasterized ring/alert HICON (premultiplied DIB, no fonts) |
 | `alerts.rs` | 75% toast alerts: WinRT toast pipeline, AUMID registration, per-window dedup |
 | `updater.rs` | GitHub-Releases self-update: daily check, verified download, rename-swap handover |
-| `util.rs` | theme/accent detection, autostart registry, poll-interval config, caps-LED toggle, dark menus, acrylic |
-| `vibecode.rs` | Vibecode mode: wake lock + lid-close-action override, with save/restore of the user's original indices |
+| `config.rs` | cached validated `SettingsV1`, atomic persistence, legacy dual-read/write, and schema diagnostics |
+| `util.rs` | theme/accent detection, autostart registry, caps-LED toggle, dark menus, acrylic |
+| `vibecode.rs` | independent wake lock plus journaled Advanced lid override, conservative recovery, legacy one-shot restore, and lifecycle reconciliation |
 
 ## Rendering (`gfx::Surface`)
 
@@ -44,7 +50,7 @@ WARP D3D11 device → DXGI **composition** swapchain (premultiplied alpha) → `
 
 Key decisions, with reasons:
 
-- **WARP, not hardware** (v0.2.0): the HW driver's user-mode heaps cost ~40 MB private and are not returned on device release (measured 57 MB open *and* after close). WARP: 7 MB open, 5.5 MB after close. Surface is ~330 px — CPU rasterization is microseconds, and DWM composes the swapchain on the GPU either way.
+- **WARP, not hardware** (v0.2.0): historical driver-comparison testing measured 57 MB with the hardware driver versus 7 MB with WARP because the hardware driver's user-mode heaps survived device release. Those are not current whole-process claims; the reproducible Foundation baseline is in `docs/performance/foundation-baseline.md`. The surface is ~330 px, CPU rasterization is microseconds, and DWM composes the swapchain on the GPU either way.
 - **Surface dropped on hide, recreated on show** (~10 ms): the GPU stack *is* the app's RAM cost; windows are hidden 99% of the time.
 - **Caches**: brushes keyed by `(dark, accent)`, text formats built once, single RT QI at creation. Zero per-draw allocations.
 - **Flyout material — accent-policy acrylic** (`ACCENT_ENABLE_ACRYLICBLURBEHIND`, undocumented): `DWMWA_SYSTEMBACKDROP_TYPE = DWMSBT_TRANSIENTWINDOW` renders only its opaque fallback on borderless DComp popups (observed on build 28020, even with frame extension). Settings window is a titled window, where `DWMSBT_MAINWINDOW` (Mica) works through the documented path.
@@ -67,32 +73,40 @@ Two independent providers, one worker thread each per poll (~1/min), both produc
 2. `GET chatgpt.com/backend-api/wham/usage` — the same **unofficial endpoint** the Codex CLI's TUI polls — with `Authorization: Bearer` + `chatgpt-account-id` headers.
 3. `rate_limit.primary_window`/`secondary_window` → rows; kind/label derived from `limit_window_seconds` (≤24 h → "Session (Nh)", 7 d → "Weekly"), **not** from window position — which window arrives as primary varies by plan. Severity is empty → percent thresholds color the bars.
 
-Resilience rules (in `main.rs`, per provider via `SLOTS`):
+Every provider HTTP body is read as at most 1 MiB plus one sentinel byte and rejected when oversized. Parsed output is bounded to 64 rows and 512 UTF-8 bytes per provider-controlled display string. Sanitized fixtures under `tests/fixtures/` cover normal, partial, unknown, malformed, missing-reset, weekly-primary, non-finite, and out-of-range shapes without live network access.
 
+Resilience rules (in `main.rs`, per provider via `SLOTS`, with time decisions isolated in `state_policy.rs`):
+
+- Credential parsing and secret-bearing request preparation run only on short-lived provider workers. A stable provider account ID is salted with the CNG-generated install salt and SHA-256; when none exists, an access-token fingerprint uses a process-only salt and is never persisted. Secret strings have no `Debug`/serialization surface and overwrite their buffers on drop.
+- Every slot has a current opaque account, generation, reserved request ID, and account-bound completion/last-good state. Credential changes clear snapshot, plan, error, cooldown, debounce, and alerts before replacement work. A completion must match provider + generation + request + account before any side effect; obsolete work cannot clear a newer fetch flag.
+- Claude's profile-plan cache is keyed by opaque account. Its local fallback plan and stable ID are captured from the same worker-local identity read, so a concurrent account switch cannot attach another account's plan.
 - `last_good` snapshot survives failed fetches for up to 10 minutes — UI shows stale data + footer note; a provider with no data degrades to a dim note line in its own section; the whole-flyout error view exists only for the nothing-ever-fetched case.
 - Every 429 starts a 60–900 s `cooldown_until` immediately (server `Retry-After` when useful, exponential fallback otherwise). Automatic and manual refreshes both honor it; there is no fast retry.
-- 3 s debounce on refresh; `fetching` flag dedupes concurrent spawns.
+- 3 s debounce on refresh; `fetching` flag dedupes concurrent spawns. Characterization uses an injected fake clock and never sleeps.
 - Fetch threads publish via mutexed statics + `PostMessageW(WM_DATA_READY)` — UI mutations stay on the UI thread.
 - Codex enablement (`codex_active`) = settings toggle AND auth file present — checked per poll, so signing in/out of Codex shows/hides the section without restart.
 
 ## Alerts (`alerts.rs`)
 
-One native toast per limit window that crosses **75%** (`WARN_AT`), evaluated on the UI thread on every `WM_DATA_READY` — but only from a *fresh* `FetchOutcome::Ok`; stale/error-preserved data never alerts.
+One native toast per limit window that crosses **75%** (`WARN_AT`), evaluated on the UI thread on `WM_DATA_READY`. The current stored-success selection is characterized explicitly: an unrelated provider completion can re-evaluate another provider's last `FetchOutcome::Ok`, although receipt dedup normally suppresses a second toast. `ALERT-01` replaces this with completion-specific fresh events; stale/error-preserved snapshots remain ineligible.
 
 - **Real WinRT toasts, unpackaged**: `ToastNotificationManager::CreateToastNotifierWithId` against an AUMID registered under `HKCU\Software\Classes\AppUserModelId\Claudometer` (`DisplayName` + `IconUri` → ico extracted to `%APPDATA%\Claudometer`). Gets Action Center persistence, Focus Assist / DND suppression, and a per-app toggle in Windows notification settings — none of which legacy balloons provide. `SetCurrentProcessExplicitAppUserModelID` ties the process to the AUMID at startup.
-- **Dedup keyed on the window instance**: `provider.kind.label → resets_unix`. Percent climbing inside one window fires once; the window rolling over (new `resets_at`) re-arms. Persisted in settings.json (`alerted`) so restarts stay quiet mid-window.
+- **Account-scoped dedup**: provider + opaque account key + stable limit ID + threshold + reset instance. Percent climbing inside one window fires once; a real reset re-arms. Receipts live in sanitized `state.json`; the legacy `settings.json.alerted` map is dual-written only for downgrade compatibility and migrated once to the first proven account for each provider.
 - Toast body: title + reset time + native `<progress>` bar pinned at the worst crossed limit. Click → `WM_TOAST_ACTIVATED` → flyout opens at the tray icon (`Shell_NotifyIconGetRect`). Shown `ToastNotification` objects are kept alive in a thread_local — the OS routes `Activated` through them.
 - `NotificationSetting::DisabledForApplication/User` is honored: no balloon resurrection. The `NIF_INFO` balloon fallback fires only when the WinRT path itself errors.
 - `claudometer.exe --test-alert` drives the whole pipeline with fake data; outcome written to `%APPDATA%\Claudometer\alert-test.txt` (exe has no console).
 
 ## Vibecode mode (`vibecode.rs`)
 
-A flyout toggle row that keeps the machine working with the lid shut. Two switches, both reversible:
+The flyout toggle controls only a wake lock through `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`. It is per-*thread*, so it is armed and dropped on the UI thread and disappears with the process. Wake-lock failure/state is independent from the persistent lid transaction.
 
-- **Wake lock** — `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`. Per-*thread*, so it is armed and dropped on the UI thread only; it dies with the process, nothing to clean up.
-- **Lid-close action** — `PowerRead/WriteAC|DCValueIndex` on the active scheme (`SUB_BUTTONS` / lid-close-action GUIDs, both hand-declared: windows 0.58 exports neither under our features) set to index 0 = *Do nothing*, then `PowerSetActiveScheme` on the same scheme to push the change into the running policy. This one outlives the process, so the previous (AC, DC) pair is written to settings.json **before** the first override and restored verbatim on disable. Re-arming never overwrites a saved pair — that's what makes a crash recoverable.
+Ignoring lid close is a separate explicit **Advanced** Settings control. Before any system write, `power-override.v1.json` records schema, operation, exact scheme GUID, original/applied AC/DC values, `prepared` phase, time, and app version through `AtomicJsonStore`. The controller rechecks the active scheme, checks both writes and activation, reads back both values, then records `applied`. Only that verified state is displayed as active.
 
-Lifecycle: quit restores the system state but keeps the preference (re-armed at next launch, saved indices intact); toggling off restores and clears the saved pair. A machine with no lid setting (desktop) fails the read, so only the wake lock applies.
+Recovery changes the journal to `restoring`, operates only on its recorded GUID, and restores a field only while it still equals Claudometer's applied value. A field already at the original is `restored`; any other value is `relinquished_external_change`. An inactive old scheme is never activated. If the journal scheme is still active it is reactivated even on a retry where stored originals were already present, closing the crash-before-activation window. The journal and `.bak` are deleted only after both fields reach terminal verified outcomes.
+
+Startup recovers before applying a new override. `WM_QUERYENDSESSION`, `WM_ENDSESSION`, `WM_DESTROY`, power broadcasts, and the poll timer converge through the same idempotent recovery/reconcile path; wake lock is dropped first on exit even when persistent recovery remains. `--recover-vibecode` performs the same deterministic recovery without starting the UI, provider workers, alerts, or updater.
+
+Legacy `settings.json.vibecode_lid` has no scheme GUID, so it blocks new overrides and remains preserved. Settings offers “Restore” with an explicit current-scheme explanation. That direct action creates a one-shot journal before applying the saved pair and clears the legacy field only after verified application; it is never guessed or silently discarded. See `docs/recovery/vibecode.md`.
 
 ## Updater (`updater.rs`)
 
@@ -109,7 +123,25 @@ Install (only on click), all failure paths falling back to opening the release p
 
 - Cross-thread: `SLOTS[2]` (per-provider `state`, `last_good`, `last_fetch`, `cooldown_until` mutexes + `fetching` atomic); `POLL_SECS`, hwnds (atomics).
 - UI-thread only: `UI` thread_local — surfaces, hover, keyboard focus, mouse-tracking flags.
-- Persistent: `%APPDATA%\Claudometer\settings.json` (poll interval, Codex toggle, alerts toggle, `alerted` dedup map, Vibecode flag + saved lid indices), `%APPDATA%\Claudometer\icon.ico` (toast icon), HKCU Run key (autostart), HKCU AppUserModelId key (toast registration), `~/.claude/hooks/caps-led.disabled` (LED kill switch). Account credentials remain owned by Claude Code/Codex; Claudometer adds no token store.
+- Persistent: `%APPDATA%\Claudometer\settings.json` is loaded once into validated `SettingsV1` and written through `AtomicJsonStore`. Canonical v1 preference keys are dual-written with the v0.7.x keys; unknown fields, legacy `alerted`, and legacy `vibecode_lid` remain preserved. Optional `%APPDATA%\Claudometer\state.json` contains only schema metadata, a 32-byte CNG-generated install salt, account/provider/limit/reset-scoped alert receipts, and one-time legacy-migration markers. Account changes atomically evict that provider's previous receipts; token-fingerprint identities never enter the file. Deleting `state.json` loses only cache/deduplication identity and safely generates a new salt. `%APPDATA%\Claudometer\icon.ico` (toast icon), HKCU Run key (autostart), HKCU AppUserModelId key (toast registration), and `~/.claude/hooks/caps-led.disabled` (LED kill switch) remain separate. Account credentials remain owned by Claude Code/Codex; Claudometer adds no token store.
+
+`store.rs` is the persistence primitive for the typed migrations that follow.
+It serializes and validates completely in memory, writes a unique same-directory
+temporary file, calls `sync_all`, and commits with `ReplaceFileW` (retaining one
+verified `.bak`) or first-create `MoveFileExW(...WRITE_THROUGH)`. It validates
+the committed target and backup, restores on validation failure, and moves a
+malformed target to a timestamped `.corrupt` sibling before loading a verified
+backup or requesting defaults. Typed errors contain only stage/error category,
+never a path. Fault tests cover directory/temp creation, access denial, disk
+full, write, flush/interruption, replace, validation, restoration, and corrupt
+preservation. Settings now use it through `config.rs`; safety and runtime state
+move to their own files in later slices.
+
+## Deterministic demo mode
+
+`claudometer.exe --demo=<scenario>` renders synthetic `claude-only`, `codex-only`, `both`, `loading`, `stale`, `cooldown`, `error`, or `neither` state. `--demo-hidden` keeps only its synthetic tray icon for hidden-state measurement. The demo branch runs before single-instance/update cleanup, toast registration, settings and credential reads, provider workers, or Vibecode initialization; refresh, settings, and wake-lock actions are guarded while it is active. Appearance and data are fixed, no provider endpoint is contacted, and Escape closes a visible demo.
+
+`ci/verify-demo.ps1` runs the optimized binary with an isolated empty profile and verifies no profile files, Claudometer registry changes, child processes, TCP connections, or active-power-scheme changes.
 
 ## Known gaps
 

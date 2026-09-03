@@ -6,8 +6,7 @@ use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::*;
 use windows::UI::ViewManagement::{UIColorType, UISettings};
 
-const PERSONALIZE: PCWSTR =
-    w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+const PERSONALIZE: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("Claudometer");
 
@@ -66,7 +65,9 @@ pub fn autostart_enabled() -> bool {
 pub fn set_autostart(on: bool) {
     unsafe {
         if on {
-            let Ok(exe) = std::env::current_exe() else { return };
+            let Ok(exe) = std::env::current_exe() else {
+                return;
+            };
             let cmd = format!("\"{}\"", exe.display());
             let wide: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
             let _ = RegSetKeyValueW(
@@ -86,119 +87,7 @@ pub fn set_autostart(on: bool) {
 // ---------- app config (%APPDATA%\Claudometer\settings.json) ----------
 
 pub fn config_dir() -> Option<std::path::PathBuf> {
-    let appdata = std::env::var("APPDATA").ok()?;
-    Some(std::path::Path::new(&appdata).join("Claudometer"))
-}
-
-fn config_path() -> Option<std::path::PathBuf> {
-    Some(config_dir()?.join("settings.json"))
-}
-
-fn read_config() -> serde_json::Value {
-    config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}))
-}
-
-fn write_config_field(key: &str, value: serde_json::Value) {
-    let Some(p) = config_path() else { return };
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let mut cfg = read_config();
-    cfg[key] = value;
-    if let Ok(s) = serde_json::to_string_pretty(&cfg) {
-        let _ = std::fs::write(p, s + "\n");
-    }
-}
-
-pub fn load_poll_secs() -> u32 {
-    read_config()
-        .get("poll_secs")
-        .and_then(|x| x.as_u64())
-        .map(|x| (x as u32).clamp(30, 300))
-        .unwrap_or(60)
-}
-
-pub fn save_poll_secs(secs: u32) {
-    write_config_field("poll_secs", secs.into());
-}
-
-/// Codex section toggle — defaults on; section still only shows when a
-/// Codex sign-in actually exists on disk.
-pub fn show_codex() -> bool {
-    read_config()
-        .get("show_codex")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(true)
-}
-
-pub fn set_show_codex(on: bool) {
-    write_config_field("show_codex", on.into());
-}
-
-/// Toast alerts when a limit window crosses the warn threshold — default on.
-pub fn alerts_enabled() -> bool {
-    read_config()
-        .get("alerts")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(true)
-}
-
-pub fn set_alerts_enabled(on: bool) {
-    write_config_field("alerts", on.into());
-}
-
-/// Vibecode mode (no sleep, lid close ignored) — a persisted preference,
-/// re-armed at startup. Default off.
-pub fn vibecode_enabled() -> bool {
-    read_config()
-        .get("vibecode")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false)
-}
-
-pub fn set_vibecode_enabled(on: bool) {
-    write_config_field("vibecode", on.into());
-}
-
-/// The (AC, DC) lid-close action indices Vibecode mode overrode. Present only
-/// while the override is live, so a crash still leaves the restore on disk.
-pub fn vibecode_saved_lid() -> Option<(u32, u32)> {
-    let cfg = read_config();
-    let v = cfg.get("vibecode_lid")?;
-    Some((
-        v.get("ac")?.as_u64()? as u32,
-        v.get("dc")?.as_u64()? as u32,
-    ))
-}
-
-pub fn save_vibecode_lid(v: Option<(u32, u32)>) {
-    let value = match v {
-        Some((ac, dc)) => serde_json::json!({ "ac": ac, "dc": dc }),
-        None => serde_json::Value::Null,
-    };
-    write_config_field("vibecode_lid", value);
-}
-
-/// Alert dedup, persisted so a restart mid-window doesn't re-alert:
-/// map of limit key → `resets_at` epoch that already fired.
-pub fn load_alerted() -> std::collections::HashMap<String, i64> {
-    read_config()
-        .get("alerted")
-        .and_then(|v| v.as_object().cloned())
-        .map(|o| {
-            o.into_iter()
-                .filter_map(|(k, v)| Some((k, v.as_i64()?)))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-pub fn save_alerted(map: &std::collections::HashMap<String, i64>) {
-    write_config_field("alerted", serde_json::json!(map));
+    crate::config::config_dir()
 }
 
 // ---------- Caps-LED status hook toggle ----------
@@ -267,12 +156,13 @@ pub fn apply_acrylic(hwnd: HWND, dark: bool) {
         size: usize,
     }
     unsafe {
-        let Ok(user32) = LoadLibraryW(w!("user32.dll")) else { return };
+        let Ok(user32) = LoadLibraryW(w!("user32.dll")) else {
+            return;
+        };
         let Some(f) = GetProcAddress(user32, s!("SetWindowCompositionAttribute")) else {
             return;
         };
-        let set_wca: extern "system" fn(HWND, *mut CompAttrData) -> BOOL =
-            std::mem::transmute(f);
+        let set_wca: extern "system" fn(HWND, *mut CompAttrData) -> BOOL = std::mem::transmute(f);
         let tint: u32 = if dark { 0xCC_20_20_20 } else { 0xCC_F3_F3_F3 };
         let mut policy = AccentPolicy {
             state: 4, // ACCENT_ENABLE_ACRYLICBLURBEHIND
@@ -293,10 +183,11 @@ pub fn apply_acrylic(hwnd: HWND, dark: bool) {
 /// Ordinal 135 = SetPreferredAppMode(AllowDark), 136 = FlushMenuThemes.
 pub fn enable_dark_context_menus() {
     unsafe {
-        let Ok(lib) = LoadLibraryW(w!("uxtheme.dll")) else { return };
+        let Ok(lib) = LoadLibraryW(w!("uxtheme.dll")) else {
+            return;
+        };
         if let Some(p135) = GetProcAddress(lib, PCSTR(135usize as *const u8)) {
-            let set_preferred_app_mode: extern "system" fn(i32) -> i32 =
-                std::mem::transmute(p135);
+            let set_preferred_app_mode: extern "system" fn(i32) -> i32 = std::mem::transmute(p135);
             set_preferred_app_mode(1); // AllowDark
         }
         if let Some(p136) = GetProcAddress(lib, PCSTR(136usize as *const u8)) {

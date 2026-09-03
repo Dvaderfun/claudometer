@@ -1,0 +1,8 @@
+{
+  "limits": [
+    {
+      "kind": "session",
+      "percent": 77
+    }
+  ]
+}

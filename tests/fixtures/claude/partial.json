@@ -1,0 +1,12 @@
+{
+  "limits": [
+    {
+      "kind": "session"
+    },
+    {
+      "kind": "weekly_scoped",
+      "percent": 33,
+      "scope": {}
+    }
+  ]
+}

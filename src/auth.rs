@@ -28,7 +28,7 @@ static CANCEL_LOGIN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 pub enum ClaudeConnection {
-    Connected { email: String, plan: String },
+    Connected { plan: String },
     Disconnected,
     CliUnavailable,
     Problem(String),
@@ -76,13 +76,11 @@ pub fn query_status() -> ClaudeConnection {
         return ClaudeConnection::Disconnected;
     }
     let account = read_oauth_account();
-    let email = account
-        .as_ref()
-        .and_then(|a| a.email_address.clone())
-        .or_else(|| account.as_ref().and_then(|a| a.organization_name.clone()))
-        .unwrap_or_else(|| "Connected account".into());
-    let plan = local_plan().unwrap_or_default();
-    ClaudeConnection::Connected { email, plan }
+    let plan = account
+        .and_then(|account| account.organization_type)
+        .map(|kind| crate::api::plan_label(kind.strip_prefix("claude_").unwrap_or(&kind)))
+        .unwrap_or_default();
+    ClaudeConnection::Connected { plan }
 }
 
 #[derive(Deserialize)]
@@ -93,10 +91,6 @@ struct ClaudeJson {
 
 #[derive(Deserialize)]
 struct OauthAccount {
-    #[serde(rename = "emailAddress")]
-    email_address: Option<String>,
-    #[serde(rename = "organizationName")]
-    organization_name: Option<String>,
     #[serde(rename = "organizationType")]
     organization_type: Option<String>,
 }
@@ -104,14 +98,6 @@ struct OauthAccount {
 fn read_oauth_account() -> Option<OauthAccount> {
     let raw = std::fs::read_to_string(crate::api::claude_state_path()?).ok()?;
     serde_json::from_str::<ClaudeJson>(&raw).ok()?.oauth_account
-}
-
-/// Plan name from the profile Claude Code refreshes (`organizationType`).
-/// `.credentials.json`'s `subscriptionType` is written once at login and goes
-/// stale across plan changes — never read it for display.
-pub fn local_plan() -> Option<String> {
-    let ty = read_oauth_account()?.organization_type?;
-    Some(crate::api::plan_label(ty.strip_prefix("claude_").unwrap_or(&ty)))
 }
 
 /// Let Claude Code own the complete browser login and token persistence flow,
@@ -268,7 +254,8 @@ mod tests {
 
     #[test]
     fn maps_official_npm_shim_to_embedded_executable() {
-        let root = std::env::temp_dir().join(format!("claudometer-auth-test-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("claudometer-auth-test-{}", std::process::id()));
         let bin = root.join("node_modules/@anthropic-ai/claude-code/bin");
         std::fs::create_dir_all(&bin).unwrap();
         let shim = root.join("claude.cmd");

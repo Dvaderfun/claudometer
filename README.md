@@ -2,7 +2,7 @@
 
 **Your Claude + Codex usage limits, live in the Windows 11 tray.**
 
-A tiny native Windows app that shows how much of your Claude (and optionally OpenAI Codex) session and weekly limits you've used — as a colored ring in the taskbar corner and an acrylic flyout with the details. No Electron, no webview, no background bloat: a single ~700 KB executable built with Rust + Win32 + Direct2D.
+A tiny native Windows app that shows how much of your Claude (and optionally OpenAI Codex) session and weekly limits you've used — as a colored ring in the taskbar corner and an acrylic flyout with the details. No Electron, no webview, no background bloat: the current unsigned build is a single 941,056-byte (919 KiB) executable built with Rust + Win32 + Direct2D.
 
 ## What you get
 
@@ -14,7 +14,7 @@ A tiny native Windows app that shows how much of your Claude (and optionally Ope
 - **Settings window** (Mica) — Claude account, auto-refresh interval (30s / 1m / 2m / 5m), start with Windows, Codex section toggle, refresh, quit.
 - **Keyboard**: Tab cycles controls (visible focus ring), Space/Enter activates, ←/→ changes the refresh interval, Esc closes.
 - Survives Explorer restarts, per-monitor DPI aware, respects `Retry-After` on rate limits, keeps showing cached data through network blips.
-- Frugal by design: ~3–7 MB RAM (GPU resources are released whenever the flyout closes), ~0.02% CPU.
+- Frugal by design: the reproducible no-network baseline is 1.53 MiB hidden and 4.45 MiB with the two-provider flyout visible (p95 private working set), with less than 0.002% idle CPU. See the [measurement method and raw runs](docs/performance/foundation-baseline.md).
 
 > Known gap: screen-reader (UI Automation) support is not implemented yet — the UI is fully keyboard-operable, but not announced to narrators.
 
