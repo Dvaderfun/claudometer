@@ -628,6 +628,10 @@ Abort a rollout immediately if any of these occurs:
   - Upload to a draft release and smoke-test the downloaded assets.
   - Publish immutable releases; never edit/reuse an existing version or tag.
   - Protect `main`, release tags, and the signing environment.
+  - Local pipeline complete. This solo-maintainer repository uses pull requests
+    plus required checks with zero approvals and an owner-approved `release`
+    environment. Production key/sequence variables and the first live release
+    remain external blockers; repository release immutability is enabled.
 
 ### `v0.9` acceptance
 

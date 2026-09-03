@@ -103,7 +103,22 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build immutable release artifact
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        shell: pwsh
+        env:
+          RELEASE_PUBLIC_KEY_HEX: ${{ vars.CLAUDOMETER_RELEASE_PUBLIC_KEY_HEX }}
+          RELEASE_SEQUENCE: ${{ vars.CLAUDOMETER_RELEASE_SEQUENCE }}
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            if ($env:RELEASE_PUBLIC_KEY_HEX -cnotmatch '^[0-9a-f]{64}$') {
+              throw 'CLAUDOMETER_RELEASE_PUBLIC_KEY_HEX is not provisioned.'
+            }
+            if ($env:RELEASE_SEQUENCE -cnotmatch '^[1-9][0-9]*$') {
+              throw 'CLAUDOMETER_RELEASE_SEQUENCE is not a positive integer.'
+            }
+            $env:CLAUDOMETER_RELEASE_PUBLIC_KEY_HEX = $env:RELEASE_PUBLIC_KEY_HEX
+            $env:CLAUDOMETER_RELEASE_SEQUENCE = $env:RELEASE_SEQUENCE
+          }
+          cargo build --locked --release --target ${{ matrix.target }}
       - name: Name, measure, and hash artifact
         id: artifact
         shell: pwsh

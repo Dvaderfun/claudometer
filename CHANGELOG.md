@@ -5,6 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 ## [Unreleased]
 
 ### Security
+- Release tags now build once with `--locked`, publish signed manifests and an SPDX SBOM, create GitHub provenance/SBOM attestations, verify downloaded draft assets, smoke-test the downloaded x64 executable, and publish only with immutable releases enabled.
 - **Manual trust-root bootstrap required.** Versions without an embedded Ed25519 release key—including all published versions through 0.7.3—cannot authenticate a trust-root-enabled update. They will not update automatically across that boundary. Existing users must manually download and independently verify the first trust-root-enabled release using its published hash and Authenticode identity before installing it. Later releases can use signed-manifest updates. See the [bootstrap verification procedure](docs/release-manifest-v1.md#trust-root-bootstrap).
 - Portable self-updates now use an atomic `update-operation.v1.json` journal, attempt-unique candidate and backup names, and hash-reconciled startup recovery. The previous verified executable remains available until the candidate commit is durable.
 

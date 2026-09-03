@@ -4,12 +4,12 @@
   "reference_release_x64_bytes": 815104,
   "targets": {
     "x86_64-pc-windows-msvc": {
-      "baseline_bytes": 941056,
-      "baseline_slice": "PR 9 / AUTH-01..03"
+      "baseline_bytes": 1097728,
+      "baseline_slice": "REL-02 / provisioned authenticated updater"
     },
     "aarch64-pc-windows-msvc": {
-      "baseline_bytes": 889344,
-      "baseline_slice": "PR 9 / AUTH-01..03"
+      "baseline_bytes": 995840,
+      "baseline_slice": "REL-02 / provisioned authenticated updater"
     }
   }
 }

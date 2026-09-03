@@ -7,36 +7,253 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   source-gate:
     uses: ./.github/workflows/build.yml
     permissions:
       contents: read
 
-  draft-release:
-    name: Draft release from tested artifacts
+  sbom:
+    name: Generate release SBOM
     needs: source-gate
     runs-on: windows-2025
-    timeout-minutes: 15
-    environment: release
+    timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Generate SPDX SBOM from tagged locked source
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        env:
+          SYFT_SOURCE_NAME: claudometer
+          SYFT_SOURCE_VERSION: ${{ github.ref_name }}
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom-assets/claudometer-${{ github.ref_name }}.sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Upload release SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: claudometer-sbom
+          path: sbom-assets/claudometer-${{ github.ref_name }}.sbom.spdx.json
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Sign, attest, smoke-test, and publish
+    needs: [source-gate, sbom]
+    runs-on: windows-2025
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      actions: read
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      RELEASE_PUBLIC_KEY_HEX: ${{ vars.CLAUDOMETER_RELEASE_PUBLIC_KEY_HEX }}
+      RELEASE_SEQUENCE: ${{ vars.CLAUDOMETER_RELEASE_SEQUENCE }}
+      MINIMUM_UPDATER_VERSION: ${{ vars.CLAUDOMETER_MINIMUM_UPDATER_VERSION }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Require a new version on main
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Release tags must point to a commit on main.'
+          }
+          $existingTags = gh release list `
+            --repo $env:GITHUB_REPOSITORY `
+            --limit 1000 `
+            --json tagName `
+            --jq '.[].tagName'
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not inspect existing releases.'
+          }
+          if ($env:GITHUB_REF_NAME -cin @($existingTags)) {
+            throw "Release '$env:GITHUB_REF_NAME' already exists; versions are never reused or edited."
+          }
+      - name: Require protected release infrastructure
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDOMETER_RELEASE_ADMIN_READ_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw 'CLAUDOMETER_RELEASE_ADMIN_READ_TOKEN is not provisioned in the release environment.'
+          }
+          ./ci/check-release-infrastructure.ps1 -Repository $env:GITHUB_REPOSITORY
       - name: Download exact tested artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: claudometer-*
+          pattern: claudometer-*64
           path: release-assets
           merge-multiple: true
-      - name: Verify version, names, and hashes
+      - name: Verify version, names, architectures, and hashes
         shell: pwsh
-        run: ./ci/check-release.ps1 -Tag "${{ github.ref_name }}" -AssetsPath release-assets
-      - name: Create reviewable draft
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        run: ./ci/check-release.ps1 -Tag $env:GITHUB_REF_NAME -AssetsPath release-assets
+      - name: Download release SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          draft: true
-          generate_release_notes: true
-          files: release-assets/*
-          fail_on_unmatched_files: true
+          name: claudometer-sbom
+          path: release-assets
+      - name: Generate signed manifests
+        shell: pwsh
+        env:
+          RELEASE_PRIVATE_KEY_PKCS8_B64: ${{ secrets.CLAUDOMETER_RELEASE_PRIVATE_KEY_PKCS8_B64 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RELEASE_PRIVATE_KEY_PKCS8_B64)) {
+            throw 'CLAUDOMETER_RELEASE_PRIVATE_KEY_PKCS8_B64 is not provisioned.'
+          }
+          $keyPath = Join-Path $env:RUNNER_TEMP 'claudometer-release-key.pk8'
+          try {
+            [IO.File]::WriteAllBytes(
+              $keyPath,
+              [Convert]::FromBase64String($env:RELEASE_PRIVATE_KEY_PKCS8_B64)
+            )
+            ./ci/new-release-evidence.ps1 `
+              -Tag $env:GITHUB_REF_NAME `
+              -AssetsPath release-assets `
+              -Sequence $env:RELEASE_SEQUENCE `
+              -MinimumUpdaterVersion $env:MINIMUM_UPDATER_VERSION `
+              -PublicKeyHex $env:RELEASE_PUBLIC_KEY_HEX `
+              -PrivateKeyPath $keyPath
+          } finally {
+            if (Test-Path -LiteralPath $keyPath) {
+              Remove-Item -LiteralPath $keyPath -Force
+            }
+          }
+      - name: Verify complete release evidence
+        shell: pwsh
+        run: |
+          ./ci/check-release.ps1 `
+            -Tag $env:GITHUB_REF_NAME `
+            -AssetsPath release-assets `
+            -RequireEvidence `
+            -PublicKeyHex $env:RELEASE_PUBLIC_KEY_HEX `
+            -Sequence $env:RELEASE_SEQUENCE `
+            -MinimumUpdaterVersion $env:MINIMUM_UPDATER_VERSION
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/*.exe
+      - name: Attest SPDX SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/*.exe
+          sbom-path: release-assets/claudometer-${{ github.ref_name }}.sbom.spdx.json
+      - name: Create reviewable draft
+        id: draft
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = Get-ChildItem -LiteralPath release-assets -File |
+            Sort-Object Name |
+            ForEach-Object FullName
+          gh release create $env:GITHUB_REF_NAME @assets `
+            --draft `
+            --generate-notes `
+            --repo $env:GITHUB_REPOSITORY `
+            --verify-tag
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not create the draft release.'
+          }
+          'created=true' >> $env:GITHUB_OUTPUT
+      - name: Download and smoke-test draft assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Path release-smoke | Out-Null
+          gh release download $env:GITHUB_REF_NAME `
+            --dir release-smoke `
+            --pattern 'claudometer-*' `
+            --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not download assets from the draft release.'
+          }
+          ./ci/check-release.ps1 `
+            -Tag $env:GITHUB_REF_NAME `
+            -AssetsPath release-smoke `
+            -RequireEvidence `
+            -PublicKeyHex $env:RELEASE_PUBLIC_KEY_HEX `
+            -Sequence $env:RELEASE_SEQUENCE `
+            -MinimumUpdaterVersion $env:MINIMUM_UPDATER_VERSION
+          $signer = "$env:GITHUB_REPOSITORY/.github/workflows/release.yml"
+          foreach ($exe in Get-ChildItem -LiteralPath release-smoke -Filter '*.exe' -File) {
+            gh attestation verify $exe.FullName `
+              --repo $env:GITHUB_REPOSITORY `
+              --signer-workflow $signer `
+              --source-digest $env:GITHUB_SHA `
+              --source-ref $env:GITHUB_REF
+            if ($LASTEXITCODE -ne 0) {
+              throw "Build provenance verification failed for '$($exe.Name)'."
+            }
+            gh attestation verify $exe.FullName `
+              --repo $env:GITHUB_REPOSITORY `
+              --signer-workflow $signer `
+              --source-digest $env:GITHUB_SHA `
+              --source-ref $env:GITHUB_REF `
+              --predicate-type https://spdx.dev/Document/v2.3
+            if ($LASTEXITCODE -ne 0) {
+              throw "SBOM attestation verification failed for '$($exe.Name)'."
+            }
+          }
+          ./ci/verify-demo.ps1 `
+            -ExePath "release-smoke/claudometer-$env:GITHUB_REF_NAME-windows-x64.exe"
+      - name: Recheck protected release infrastructure
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDOMETER_RELEASE_ADMIN_READ_TOKEN }}
+        run: ./ci/check-release-infrastructure.ps1 -Repository $env:GITHUB_REPOSITORY
+      - name: Publish verified immutable release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit $env:GITHUB_REF_NAME `
+            --draft=false `
+            --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not publish the verified release.'
+          }
+      - name: Confirm published release is immutable
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $release = gh release view $env:GITHUB_REF_NAME `
+            --repo $env:GITHUB_REPOSITORY `
+            --json isDraft,isImmutable | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.isDraft -ne $false -or
+              $release.isImmutable -ne $true) {
+            throw 'Published release did not become immutable.'
+          }
+      - name: Remove failed draft
+        if: failure() && steps.draft.outputs.created == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $release = gh release view $env:GITHUB_REF_NAME `
+            --repo $env:GITHUB_REPOSITORY `
+            --json isDraft | ConvertFrom-Json
+          if ($LASTEXITCODE -eq 0 -and $release.isDraft -eq $true) {
+            gh release delete $env:GITHUB_REF_NAME --yes --repo $env:GITHUB_REPOSITORY
+          } else {
+            Write-Output 'Release is not a draft; cleanup will not delete it.'
+          }
