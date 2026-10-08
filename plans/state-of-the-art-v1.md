@@ -151,7 +151,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | Foundation | Baseline and required gates | **Done**; SIZE-01 profile audit complete on `chore/size-audit` |
 | `v0.8` | Trustworthy state and system safety | **Done on `main`, unreleased** |
 | `v0.9` | Authenticated, crash-safe updates | **Done on `main`, unreleased** |
-| R0 | Ship the trust-root release | **Blocked on human provisioning** (§7) |
+| R0 | Ship the trust-root release | **Notes prepared (REL-03)**; publication blocked on human signing/provisioning (§7) |
 | `v0.10` | State core, diagnostics, Codex documented source | Not started |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
 | `v0.12` | Glanceable status, tray, and alerts | Not started |
@@ -177,7 +177,7 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 
 1. **WIP-00** — verify the committed accessibility work (§9.1); **Narrator verification deferred by the owner on 2026-10-08**. WIP-00 and A11Y-01 remain unchecked; the owner explicitly authorized proceeding to SIZE-01 and release-note preparation without this check.
 2. **SIZE-01** — **done**: size audit, measured `z` profile, and headroom plan (§3.2) on `chore/size-audit`, branched from PR #2.
-3. **REL-03** — prepare the trust-root release for the human (§7).
+3. **REL-03** — **done (notes only)**: proposed `docs/release-notes/0.9.0.md`, expanded Unreleased changelog, local release-input check, and live protection audit (§7). Human publishes.
 4. **MODEL-01** → **STATE-01** → **APP-01** → **CACHE-01** (§8.1).
 5. **ERR-01** — actionable error states (§8.2).
 6. **DIAG-01** → **DIAG-02** (§8.3).
@@ -456,7 +456,7 @@ Abort a rollout immediately if: cross-account data is rendered, cached, alerted,
 
 Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authenticated release is also the trust-root bootstrap (UPD-02): existing users must install it manually and verify it independently; the old updater cannot authenticate it.
 
-- [ ] **REL-03 — Prepare the trust-root release (agent prepares; human publishes).**
+- [x] **REL-03 — Prepare the trust-root release (agent prepares; human publishes).**
   - Prepare notes after WIP-00 local verification. The owner deferred Narrator on 2026-10-08 and authorized proceeding; notes must disclose incomplete A11Y-01 and do not authorize publishing or claim screen-reader support.
   - Draft `CHANGELOG.md` for the next version covering all `v0.8` and `v0.9` work. Lead with the manual-install requirement and the verification steps from `docs/release-manifest-v1.md`.
   - Draft release notes at `docs/release-notes/<version>.md` with: what changed for users, the manual install and verification procedure, the Vibecode legacy-recovery notice, and the update-check default for new installs.
@@ -466,6 +466,7 @@ Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authentic
     2. Choose the version (recommended `0.9.0`), bump `Cargo.toml`, commit, and wait for `build` to go green.
     3. Push the tag and approve the `release` environment. The workflow smoke-tests and publishes automatically; then apply the drafted notes with `gh release edit <tag> --notes-file docs/release-notes/<version>.md`.
     4. Record the dated provisioning entry in `docs/release-manifest-v1.md`.
+  - Completed 2026-10-08: proposed 0.9.0 notes and Unreleased changelog cover v0.8/v0.9, manual verification, Vibecode recovery, update consent, and deferred A11Y. fmt/clippy/115 tests/x64 build pass; `ci/check-release.ps1` passes on actual v0.7.3 isolated assets and live `ci/check-release-infrastructure.ps1` passes. No version bump or publication. **Publishing prerequisite:** current release workflow signs Ed25519 manifests but has no Authenticode signing/verification step required by the bootstrap contract. The human checklist records signing integration, private/public policy provisioning, real ARM64 runtime, version PR, immutable tag, and approval. Rollback: revert the notes; no runtime/data change. See `docs/release-notes/0.9.0.md` for §0.7 handoff.
 
 ---
 

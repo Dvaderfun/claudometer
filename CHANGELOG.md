@@ -4,11 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 
 ## [Unreleased]
 
+**Proposed trust-root release: 0.9.0 (human chooses version). Manual installation required.** Existing versions through 0.7.3 cannot authenticate this first trust-root release. Before running the download, compare its SHA-256 with an independently authenticated record and verify the Authenticode publisher/certificate. See the [verification procedure](docs/release-manifest-v1.md#trust-root-bootstrap) and [draft release notes](docs/release-notes/0.9.0.md). The package version remains 0.7.3; these notes do not publish a release.
+
 ### Added
 - Flyout and Settings expose a UI Automation fragment tree with named controls, button Invoke, switch Toggle, keyboard focus events, and readable quota labels. Local UIA client checks pass; Narrator speech remains unverified, and Selection/RangeValue patterns and targeted property events remain A11Y-01 follow-ups. See [WIP-00 verification](docs/verification/wip-00.md).
+- Atomic validated settings and account-scoped alert receipts retain verified backups and preserve malformed files for recovery. Unknown settings survive migration, and legacy settings remain readable for downgrade compatibility.
+- Vibecode keeps its wake lock separate from the Advanced lid-close override. Power changes use a durable recovery journal, checked writes/read-back, and conservative restoration of the recorded scheme. Legacy lid values require an explicit Restore action.
 
 ### Changed
 - Optimize release builds for size with `opt-level = "z"`: the local provisioned x64 executable shrinks by 74,240 bytes and ARM64 by 88,576 bytes. The size audit records startup measurements and milestone allowances; dependency features and runtime behavior are preserved.
+- Automatic update checks default off for genuinely new installations; existing settings migrate to enabled. Settings provides an explicit toggle. Portable installs use authenticated journaled updates; managed or ambiguous installs offer a release-page action.
+
+### Fixed
+- Provider results are bound to account, generation, and request identity, so obsolete asynchronous work cannot replace another account's usage, plan, cooldown, or alert state.
+- Usage alerts evaluate only newly accepted successful fetches and deduplicate by provider, account, limit, and reset-window instance; stale snapshots cannot trigger alerts.
+- Credential reads handle atomic CLI file replacement without unnecessary sign-in work. Weekly reset formatting respects local daylight-saving offsets, and missing/partial/oversized provider data is handled defensively with bounded rows and text.
 
 ### Security
 - Release tags now build once with `--locked`, publish signed manifests and an SPDX SBOM, create GitHub provenance/SBOM attestations, verify downloaded draft assets, smoke-test the downloaded x64 executable, and publish only with immutable releases enabled.
