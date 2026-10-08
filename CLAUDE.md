@@ -60,9 +60,16 @@ SIZE-01 selects release `opt-level = "z"`: current x64 **947,712 bytes unprovisi
 
 ## Release process
 
-Human-only; agents prepare notes and stop (see `plans/state-of-the-art-v1.md` §7).
+R0 0.9.0 removes Ed25519's optional `fast` tables after production-key ARM64
+failed the original 10% size gate. Final local provisioned sizes are x64
+1,145,344 bytes and ARM64 1,029,120 bytes; all signature/recovery tests pass.
+The production manifest key is configured. Release notes are rendered from
+the actual GitHub artifacts before draft publication. Windows signing remains
+SIGN-01/v1.0; never claim Authenticode or completed Narrator/ARM64 runtime proof.
+
+Human-only by default. The owner explicitly authorized agent setup, tagging, approval, and publication for 0.9.0 (ADR 0006); future releases require separate authorization.
 
 1. Bump `Cargo.toml` version, update `CHANGELOG.md`.
 2. Commit, push, wait for `build` workflow green.
-3. `git tag vX.Y.Z && git push origin vX.Y.Z`, then approve the `release` environment. `release.yml` signs the manifest, attests, creates a draft with generated notes, smoke-tests the downloaded assets, and **publishes automatically** (a failed run deletes its draft). It needs `CLAUDOMETER_RELEASE_PUBLIC_KEY_HEX`, `CLAUDOMETER_RELEASE_SEQUENCE`, and `CLAUDOMETER_RELEASE_ADMIN_READ_TOKEN` provisioned.
+3. `git tag vX.Y.Z && git push origin vX.Y.Z`, then approve the `release` environment. `release.yml` signs the manifest, attests, creates a draft with exact-artifact notes, smoke-tests the downloaded assets, and **publishes automatically** (a failed run deletes its draft). It needs `CLAUDOMETER_RELEASE_PUBLIC_KEY_HEX`, `CLAUDOMETER_RELEASE_SEQUENCE`, and `CLAUDOMETER_RELEASE_ADMIN_READ_TOKEN` provisioned.
 4. Optionally replace the notes: `gh release edit vX.Y.Z --notes-file <notes>`. Tags and assets are immutable; never reuse a version.

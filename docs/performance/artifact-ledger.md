@@ -305,3 +305,27 @@ diagnostics UI/keyboard/clipboard guard and 22 UIA checks are verified.
 Dedicated support process reads local identity without creating UI or
 executing requests. No new ARM64/idle-CPU claim. Evidence/rollback:
 [`../verification/diag-02.md`](../verification/diag-02.md).
+
+## R0 / 0.9.0 release preparation (2026-10-09)
+
+Production-key builds with Ed25519 `fast`: x64 1,163,776 bytes, ARM64
+1,037,312 bytes. ARM64 failed its original cumulative 10% regression limit
+of 1,034,598 bytes. Removing only optional precomputed `fast` tables produces
+x64 **1,145,344 bytes** (-18,432 / -1.58%) and ARM64 **1,029,120 bytes**
+(-8,192 / -0.79%). Both pass the unchanged hard ceiling and regression gates.
+No dependency version, verifier behavior, runtime feature, or gate is changed.
+The same change was evaluated but not selected in SIZE-01; release headroom
+now requires it. Cargo graph/licenses remain unchanged.
+
+All 168 tests (including signature/rotation/replay/recovery) pass, along with
+fmt, Clippy, both architecture builds, privacy/dependency/workflow checks,
+x64 demo safety, and local production-key manifest signature verification.
+Five isolated x64 starts: 46.239 ms median / 56.803 ms p95. The one-second
+ancillary sample does not establish ten-minute idle CPU or memory compliance.
+ARM64 is cross-built/artifact-checked, not tested on ARM64 hardware.
+
+Local hashes are recorded under ignored `target/r0-release/`; final release
+hashes are generated from the exact GitHub artifacts and appear in published
+notes. Authenticode remains deferred to v1.0 per owner ADR 0006. Rollback:
+restore `fast` only with renewed size proof, or publish an authenticated
+higher-sequence rollback; never overwrite release tags/assets or delete journals.

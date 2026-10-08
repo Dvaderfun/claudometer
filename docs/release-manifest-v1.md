@@ -117,80 +117,59 @@ other network response may bridge this boundary. An unprovisioned build
 likewise rejects every manifest, even when the manifest is otherwise valid and
 correctly signed.
 
-Existing users must manually install the first trust-root-enabled release. That
-bootstrap artifact must be Authenticode-signed so Windows supplies an
-independent trust path for the executable. Its release notes must label it as
-the bootstrap release and publish all of these values before the release is
-made public:
+Existing users must manually install 0.9.0. Owner decision ADR 0006 defers
+Authenticode signing to v1.0: these executables are unsigned for Windows.
+Bootstrap verification uses SHA-256 plus GitHub build provenance for the
+`Dvaderfun/claudometer` repository and `.github/workflows/release.yml` at the
+exact release tag. This proves GitHub source/workflow identity, not a Windows
+publisher identity; users must trust that identity to obtain the initial key.
+No downloaded key or checksum alone can authorize automatic bootstrap.
 
-- exact version, tag, architecture-specific asset names, and SHA-256 hashes;
-- Authenticode publisher subject and SHA-256 certificate fingerprint;
-- the 32-byte Ed25519 release public key and its SHA-256 fingerprint;
-- the initial positive release sequence embedded in the executable;
-- the UTC provisioning time and a separately authenticated location from which
-  users can obtain the expected verification values.
+Release notes publish exact executable hashes/sizes, Ed25519 public key and
+fingerprint, sequence, and provisioning time before publication. The workflow
+renders these values from the tested artifacts, creates a draft, and publishes
+only after downloaded manifests, signatures, SBOM, provenance, and x64 demo
+checks pass. Windows signing and hardware/Narrator verification remain v1.0 work.
 
-The bootstrap release must publish only the versioned asset names specified in
-this document. In particular, it must not contain the legacy `claudometer.exe`
-or `claudometer.exe.sha256` aliases recognized by the 0.7.x updater. Omitting
-those aliases makes old clients report no automatic-update candidate instead
-of letting their unauthenticated path cross the bootstrap boundary.
+The bootstrap release publishes only versioned asset names. It never contains
+legacy `claudometer.exe` or `claudometer.exe.sha256` aliases recognized by old
+clients, so they report no automatic-update candidate across this boundary.
 
-Do not treat a checksum file downloaded beside the executable as independent
-evidence. Obtain the expected values from the bootstrap release notes and the
-separately authenticated location named there, and require them to agree.
-Then, from PowerShell, verify the downloaded executable before running it:
+Verify before running (replace the hash with the value in release notes):
 
 ```powershell
-$asset = Resolve-Path '.\claudometer-vX.Y.Z-windows-x64.exe'
-$expectedSha256 = '<64 lowercase hex characters from both published records>'
-$expectedPublisher = '<exact Authenticode subject from both published records>'
-$expectedCertSha256 = '<64 lowercase hex characters from both published records>'
-
-$actualSha256 = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($actualSha256 -cne $expectedSha256) { throw 'Claudometer SHA-256 mismatch' }
-
-$signature = Get-AuthenticodeSignature -LiteralPath $asset
-if ($signature.Status -ne 'Valid') { throw "Invalid Authenticode signature: $($signature.Status)" }
-if ($signature.SignerCertificate.Subject -cne $expectedPublisher) { throw 'Unexpected publisher' }
-$hasher = [Security.Cryptography.SHA256]::Create()
-try {
-    $actualCertSha256 = ([BitConverter]::ToString(
-        $hasher.ComputeHash($signature.SignerCertificate.RawData)
-    )).Replace('-', '').ToLowerInvariant()
-} finally {
-    $hasher.Dispose()
+$asset = Resolve-Path '.\claudometer-v0.9.0-windows-x64.exe'
+$expectedSha256 = '<64 lowercase hex characters from verified release notes>'
+if ((Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedSha256) {
+    throw 'Claudometer SHA-256 mismatch'
 }
-if ($actualCertSha256 -cne $expectedCertSha256) { throw 'Unexpected signing certificate' }
+gh attestation verify $asset.Path --repo Dvaderfun/claudometer --signer-workflow Dvaderfun/claudometer/.github/workflows/release.yml --source-ref refs/tags/v0.9.0
+if ($LASTEXITCODE -ne 0) { throw 'Claudometer provenance verification failed' }
 ```
 
-Use the matching `arm64` asset name on ARM64. Install or replace the existing
-copy only after every check succeeds. A mismatch, invalid or missing signature,
-absent independent record, or still-placeholder value is a stop condition.
+Use the matching ARM64 file/hash on ARM64. A mismatch or failed attestation
+verification stops installation. The released notes include executable hashes
+and exact sizes; the public key below authenticates subsequent updates.
 
 ### Production bootstrap record
 
-Production inputs are not yet provisioned. This table is the authoritative
-record and must be completed atomically with the first trust-root-enabled
-release; placeholders are forbidden in published release notes.
-
 | Field | Recorded value |
 |---|---|
-| Status as of 2026-09-03 | Not provisioned |
-| Provisioned at (UTC) | Pending |
-| Bootstrap version and tag | Pending |
-| Ed25519 public key (lowercase hex) | Pending |
-| Ed25519 raw-key SHA-256 fingerprint | Pending |
-| Initial embedded release sequence | Pending; must be greater than zero |
-| Authenticode publisher subject | Pending |
-| Authenticode certificate SHA-256 fingerprint | Pending |
-| Separately authenticated verification record | Pending |
+| Status | Production public policy provisioned; release prepared for GitHub |
+| Provisioned at (UTC) | 2026-10-08T23:33:54Z |
+| Bootstrap version and tag | 0.9.0 / v0.9.0 |
+| Ed25519 public key (lowercase hex) | 5741ac7eec5c56c96c5dcf12e7be47a2586b2739ec1f309f26b52527578660f9 |
+| Ed25519 raw-key SHA-256 fingerprint | ee7fcaf40164c6d8f8b9f3a34050b0173a7d3e28ef5c5b6bffc12b61af86d1a5 |
+| Initial embedded release sequence | 1 |
+| Minimum updater version | 0.9.0 |
+| Windows publisher/signature | Unsigned; SIGN-01 deferred to v1.0 by ADR 0006 |
+| Verification record | Tagged source record plus verified GitHub release-workflow attestations |
 
-The release owner must record the real values here and in the bootstrap release
-notes when provisioning occurs. The public key and sequence must be the exact
-values supplied to the build below, and release evidence must show that the
-produced binaries contain that policy. Later binaries embed the highest release
-sequence they represent so replayed manifests remain rejected.
+The private key is outside git with a protected local backup and a protected
+release-environment secret. Release keys never enter provider state. Subsequent
+releases increment sequence monotonically and preserve this public key until
+an authenticated rotation. Production hashes are generated from final GitHub
+artifacts; local-build hashes are not substituted for published artifacts.
 
 ## Rollback authorization
 

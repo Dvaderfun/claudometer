@@ -1,6 +1,6 @@
 # Claudometer privacy and system-effects contract
 
-This document describes the behavior of the Claudometer `0.7.3` source tree. It
+This document describes the behavior of the Claudometer `0.9.0` source tree. It
 is an inventory of data access and system effects, not a general legal privacy
 policy. The inventory was verified against the request, storage, registry,
 process, notification, update, and power-management call sites in `src/` and the

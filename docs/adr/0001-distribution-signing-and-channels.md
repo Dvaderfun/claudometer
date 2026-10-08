@@ -1,6 +1,6 @@
 # ADR 0001: Distribution, signing, and update channels
 
-- Status: Accepted for local implementation; external onboarding blocked
+- Status: Accepted for local implementation; external onboarding blocked. R0 signing/bootstrap prerequisites superseded by ADR 0006 (2026-10-09).
 - Date: 2026-09-03
 - Roadmap: `DIST-00`, prerequisite for `UPD-00` and `SIGN-01`
 
@@ -29,7 +29,7 @@ Versions without an embedded trust root—including all published versions
 through 0.7.3—cannot authenticate a newly supplied Ed25519 public key. The first
 trust-root-enabled release is therefore a manual migration boundary: existing
 users must download it themselves and verify its published SHA-256 and
-Authenticode identity before installation. The old updater must not download a
+GitHub release-workflow provenance before installation (ADR 0006). The old updater must not download a
 key, accept a consent-based exception, or automatically install across this
 boundary. The bootstrap release omits the legacy `claudometer.exe` and
 `claudometer.exe.sha256` aliases recognized by 0.7.x clients. The verification

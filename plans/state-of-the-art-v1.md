@@ -65,7 +65,7 @@ A task is **done** only when code, tests, docs, and the rollback note (§6) land
 - Never add Tokio, a WebView, a managed runtime, a loopback server, a service, or a scheduled task.
 - Never add a crate without recording its x64 size delta, license, and maintenance status in the commit message.
 - Never delete or hand-edit `power-override.v1.json` or `update-operation.v1.json`.
-- Never push tags, publish or edit releases, change repository settings or rulesets, or provision secrets/variables. Those are human-only (§7).
+- Tags, releases, repository settings/rulesets, and secrets/variables are human-only by default (§7). The owner explicitly authorized agent setup and publication of 0.9.0 on 2026-10-09 (ADR 0006); this does not authorize future releases or provider credential changes.
 - Never bump `Cargo.toml` `version` unless the task explicitly says so.
 - Never use `git push --force`, `--no-verify`, or interactive git commands.
 - Never “modernize” anything `CLAUDE.md` calls load-bearing (acrylic policy, WARP device, `LoadIconW` allow, `CREATE_NEW_CONSOLE` login).
@@ -149,17 +149,17 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | Milestone | Theme | State |
 |---|---|---|
 | Foundation | Baseline and required gates | **Done**; SIZE-01 profile audit complete on `chore/size-audit` |
-| `v0.8` | Trustworthy state and system safety | **Done on `main`, unreleased** |
-| `v0.9` | Authenticated, crash-safe updates | **Done on `main`, unreleased** |
-| R0 | Ship the trust-root release | **Notes prepared (REL-03)**; publication blocked on human signing/provisioning (§7) |
-| `v0.10` | State core, diagnostics, Codex documented source | **In progress** (MODEL-01 merged; state/cache/errors/diagnostics complete locally; CODEX-01 next) |
+| `v0.8` | Trustworthy state and system safety | **Done on `main`; included in prepared 0.9.0 release** |
+| `v0.9` | Authenticated, crash-safe updates | **Done on `main`; included in prepared 0.9.0 release** |
+| R0 | Ship the trust-root release | **0.9.0 preparation authorized**; GitHub manifest policy provisioned, Windows signing deferred to v1.0 (ADR 0006) |
+| `v0.10` | State core, diagnostics, Codex documented source | **In progress** (model/state/cache/errors/diagnostics committed on `main`; CODEX-01 blocked on the app-server credential contract) |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
 | `v0.12` | Glanceable status, tray, and alerts | Not started |
 | `v1.0` | Signed distribution | Not started |
 | `v1.1` | History-refined pacing | **Gated** on field evidence |
 | `v1.2` | One gated provider | Not started |
 
-`Cargo.toml` still says `0.7.3`. Everything since `5b735ce` ships in the first R0 release.
+`Cargo.toml` says `0.9.0`. Everything since `5b735ce` ships in the first R0 release, including the completed state/cache/error/diagnostic slices.
 
 ### 2.2 Facts an executor needs now
 
@@ -181,7 +181,7 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 4. **MODEL-01 done** → **STATE-01 done** → **APP-01 done** → **CACHE-01 done** (§8.1).
 5. **ERR-01 done** — actionable error states (§8.2).
 6. **DIAG-01 done** → **DIAG-02 done** (§8.3).
-7. **CODEX-01 next** → **CODEX-02** (§8.4).
+7. **CODEX-01 blocked** → **CODEX-02** (§8.4): installed Codex 0.159.1 can proactively refresh and persist managed credentials during a limits read. `refreshToken: false` does not disable this path. Resolve the credential contract before implementing or measuring live app-server polling; see `docs/verification/codex-01-preflight.md`.
 8. **PACE-01** → **ROW-01** → **FRESH-01** (§10.1). If the v0.10 tail is blocked, PACE-01 and ROW-01 may start once MODEL-01 is done, and FRESH-01 once APP-01 is done.
 9. **A11Y-02**, **LAYOUT-01**, **LAYOUT-02**, **RENDER-01** (§9).
 10. **ONBOARD-01**, **ONBOARD-02**, **KEY-01**, **UI-TEST-01** (§9).
@@ -448,13 +448,15 @@ Session                                   ~3% spare      ← name + optional pac
 | `v1.1` | Disable history and delete its bounded file | Live quota never depends on history |
 | `v1.2` | Disable the new provider independently | No other provider's state, icon, alert, or history changes |
 
-Abort a rollout immediately if: cross-account data is rendered, cached, alerted, or logged; a safety/update journal cannot converge; an unsigned or untrusted executable reaches an execution boundary; a migration stops the previous release from starting; the hard size or memory budget is exceeded without an ADR; or a critical Narrator/keyboard regression appears.
+Abort a rollout immediately if: cross-account data is rendered, cached, alerted, or logged; a safety/update journal cannot converge; an unauthenticated executable reaches an execution boundary (Windows Authenticode additionally required from v1.0; ADR 0006); a migration stops the previous release from starting; the hard size or memory budget is exceeded without an ADR; or a critical Narrator/keyboard regression appears.
 
 ---
 
 ## 7. R0: ship the trust-root release
 
-Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authenticated release is also the trust-root bootstrap (UPD-02): existing users must install it manually and verify it independently; the old updater cannot authenticate it.
+Owner decision 2026-10-09 (ADR 0006) supersedes the historical human-only/Authenticode prerequisites below for 0.9.0: agent setup and publication are authorized, Windows signing stays SIGN-01/v1.0, and bootstrap uses hashes plus GitHub source/workflow provenance. Narrator and real ARM64 runtime remain disclosed as unverified. All existing source, artifact, signature, manifest, and repository-protection gates remain required.
+
+Everything in `v0.8` and `v0.9` is on `main` and included in the prepared 0.9.0 release. The first authenticated release is also the trust-root bootstrap (UPD-02): existing users must install it manually and verify it independently; the old updater cannot authenticate it.
 
 - [x] **REL-03 — Prepare the trust-root release (agent prepares; human publishes).**
   - Prepare notes after WIP-00 local verification. The owner deferred Narrator on 2026-10-08 and authorized proceeding; notes must disclose incomplete A11Y-01 and do not authorize publishing or claim screen-reader support.
@@ -531,6 +533,7 @@ Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authentic
 ### 8.4 Codex documented source
 
 - [ ] **CODEX-01 — Codex app-server adapter.**
+  - Preflight 2026-10-09: the installed 0.159.1 source calls `auth_with_http_client_factory()` → `auth()` → proactive refresh → token persistence during `account/rateLimits/read`. This conflicts with §1.2 and the binding credential gotcha; the managed adapter remains unimplemented. The documented experimental external-token mode requires a separate design decision and isolation proof before use. CODEX-02 cannot measure/promote an unsafe adapter. Evidence and unblock conditions: `docs/verification/codex-01-preflight.md`.
   - Prefer the documented `codex app-server` JSON-RPC `account/rateLimits/read`. Request account state without forcing a token refresh.
   - Parse dynamic `rateLimitsByLimitId`, plan, reset metadata, spend-control state, and reset-credit availability (display only; never consume credits).
   - Model-specific limits (for example the `additional_rate_limits` entries in the compatibility payload) become `LimitKind::Model` rows using duration-based classification; omit them when absent.
