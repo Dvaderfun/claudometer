@@ -1,124 +1,228 @@
 # Claudometer: state-of-the-art roadmap
 
-**Status:** Proposed implementation plan
-**Baseline:** `v0.7.3` / commit `5b735ce`
-**Plan date:** 2026-09-03
-**Primary target:** a trustworthy, accessible, signed `v1.0` for Windows 11 x64 and ARM64
+**Revision:** 2 (2026-10-08). Revision 1 (2026-09-03, baseline `v0.7.3` / `5b735ce`) is in git history.
+**Executor:** an autonomous coding agent working task by task. Read §0 before touching code.
+**Primary target:** a trustworthy, accessible, glanceable, signed `v1.0` for Windows 11 x64 and ARM64.
 
-## 1. Executive decision
+---
 
-Claudometer will compete on trust, native Windows quality, and footprint—not on provider count.
+## 0. Executor brief (read first, every session)
 
-The product thesis is:
+### 0.1 What to read before the first task
+
+1. `CLAUDE.md` — working knowledge. Its “Hard-won gotchas” section is **binding**; treat each bullet as a test you must not break.
+2. `ARCHITECTURE.md` — current design.
+3. `PRIVACY.md` — the authoritative inventory of every network destination, file, registry key, child process, and system change. Any change to those must update it in the same commit.
+4. `docs/adr/0001-distribution-signing-and-channels.md` — distribution decisions.
+5. This plan: §2 (status board) tells you what to do next; the task's own section tells you how.
+
+When the plan and the code disagree about a **fact** (a file name, an existing behavior), the code wins: adapt and note it in your report. When they disagree about an **invariant** (§1.2), the plan wins: stop and report.
+
+### 0.2 Environment
+
+- Windows 11, PowerShell 7 (`pwsh`). Rust `1.97.1` pinned by `rust-toolchain.toml`, MSVC toolchain, `windows` crate pinned to `0.58`.
+- A running Claudometer locks the executable. Before every build: `Stop-Process -Name claudometer -Force -ErrorAction SilentlyContinue`.
+- Run each gate command on its own and read its full output before running the next one.
+
+### 0.3 Required gates (run in this order for every task)
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets --all-features
+cargo build --locked --release --target x86_64-pc-windows-msvc
+```
+
+Then, for any task that touches UI or runtime behavior:
+
+```powershell
+./ci/verify-demo.ps1 -ExePath .\target\x86_64-pc-windows-msvc\release\claudometer.exe   # demo mode performs no side effects
+.\target\x86_64-pc-windows-msvc\release\claudometer.exe --demo both   # also: claude-only, codex-only, neither, loading, stale, cooldown, error, many, settings
+```
+
+Demo flags: `--demo <scenario>`, `--demo-light`, `--demo-contrast`, `--demo-hidden`, `--demo-ready-event=<name>`.
+Drive the flyout without clicking: see “Verify changes” in `CLAUDE.md`.
+For any task that changes code size, record x64 bytes of the release build in `docs/performance/artifact-ledger.md` (§3.1).
+
+### 0.4 Per-task loop
+
+1. Pick the first unchecked task in the §2.3 queue whose dependencies (§15) are all done.
+2. Read the files the task names. Use `codegraph explore "<symbols>"` when `.codegraph/` exists; otherwise search.
+3. If the task changes existing behavior, first add a characterization test that pins today's behavior, then change it deliberately.
+4. Implement the smallest change that meets the task's acceptance list. Match the surrounding code style and comment density.
+5. Run all §0.3 gates. Fix failures; never weaken a test or a gate to pass.
+6. Verify at runtime when the task touches UI, tray, alerts, timers, or processes.
+7. Update, in the same commit: this plan's checkbox and §2 board, `CHANGELOG.md` under `## Unreleased`, `PRIVACY.md` if any side effect changed, the size ledger if size changed, and `CLAUDE.md` if you learned a new non-obvious gotcha.
+8. Commit with a Conventional Commit message scoped like the history (`feat(ui): …`, `fix(core): …`, `docs: …`). One task per commit unless the task says otherwise.
+9. Write the handoff report (§0.7).
+
+A task is **done** only when code, tests, docs, and the rollback note (§6) land together and every acceptance bullet is demonstrated, not assumed.
+
+### 0.5 Never do these
+
+- Never write, refresh, rotate, or exchange provider credentials. Never touch `.credentials.json` or Codex `auth.json` except to read. On 401/403, tell the user to open the CLI.
+- Never call a live provider endpoint from an automated test.
+- Never add Tokio, a WebView, a managed runtime, a loopback server, a service, or a scheduled task.
+- Never add a crate without recording its x64 size delta, license, and maintenance status in the commit message.
+- Never delete or hand-edit `power-override.v1.json` or `update-operation.v1.json`.
+- Never push tags, publish or edit releases, change repository settings or rulesets, or provision secrets/variables. Those are human-only (§7).
+- Never bump `Cargo.toml` `version` unless the task explicitly says so.
+- Never use `git push --force`, `--no-verify`, or interactive git commands.
+- Never “modernize” anything `CLAUDE.md` calls load-bearing (acrylic policy, WARP device, `LoadIconW` allow, `CREATE_NEW_CONSOLE` login).
+
+### 0.6 Stop and ask the human when
+
+- A task is blocked on an external action (signing certificate, secrets, Winget ownership, ARM64 hardware).
+- A product decision is needed that §16 does not settle.
+- The x64 release executable would exceed the 1.25 MiB hard ceiling, or a single task adds more than 10%.
+- A test cannot be made deterministic without sleeping or network access.
+- Real-hardware behavior contradicts the plan (for example, a Windows API renders differently on the DirectComposition flyout).
+
+### 0.7 Handoff report (end of every task)
+
+```text
+Task: <ID> — <title>
+Result: done | partial | blocked
+Changed: <files>
+Gates: fmt ok | clippy ok | test ok (N passed) | release build ok
+Runtime check: <what you ran and what you saw>
+Size: x64 <bytes> (<±%> vs previous ledger row)
+Docs updated: <plan, CHANGELOG, PRIVACY, ledger, CLAUDE.md>
+Deviations from plan: <none | list with reason>
+Follow-ups: <none | list>
+```
+
+---
+
+## 1. Product thesis and contract
 
 > The smallest trustworthy native Windows quota monitor for AI coding tools.
 
-The current strengths remain load-bearing:
+Claudometer competes on trust, native Windows quality, footprint, and **one-glance answers**, not on provider count. Provider breadth, dashboards, and themes never compensate for weak safety or trust. The stopping rule: if a feature does not improve trust, reliability, accessibility, actionability, or distribution while staying inside the footprint contract, it is not on this roadmap.
 
-- Native Win32 + Direct2D/DirectComposition; no WebView or managed runtime.
-- One small process, no service, daemon, local server, or resident helper.
+### 1.1 Load-bearing strengths
+
+- Native Win32 + Direct2D/DirectComposition. No WebView or managed runtime.
+- One small process. No service, daemon, local server, or resident helper.
 - Provider credentials stay owned by the official CLIs.
-- Fast glanceable tray UI with low memory and CPU use.
+- Fast, glanceable tray UI with low memory and CPU use.
 - Honest freshness, stale-data, and rate-limit behavior.
 
-The route to state of the art is therefore:
+### 1.2 Invariants every release preserves
 
-1. Make every persistent or system-changing operation recoverable.
-2. Isolate all state by provider and account.
-3. Prefer documented local provider surfaces and label compatibility fallbacks.
-4. Make failures diagnosable without collecting telemetry or secrets.
-5. Make the custom native UI accessible and adaptive.
-6. Make installation, updating, and removal signed and boring.
-7. Add actionable pacing only after the foundation is proven.
+**Privacy and credentials**
 
-Provider breadth, dashboards, and themes do not compensate for weak safety or trust. No new provider is authorized before `v1.0`.
-
-## 2. How to use this plan
-
-- Treat every task ID as a separate issue and, normally, a separate reviewable pull request.
-- Keep every pull request runnable and independently releasable.
-- Add characterization tests before structural changes.
-- A milestone is complete only when every acceptance criterion is demonstrated.
-- Do not begin a later milestone to work around an incomplete earlier invariant.
-- If a task forces a product or security tradeoff, record an ADR under `docs/adr/` before implementation.
-- Check a task box only after code, tests, documentation, and rollback behavior land together.
-
-### 2.1 Start here
-
-The first implementation slice is intentionally small:
-
-1. Ship PR 0: disable new persistent lid-policy mutations while retaining the wake lock and all recovery data.
-2. Ship PR 1: format the tree and make format, Clippy, and tests required for branches and tags.
-3. Add current Claude/Codex fixtures and fake-clock state characterization.
-4. Measure and record the current binary/memory/startup/network baseline.
-5. Land the distribution/channel ADR early, even though installer work comes later.
-
-Stop that slice when the emergency risk is contained and Foundation acceptance is green. Do not start the architecture extraction in the same batch.
-
-## 3. Product contract
-
-Every release must preserve these invariants.
-
-### 3.1 Privacy and credentials
-
-- Claude Code and Codex remain the sole owners of login, refresh-token rotation, and durable credentials.
-- Claudometer never writes provider credential files and never stores refresh tokens, access tokens, browser cookies, or user-entered API keys.
-- Secret material remains worker-local, is never included in `Debug`, and is never serialized or logged.
+- Claude Code and Codex alone own login, refresh-token rotation, and durable credentials.
+- Claudometer never stores refresh tokens, access tokens, browser cookies, or user-entered API keys.
+- Secret material stays worker-local, is never in `Debug` output, and is never serialized or logged.
 - Every displayed snapshot belongs to an opaque account identity that matches the current credential identity.
-- No telemetry, cloud sync, prompt collection, response-body logging, or automatic crash upload.
-- Every network destination, file, registry key, child process, and system-setting mutation is documented with its trigger and user control.
+- No telemetry, analytics, cloud sync, prompt collection, response-body logging, or automatic crash upload.
+- Every network destination, file, registry key, child process, and system mutation is documented in `PRIVACY.md` with its trigger and user control. `ci/check-privacy.ps1` enforces the network allowlist.
 
-### 3.2 Native footprint
+**Native footprint**
 
-- No Electron, Tauri, WebView, .NET runtime, Node runtime, Java runtime, or browser shell.
-- No Tokio or general asynchronous runtime unless an ADR proves that the native thread/message model cannot meet a concrete requirement.
-- No persistent helper, Windows service, scheduled task, or loopback server.
-- No new dependency without measured binary-size, startup, security, maintenance, and license impact.
+- No Electron, Tauri, WebView, .NET, Node, Java, or browser shell.
+- No async runtime unless an ADR proves the thread/message model cannot meet a concrete requirement.
+- No persistent helper, service, scheduled task, or loopback server.
+- No continuous animation. Visible timers repaint at most once per 30 seconds; hidden windows never repaint on a timer.
 
-### 3.3 Data integrity
+**Data integrity**
 
 - Every quota has a provider, account, stable limit identity, source, observation time, and freshness state.
-- Cached data is loaded only after its account identity is matched locally.
-- Obsolete asynchronous results cannot update UI, cache, alerts, or cooldowns.
+- Cached data loads only after its account identity matches locally.
+- Obsolete asynchronous results never update UI, cache, alerts, or cooldowns.
 - A failed write leaves the previous valid file intact.
-- A failed system mutation leaves either verified original state or a durable actionable recovery journal.
-- Alerts consume accepted fresh-fetch events, never inferred freshness from the currently rendered view.
+- A failed system mutation leaves verified original state or a durable, actionable recovery journal.
+- Alerts consume accepted fresh-fetch events, never freshness inferred from the rendered view.
+- Stale data beats error UI: never wipe last-good data on a failed fetch (except on account change or authentication failure).
 
-### 3.4 Valid installation states
+**Valid installation states (all first-class and tested)**
 
-All of these are first-class, tested states:
+Claude only · Codex only · both · neither installed or signed in · portable · per-user installed.
 
-- Claude only.
-- Codex only.
-- Claude and Codex.
-- Neither provider installed or signed in.
-- Portable installation.
-- Per-user installed application.
+---
 
-## 4. Provisional performance budgets
+## 2. Status board (2026-10-08)
 
-Milestone `BASE-01` will measure and freeze the reference hardware and exact methodology. Until then, use these budgets:
+### 2.1 Milestones
 
-| Metric | Budget |
-|---|---:|
-| Current unsigned release executable | 815,104 bytes |
-| Signed executable soft target | at most 1.0 MiB |
-| Signed executable hard ceiling | 1.25 MiB; exceed only through an approved ADR |
-| Hidden private working set after 60 seconds | at most 10 MiB |
-| Visible two-provider flyout private working set | at most 15 MiB |
-| Idle CPU, excluding refresh work | below 0.1% over five minutes |
-| Tray readiness on reference Windows 11 VM | at most 500 ms p95 |
-| Statusline bridge duration | at most 50 ms p95 |
-| Persistent quota-history cap after `v1.0` | at most 1 MiB |
+| Milestone | Theme | State |
+|---|---|---|
+| Foundation | Baseline and required gates | **Done** |
+| `v0.8` | Trustworthy state and system safety | **Done on `main`, unreleased** |
+| `v0.9` | Authenticated, crash-safe updates | **Done on `main`, unreleased** |
+| R0 | Ship the trust-root release | **Blocked on human provisioning** (§7) |
+| `v0.10` | State core, diagnostics, Codex documented source | Not started |
+| `v0.11` | Accessible, adaptive first run | **In progress** (A11Y-01 uncommitted) |
+| `v0.12` | Glanceable status, tray, and alerts | Not started |
+| `v1.0` | Signed distribution | Not started |
+| `v1.1` | History-refined pacing | **Gated** on field evidence |
+| `v1.2` | One gated provider | Not started |
 
-Additional rules:
+`Cargo.toml` still says `0.7.3`. Everything since `5b735ce` ships in the first R0 release.
 
-- Report the executable, installer, memory, startup, and idle-CPU measurements separately.
-- A provider refresh may launch a deadline-bound child, but no child may remain afterward.
-- Opening or repainting a window must not itself create a network request unless the selected freshness policy says the data is due.
-- Investigate any executable growth greater than 10% in one pull request, even when still under the hard ceiling.
+### 2.2 Facts an executor needs now
 
-Initial defensive bounds, adjustable only with fixture evidence:
+- The authenticated updater pushed x64 to **1,097,728 bytes**, above the 1.0 MiB soft target. Headroom to the hard ceiling is **212,992 bytes** for everything below. Measure every task (§3.1).
+- `src/accessibility.rs` and edits to `src/main.rs`, `src/gfx.rs`, `src/util.rs`, `src/demo.rs`, `Cargo.toml` are an **uncommitted** A11Y-01 implementation (UIA fragment tree via `WM_GETOBJECT`, new `windows` features `implement`, `Win32_UI_Accessibility`, `Win32_System_Ole`, `Win32_System_Variant`, plus a `windows-core` dependency).
+- HTTP requests already use a 10-second `ureq` timeout (`api.rs`, `codex.rs`).
+- Existing modules: `accessibility`, `alerts`, `api`, `auth`, `codex`, `config`, `demo`, `gfx`, `main`, `network`, `provider/{mod,model}`, `release_manifest`, `runtime_state`, `state_policy`, `store`, `trayicon`, `updater`, `util`, `vibecode`.
+- Demo scenarios: `claude-only`, `codex-only`, `both`, `loading`, `stale`, `cooldown`, `error`, `neither`, `settings`, `many`.
+- Codex-family agents auto-load `AGENTS.md`, which points here and to `CLAUDE.md`. Read both explicitly either way.
+
+### 2.3 Execution queue
+
+Work strictly top to bottom, skipping only tasks whose dependencies are not done.
+
+1. **WIP-00** — land or park the uncommitted accessibility work (§9.1).
+2. **SIZE-01** — size audit and headroom plan (§3.2).
+3. **REL-03** — prepare the trust-root release for the human (§7).
+4. **MODEL-01** → **STATE-01** → **APP-01** → **CACHE-01** (§8.1).
+5. **ERR-01** — actionable error states (§8.2).
+6. **DIAG-01** → **DIAG-02** (§8.3).
+7. **CODEX-01** → **CODEX-02** (§8.4).
+8. **PACE-01** → **ROW-01** → **FRESH-01** (§10.1). If the v0.10 tail is blocked, PACE-01 and ROW-01 may start once MODEL-01 is done, and FRESH-01 once APP-01 is done.
+9. **A11Y-02**, **LAYOUT-01**, **LAYOUT-02**, **RENDER-01** (§9).
+10. **ONBOARD-01**, **ONBOARD-02**, **KEY-01**, **UI-TEST-01** (§9).
+11. **TRAY-01**, **TRAY-02**, **TRAY-03**, **ALERT-03**, **ALERT-04**, **PRIV-03** (§10).
+12. `v1.0` tasks (§11), most of which are human-gated.
+
+---
+
+## 3. Budgets
+
+### 3.1 Measured baseline and budgets
+
+Methodology: `docs/performance/foundation-baseline.md`, script `ci/measure-baseline.ps1`. CI enforces size through `ci/check-artifact.ps1` and `ci/release-budgets.json`.
+
+| Metric | Measured (Foundation) | Budget |
+|---|---:|---:|
+| x64 release executable, provisioned trust root | 1,097,728 bytes | Hard ceiling **1,310,720 bytes (1.25 MiB)**; see §3.2 |
+| ARM64 release executable, provisioned trust root | 995,840 bytes | Hard ceiling 1.25 MiB |
+| Hidden private working set, p95 | 1.53 MiB | **≤ 2.5 MiB** |
+| Visible two-provider flyout private working set, p95 | 4.45 MiB | **≤ 6.0 MiB** |
+| Idle CPU, excluding refresh work | < 0.002% | **≤ 0.01%** over ten minutes |
+| GDI handles hidden / visible | 10 / 13 | ≤ 16 / ≤ 24 |
+| Tray readiness, 50 starts | 50.4 ms median, 76.6 ms p95 | **≤ 150 ms p95** |
+| Codex app-server read (CODEX-02) | — | ≤ 2 s p95, hard kill at 10 s |
+
+Rules:
+
+- A single task that grows the executable more than 10% must explain the growth in the ledger before merge.
+- Opening or repainting a window never triggers a network request unless the freshness policy says data is due.
+- A provider refresh may launch a deadline-bound child process, but no child may remain afterward.
+- Re-measure memory and CPU after A11Y-01, APP-01, and PACE-01/FRESH-01 land.
+
+### 3.2 SIZE-01 — size audit and headroom plan
+
+- [ ] **SIZE-01**
+  - Build x64 and ARM64 with and without the A11Y WIP; record both in the ledger.
+  - Produce a size breakdown (for example `cargo bloat --release --crates` run locally, not added as a dependency) and list the five largest contributors.
+  - Evaluate, with measurements, at least: `opt-level = "z"` versus `"s"` (also re-measure startup and the 50-start p95), trimming unused `windows` features, and feature-gating heavy `ed25519-dalek` options.
+  - Decide a new soft target that fits the remaining roadmap. Record the decision and the expected per-milestone allowance in the ledger. The 1.25 MiB hard ceiling does not move without an ADR.
+  - Acceptance: ledger has per-crate numbers, a chosen profile, and a per-milestone allowance; `ci/release-budgets.json` is updated only if a size-reducing change lands.
+
+### 3.3 Defensive bounds (adjust only with fixture evidence)
 
 | Input/state | Bound |
 |---|---:|
@@ -129,86 +233,81 @@ Initial defensive bounds, adjustable only with fixture evidence:
 | Provider-controlled display string | 512 UTF-8 bytes |
 | Retained diagnostic files | 3 files × 256 KiB |
 | Update readiness timeout | 15 seconds |
-| Pacing limits retained | 32 current-account limit identities |
-| Pacing samples used per limit | 96 downsampled points |
+| HTTP request total timeout | 10 seconds |
+| Codex app-server request deadline | 10 seconds, then kill the process tree |
+| History limits retained (v1.1 only) | 32 current-account limit identities × 96 points |
 
-## 5. Target architecture
+---
 
-Keep the current single-process Win32 architecture. Move policy and state out of window procedures so it can be tested without creating windows.
+## 4. Target architecture
+
+Keep the single-process Win32 architecture. Move policy and state out of window procedures so it can be tested without windows.
 
 ```text
 Win32 messages
       │
       ▼
-App (UI-thread owner) ─────► View models ─────► flyout / settings / tray / alerts
+App (UI-thread owner) ─────► View models ─────► flyout / settings / tray / alerts / UIA
       │
       ├────► Provider controller ─────► short-lived source workers
       │                                      ├── documented local source
       │                                      └── compatibility endpoint
       │
       └────► Typed stores
-              ├── settings
-              ├── sanitized runtime cache
-              ├── power-operation journal
-              └── update-operation journal
+              ├── settings.json
+              ├── state.json (sanitized runtime cache)
+              ├── power-override.v1.json
+              └── update-operation.v1.json
 ```
 
-### 5.1 State ownership
+### 4.1 State ownership
 
 - The UI thread exclusively mutates `App` and provider state.
 - Workers receive immutable inputs and send typed `AppEvent` values through `std::sync::mpsc`.
-- `PostMessageW` only wakes the UI thread; the UI thread drains the event queue.
+- `PostMessageW` only wakes the UI thread; the UI thread drains the queue.
 - Every request and event carries `provider`, `generation`, `request_id`, and `account_key`.
-- Events that no longer match current state are discarded without any side effect.
-- Rendering consumes derived view models, never provider JSON or transport errors.
+- Events that no longer match current state are dropped with no side effect.
+- Rendering and UIA consume derived view models, never provider JSON or transport errors.
 
-### 5.2 Intended module boundaries
+### 4.2 Module boundaries
 
-| Module | Responsibility |
-|---|---|
-| `main.rs` | Process bootstrap, argument dispatch, window registration, message loop |
-| `app.rs` | UI-thread-owned `App`, commands, timers, window-event coordination |
-| `provider/model.rs` | Provider/source IDs, normalized limits, account keys, snapshots, typed errors |
-| `provider/state.rs` | Pure reducer, freshness policy, retry policy, display derivation |
-| `provider/mod.rs` | Static provider catalog and source-order policy |
-| `provider/claude.rs` | Claude credentials, source adapters, parsers |
-| `provider/codex.rs` | Codex credentials, app-server client, compatibility parser |
-| `poller.rs` | Worker spawning and typed event delivery; no provider-specific policy |
-| `config.rs` | Typed settings, validation, defaults, migration |
-| `store.rs` | Atomic JSON writes, replacement, corruption preservation |
-| `cache.rs` | Sanitized account-bound snapshots, alert receipts, retry deadlines |
-| `timefmt.rs` | Target-instant local-time conversion and reset labels |
-| `diagnostics.rs` | Stable error codes, bounded redacted log, support snapshot |
-| `alerts.rs` | Fresh-event-only alert policy and WinRT delivery |
-| `vibecode.rs` | Wake lock and its independent power-operation transaction |
-| `updater.rs` | Manifest verification and its independent update transaction |
-| `gfx.rs` | Existing renderer until accessibility/layout tests allow a safe split |
-| `trayicon.rs` | CPU tray icon generation |
-| `util.rs` | Small Windows helpers only; split opportunistically, not as a rewrite |
+`exists` means the file is on `main` today; `planned` means the named task creates it.
 
-Do not create a cross-platform abstraction. Windows is the product platform, not an implementation detail.
+| Module | Responsibility | State |
+|---|---|---|
+| `main.rs` | Bootstrap, argument dispatch, window registration, message loop | exists (too large; shrink in APP-01) |
+| `app.rs` | UI-thread `App`, commands, timers, window-event coordination | planned (APP-01) |
+| `provider/model.rs` | Provider/source IDs, normalized limits, account keys, snapshots, typed errors | exists (minimal; completed in MODEL-01) |
+| `provider/state.rs` | Pure reducer, freshness, retry, display derivation | planned (STATE-01); absorb `state_policy.rs` |
+| `provider/pace.rs` | Pure pace verdict | planned (PACE-01) |
+| `provider/mod.rs` | Static provider catalog and source order | exists |
+| `api.rs`, `codex.rs` | Provider adapters and parsers (move under `provider/` only when touched anyway) | exists |
+| `poller.rs` | Worker spawning and typed event delivery; no provider policy | planned (APP-01) |
+| `config.rs` | Typed settings, validation, defaults, migration | exists |
+| `store.rs` | Atomic JSON writes, replacement, corruption preservation | exists |
+| `runtime_state.rs` | `state.json` envelope, receipts, install salt | exists; extended in CACHE-01 |
+| `diagnostics.rs` | Stable error codes, bounded redacted log, support snapshot | planned (DIAG-01) |
+| `alerts.rs` | Fresh-event-only alert policy and WinRT delivery | exists |
+| `vibecode.rs` | Wake lock and power-operation transaction | exists |
+| `updater.rs`, `release_manifest.rs` | Manifest verification and update transaction | exists |
+| `accessibility.rs` | UIA providers derived from the same view/geometry as rendering | exists (uncommitted) |
+| `gfx.rs` | Renderer | exists |
+| `trayicon.rs` | CPU tray icon generation | exists |
+| `network.rs` | Central network destination constants | exists |
+| `util.rs` | Small Windows helpers only | exists |
 
-### 5.3 Normalized provider model
+Do not create a cross-platform abstraction. Windows is the product platform.
 
-The exact names may change during implementation, but the model must express the following contract:
+### 4.3 Normalized provider model (MODEL-01 target)
+
+Names may change; the contract may not.
 
 ```rust
-enum ProviderId {
-    Claude,
-    Codex,
-}
+enum ProviderId { Claude, Codex }
 
-enum SourceId {
-    ClaudeStatusline,
-    ClaudeOAuthCompatibility,
-    CodexAppServer,
-    CodexWhamCompatibility,
-}
+enum SourceId { ClaudeOAuthCompatibility, CodexAppServer, CodexWhamCompatibility }
 
-enum SourceSupport {
-    Documented,
-    Compatibility,
-}
+enum SourceSupport { Documented, Compatibility }
 
 struct UsageSnapshot {
     provider: ProviderId,
@@ -219,10 +318,7 @@ struct UsageSnapshot {
     observed_at_unix: i64,
 }
 
-struct SourceProvenance {
-    id: SourceId,
-    support: SourceSupport,
-}
+struct SourceProvenance { id: SourceId, support: SourceSupport }
 
 struct UsageLimit {
     id: LimitId,
@@ -232,36 +328,27 @@ struct UsageLimit {
     utilization: Percent,
     provider_severity_hint: Option<ProviderSeverity>,
     resets_at_unix: Option<i64>,
+    window_seconds: Option<u32>,   // needed by PACE-01; Claude: derived from kind, Codex: limit_window_seconds
 }
 
-enum LimitClass {
-    Quota,
-    Spend,
-}
+enum LimitClass { Quota, Spend }
 
-enum LimitKind {
-    Session,
-    Weekly,
-    Model,
-    ExtraUsage,
-    Other(String),
-}
+enum LimitKind { Session, Weekly, Model, ExtraUsage, Other(String) }
 ```
 
 Required behavior:
 
 - `Percent` rejects non-finite input and clamps once at the adapter boundary.
-- Formatted reset text does not live in the domain model; the UI formats the target instant using the offset applicable at that instant.
-- Alert identity uses provider + account + stable limit ID + threshold + reset instance, never a display label.
-- Spend/extra usage is typed rather than excluded through string comparisons.
-- User-facing `DisplaySeverity` is derived in policy/view state from utilization, configured thresholds, and any provider hint; it is not frozen into cached snapshots.
-- Errors contain a stable safe category, source, retry hint, and user message. Raw response bodies are not retained.
-- Existing direct endpoints are labeled `Compatibility`, never `Documented`.
-- A source fallback occurs only when the source is unsupported, unavailable, or explicitly disabled. It must not evade an authentication error or 429 by immediately hitting another source.
+- Formatted reset text never lives in the domain model. The UI formats the target instant using the offset in force at that instant.
+- Alert identity = provider + account + stable limit ID + threshold + reset instance, never a display label.
+- Spend/extra usage is typed, not excluded by string comparison.
+- `DisplaySeverity` and the pace verdict are derived in view state, never frozen into cached snapshots.
+- Errors carry a stable safe category, source, retry hint, and user message (§5.3). Raw response bodies are never retained.
+- Direct endpoints are labeled `Compatibility`, never `Documented`.
+- Fallback to another source happens only when a source is unsupported, unavailable, or disabled — never to evade a 401/403 or 429.
+- Window kind comes from duration (`limit_window_seconds`), never from `primary`/`secondary` position.
 
-### 5.4 Provider reducer
-
-Use one UI-owned state machine per provider:
+### 4.4 Provider reducer (STATE-01 target)
 
 ```rust
 enum ProviderPhase {
@@ -278,855 +365,529 @@ enum ProviderPhase {
 | Event | Required result |
 |---|---|
 | Provider disabled | Increment generation, clear displayed data, enter `Disabled` |
-| Credential/account changes | Increment generation; clear old snapshot, plan, error, cooldown, and debounce |
-| Matching cache loaded | Attach as explicitly cached data |
+| Credential/account changes | Increment generation; clear snapshot, plan, error, cooldown, debounce |
+| Matching cache loaded | Attach as cached data with its true age; it is never “fresh” |
 | Refresh requested | Start only if enabled, available, not fetching, and allowed by debounce/backoff |
-| Fetch succeeds | Accept only matching generation/request/account; clear errors and streak; persist sanitized snapshot |
-| Fetch returns 429 | Preserve same-account last-good data; enter explicit backoff |
-| Other transient failure | Preserve same-account data only for the configured stale window |
-| Authentication fails | Clear account-bound data and enter `Unavailable` |
-| Obsolete worker completes | Drop it; no render, alert, cache, or cooldown change |
-| Cooldown expires | Return to `Idle`; the next explicit/scheduled command may fetch |
+| Fetch succeeds | Accept only matching generation/request/account; clear errors and 429 streak; persist sanitized snapshot |
+| Fetch returns 429 | Keep same-account last-good data; enter explicit backoff; persist the retry deadline |
+| Other transient failure | Keep same-account data; show it as Outdated once the age rule in §5.2 triggers |
+| Authentication fails | Clear account-bound data; enter `Unavailable` |
+| Obsolete worker completes | Drop it: no render, alert, cache, or cooldown change |
+| Cooldown expires | Return to `Idle`; the next scheduled or explicit command may fetch |
 
-Manual refresh during cooldown must display the next allowed retry time rather than silently doing nothing. Any non-429 result resets the consecutive 429 streak.
+Manual refresh during cooldown shows the next allowed time instead of silently doing nothing. Any non-429 result resets the consecutive-429 streak.
 
-### 5.5 Persistence ownership
-
-Use separate files because their failure and deletion semantics differ:
+### 4.5 Persistence ownership
 
 | File | Contents | Safe to delete? |
 |---|---|---|
 | `settings.json` | User preferences only | Yes; defaults return |
-| `state.json` | Sanitized snapshots, alert receipts, retry deadline, install salt | Yes; cached state is lost |
-| `power-override.v1.json` | Safety-critical Vibecode transaction | No while present; recover first |
-| `update-operation.v1.json` | Update swap transaction | No while present; recover first |
-| `diagnostics.log` | Bounded redacted operational events | Yes |
+| `state.json` | Sanitized snapshots, alert receipts, retry deadline, install salt | Yes; cache and dedup state are lost |
+| `power-override.v1.json` | Vibecode transaction | **No** while present; recover first |
+| `update-operation.v1.json` | Update swap transaction | **No** while present; recover first |
+| `diagnostics.log` (+2 rotations) | Bounded redacted operational events | Yes |
 
-All JSON writes go through `AtomicJsonStore`:
+All JSON writes go through `AtomicJsonStore` (`store.rs`): full in-memory serialize, same-directory temp file, `sync_all`, verified `.bak` generation, `ReplaceFileW` (or `MoveFileExW(...WRITE_THROUGH)` on first create), post-commit validation, restore on failure, `.corrupt` preservation of malformed input.
 
-1. Validate and serialize completely in memory.
-2. Create a unique temporary file beside the target.
-3. Write and `sync_all` the temporary file.
-4. Validate the existing target and retain one verified last-known-good `.bak` generation.
-5. Atomically replace with `ReplaceFileW` using the backup generation, or first-create with `MoveFileExW(...WRITE_THROUGH)`.
-6. Validate the committed file before reporting success.
-7. Restore the verified backup if post-commit validation fails.
-8. Return a typed error without modifying in-memory state if the operation fails.
-9. Preserve malformed input as a timestamped `.corrupt` copy before loading the verified backup or creating defaults.
+---
 
-Safety journals are never stored inside ordinary settings and are never deleted until the corresponding restoration or commit is verified.
+## 5. UI rules and copy (single source of truth)
 
-## 6. Milestone overview
+All user-visible strings below are exact. Reuse an existing string in the code when it already says the same thing; otherwise use these. Every state must be available as text through UIA, never as color alone.
 
-| Milestone | Theme | Exit result |
+### 5.1 Quota row anatomy
+
+```text
+Session                                   ~3% spare      ← name + optional pace note
+[██████████████░░░░░░│░░░░░░]                            ← bar + optional even-pace tick
+48% used                          resets in 3h 25m       ← value + reset label
+```
+
+- **Value:** `48% used` or `52% left` per the `quota_display` setting (TRAY-02). Severity and alerts always use used %.
+- **Reset label:** `resets in 3h 25m` (countdown) or `resets 18:59` / `resets Tue 18:59` (clock) per the `reset_format` setting (ROW-01). Countdown over 24 h: `resets in 2d 4h`.
+- **Not started:** a Claude session limit with no reset timestamp reads `Not started`; UIA adds “The session starts with your first message.” Codex never infers this state.
+- **Pace note and color:** §10.1 PACE-01.
+
+### 5.2 Provider header and footer
+
+- Header: provider name, plan badge, then at most one status token:
+  - `Updating…` while a fetch is in flight (static text, no spinner animation).
+  - `Outdated` when the last successful fetch is older than `max(2 × poll interval, 10 minutes)`. Tooltip/UIA: `Last updated 3h ago`.
+  - A warning glyph plus the short error text from §5.3 when the last attempt failed.
+- Footer: the existing `Updated …` caption plus `Next update in 4m`. Activating the footer action (click, Enter, Space) refreshes all providers now. During cooldown it reads `Retry at 18:42` and does not fetch.
+- Source provenance (`Documented`/`Compatibility`) is **not** shown in the flyout. It appears in diagnostics, Settings → About/Diagnostics, and the provider's UIA description.
+
+### 5.3 Error states (ERR-01)
+
+| Condition | Short text (header) | Detail (tooltip, UIA, diagnostics) | Action |
+|---|---|---|---|
+| Claude credentials missing | `Not signed in` | `Open Claude Code and sign in.` | Existing Connect |
+| Claude 401/403 | `Sign-in expired` | `Open Claude Code once; it renews the sign-in automatically.` | Existing Reconnect |
+| Claude credential lacks `user:profile` scope | `Sign in again for live usage` | `This login can run Claude but cannot read usage limits (for example, a token from claude setup-token). Run claude and sign in with your Claude account.` | Existing Reconnect |
+| HTTP 429 | `Paused by provider` | `<Provider> is limiting usage checks. Retrying at 18:42.` | none |
+| Timeout | `Timed out` | `No response within 10 seconds. Retrying at 18:42.` | none |
+| No network | `Offline` | `Can't reach <host>. Showing the last values.` | none |
+| Codex CLI or auth missing | `Not signed in` | `Run codex and sign in.` | none |
+| Codex 401/403 | `Sign-in expired` | `Run codex once; it renews the sign-in automatically.` | none |
+| Unexpected response | `Couldn't read usage` | `The usage format changed. Code <stable code>. Copy diagnostics to report it.` | Copy diagnostics |
+
+---
+
+## 6. Rollback contract
+
+| Milestone | Kill switch / rollback | Compatibility proof |
 |---|---|---|
-| Foundation | Baseline and required gates | Reproducible evidence before structural work |
-| `v0.8` | Trustworthy state and system safety | No cross-account data and no unrecoverable lid mutation |
-| `v0.9` | Authenticated, crash-safe updates | No unauthenticated executable can be installed |
-| `v0.10` | Supported sources and diagnostics | Documented sources preferred; fallbacks and failures are visible |
-| `v0.11` | Accessible, adaptive first run | Screen-reader, High Contrast, scaling, and small-screen support |
-| `v0.12` | Actionable tray and alerts | Correct Codex-only mode and user-selected signals |
-| `v1.0` | Signed distribution | Signed x64/ARM64 install, update, rollback, and uninstall |
-| `v1.1` | Bounded local pacing | Honest answer to “will I run out before reset?” |
-| `v1.2` | One gated provider | At most one provider that passes the strict source/privacy gate |
-
-### 6.1 Rollback contract by milestone
-
-| Milestone | Kill switch / rollback | Compatibility and proof |
-|---|---|---|
-| Foundation | Revert workflow-only changes only through a reviewed emergency change; publish nothing while required gates are unavailable | No user data changes; previous binary remains valid |
-| `v0.8` | Persistent lid override defaults disabled until its suite passes; unresolved recovery journal blocks re-apply | Dual-read/write legacy settings for two releases; previous binary can read legacy keys; `state.json` is safe to delete, power journal is not |
-| `v0.9` | Disable automatic update checks and direct users to manual signed downloads | Last-known-good executable retained until commit; every journal phase has an idempotent recovery test |
-| `v0.10` | Per-provider source selector can return to the compatibility source; disable a broken adapter without disabling the provider | `state.json` remains optional and backward-compatible; deleting it loses only cache/deduplication |
-| `v0.11` | Roll back to the previous release binary; do not perform irreversible data migration in UI work | New UI settings are additive and ignored safely by older binaries; demo/UI matrix proves old and new layouts from the same view model |
-| `v0.12` | Reset tray/alert choices to documented defaults or roll back the binary | Settings remain additive; old binaries ignore unknown keys; alert receipt schema remains readable |
-| `v1.0` | Keep the immediately previous signed installer available as an explicit rollback release authorized by signed policy | Managed installs never self-modify; install/update/uninstall smoke tests prove both architectures and both channels |
-| `v1.1` | Disable history and delete its bounded file | History is optional and never required to render live quota |
-| `v1.2` | Disable the new provider independently | No other provider state, icon, alert, or history changes when the adapter is disabled |
-
-Abort a rollout immediately if any of these occurs:
-
-- Cross-account data is rendered, cached, alerted, or logged.
-- A safety/update journal cannot converge under a tested recovery path.
-- An unsigned/untrusted executable reaches an execution boundary.
-- A migration prevents the last released binary from starting or safely ignoring new state.
-- The hard executable/memory budget is exceeded without an approved ADR.
-- A critical Narrator/keyboard regression or inaccessible recovery action is discovered.
-
-## 7. Foundation: baseline and required gates
-
-**Goal:** make every later change measurable and prevent another release from bypassing tests.
-
-### Tasks
-
-- [x] **BASE-01 — Freeze the baseline.**
-  - Record executable size, cold tray readiness, hidden/open memory, idle CPU, GDI handles, and network requests.
-  - Define the reference Windows 11 x64 machine/VM, sample duration, commands, and acceptable variance.
-  - Use at least five cold-start runs; report median and p95. Measure idle CPU/memory for ten minutes after a 60-second warm-up.
-  - Repeat the baseline twice on separate runs; investigate more than 10% disagreement before accepting it.
-  - Reconcile the conflicting memory and binary-size claims in `README.md`, `CLAUDE.md`, and `ARCHITECTURE.md`.
-
-- [x] **BASE-02 — Add parser characterization fixtures.**
-  - Add sanitized Claude and Codex response fixtures for normal, partial, unknown-field, malformed, missing-reset, weekly-as-primary, non-finite, and out-of-range cases.
-  - No live network calls in automated tests.
-  - Enforce the bounds in Section 4 and test limit, limit + 1, and truncated input.
-
-- [x] **BASE-03 — Add state-policy characterization tests.**
-  - Freeze current debounce, stale-data, 429, manual-refresh, provider-isolation, and alert behavior before refactoring it.
-  - Use an injected clock; tests must not sleep.
-
-- [x] **BASE-04 — Add deterministic demo mode.**
-  - Add a test-only/demo argument that renders representative Claude-only, Codex-only, dual-provider, loading, stale, cooldown, and error states without reading credentials, touching power policy, or making network calls.
-  - Make it usable for screenshots and later UI Automation tests.
-
-- [ ] **CI-01 — Add one required source gate.**
-  - `cargo fmt --all -- --check`
-  - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`
-  - `cargo test --locked --workspace --all-targets --all-features`
-  - Release builds for supported architectures.
-  - RustSec/OSV advisory check plus dependency source/license policy.
-  - Binary-size comparison against the checked baseline.
-
-- [ ] **CI-02 — Make CI reproducible.**
-  - Add `rust-toolchain.toml` with an explicit supported toolchain.
-  - Build with `--locked`.
-  - Use minimal workflow permissions.
-  - Pin every GitHub Action to a full commit SHA with a version comment.
-  - Add dependency review for lockfile changes.
-  - Configure branch/tag rulesets and a protected release environment so required checks cannot be bypassed by a direct tag push.
-  - Enable immutable releases as soon as the repository setting is available; otherwise document the equivalent no-edit/no-tag-reuse policy.
-
-- [ ] **DIST-00 — Resolve long-lead distribution decisions now.**
-  - Record an ADR selecting installer technology and defining install channels before updater implementation.
-  - Default channels: portable builds use journaled self-swap; managed installs use a signed-installer/package-manager handoff and never self-modify.
-  - Select the Authenticode provider, certificate/publisher identity, key custodian, timestamp service, protected environment, and approval owner.
-  - Confirm native ARM64 build/test capacity and Winget package ownership.
-  - Record silent install/update/uninstall commands and the app-to-uninstaller recovery handshake.
-  - Treat unavailable signing credentials, ARM64 test capacity, or package ownership as explicit blockers rather than deferring their discovery to `v1.0`.
-
-- [ ] **REL-01 — Gate releases through the same workflow.**
-  - Verify tag, `Cargo.toml`, VERSIONINFO, changelog heading, and artifact names agree.
-  - Build once and test/publish that exact artifact rather than rebuilding it later; once signing lands, sign that same tested artifact.
-  - Publish draft releases first and smoke-test downloaded assets before making them public.
-
-### Foundation acceptance
-
-- The current code is formatted and every required gate is green.
-- Pull requests and tags cannot bypass the source gate.
-- Installer/channel/signing decisions have named owners and concrete unblock conditions.
-- Parser and state tests fail if current behavior changes unintentionally.
-- Demo mode performs no external write, registry mutation, credential read, power change, or network call.
-- Performance results are reproducible enough to detect a 10% regression.
-
-## 8. `v0.8`: trustworthy state and system safety
-
-**Goal:** repair the current correctness and recovery risks before adding capabilities.
-
-### 8.1 Typed, atomic settings
-
-- [x] **STORE-01 — Implement `AtomicJsonStore`.**
-  - Same-directory temporary file, full write, `sync_all`, atomic replace, typed errors.
-  - Fault-inject create, write, flush, replace, disk-full, access-denied, and interrupted-operation failures.
-
-- [x] **CFG-01 — Introduce `SettingsV1`.**
-  - Preserve current defaults and unversioned keys.
-  - Add `schema_version` and validation.
-  - Preserve unknown fields during the compatibility period.
-  - A future schema is not overwritten; settings become read-only with a diagnostic explanation.
-  - Avoid repeated disk reads from render paths; keep validated settings in the cached config runtime, then move ownership into `App` in `APP-01` (which depends on this task).
-
-- [x] **CFG-02 — Use expand–migrate–contract.**
-  - Continue reading legacy unversioned files indefinitely.
-  - Dual-read/dual-write moved fields for at least two releases.
-  - Preserve malformed files as `.corrupt`.
-  - Prove downgrade compatibility before deleting legacy writes.
-
-### 8.2 Minimal identity and runtime-state contracts
-
-- [x] **MODEL-00 — Introduce the minimum stable identity types.**
-  - Add `ProviderId`, opaque `AccountKey`, stable `LimitId`, request generation/ID, and a typed fetch-completion envelope.
-  - Keep the existing display model and renderer unchanged; the full provider-domain extraction remains in `MODEL-01`.
-  - Use these types immediately for account isolation and alert identity so no temporary string-key scheme or second migration is required.
-
-- [x] **STATE-00 — Create the first version of `state.json`.**
-  - Initially store the install salt and define the account-scoped alert-receipt envelope through `AtomicJsonStore`; populate/migrate receipts only after `AUTH-01/02` can derive the account key.
-  - Define the forward-compatible envelope now; `CACHE-01` extends it with sanitized snapshots and retry state later.
-  - Keep dual-read compatibility with legacy `settings.json.alerted` for at least two releases.
-  - Deleting `state.json` remains safe and only loses cache/deduplication state.
-
-### 8.3 Vibecode containment and transaction
-
-- [x] **VIBE-00 — Contain the current unsafe behavior immediately.**
-  - Separate wake lock from persistent lid-policy override.
-  - Ship this as emergency PR 0: disable new persistent lid-policy mutations until the journaled implementation passes its fault-injection suite.
-  - Preserve any legacy recovery values and show a recovery notice; never clear or guess them.
-  - Do not report the lid override as active unless persistence, both writes, activation if needed, and read-back verification succeeded.
-  - Put the persistent lid override behind an explicit Advanced explanation until the transaction work is complete.
-
-- [x] **VIBE-01 — Add `power-override.v1.json`.**
-  - Store schema, exact power-scheme GUID, original AC/DC values, applied AC/DC values, phase, timestamp, and app version.
-  - Phases: `prepared`, `applied`, and `restoring`.
-  - Persist `prepared` before the first OS mutation.
-
-- [x] **VIBE-02 — Implement an injectable power transaction.**
-  - Read active scheme and originals.
-  - Persist `prepared`; if it fails, perform zero power writes.
-  - Recheck that the active scheme did not change.
-  - Write AC and DC to that exact GUID; check every return value.
-  - Apply only when that scheme is still active.
-  - Read back and verify before recording the persistent override as `applied`.
-  - Keep the wake lock independently operable; a lid-override failure must not falsely report that the wake lock failed or vice versa.
-  - Roll back partial failures immediately and retain the journal unless rollback is verified.
-
-- [x] **VIBE-03 — Make restoration conservative and idempotent.**
-  - Restore the journal’s GUID, never an arbitrary current scheme.
-  - Restore a field only if it still equals Claudometer’s applied value, so an external user change is not overwritten.
-  - Record each field as `restored` or `relinquished_external_change`; either is a resolved terminal outcome.
-  - Never force an inactive old scheme to become active.
-  - Delete the journal only after every field is verified restored or explicitly relinquished because of an external change.
-  - Drop the wake lock even if persistent recovery remains outstanding.
-
-- [x] **VIBE-04 — Recover across lifecycle failures.**
-  - On startup, recover any existing journal before re-arming the current scheme.
-  - If recovery fails, do not apply a new override; show an actionable recovery state.
-  - Handle `WM_QUERYENDSESSION`, `WM_ENDSESSION`, and `WM_DESTROY` idempotently.
-  - Reconcile an active-scheme change by restoring the old transaction before applying a new one.
-  - Add `--recover-vibecode` for deterministic support and uninstall use.
-
-- [x] **VIBE-05 — Handle the legacy migration honestly.**
-  - Legacy `vibecode_lid` has no scheme GUID; exact automatic recovery is impossible.
-  - Disable the persistent override during migration, preserve the legacy pair, and offer “Restore these values to the current scheme.”
-  - Never silently assume the current scheme owns the legacy values and never silently discard them.
-
-### 8.4 Account and asynchronous-result isolation
-
-- [x] **AUTH-01 — Add an opaque `AccountKey`.**
-  - Prefer a stable provider-owned account identifier; salt/hash it with Windows CNG.
-  - Fall back to an in-memory access-token fingerprint only when no stable identity exists.
-  - Persist no token, email, organization name, username, home path, or raw account ID.
-
-- [x] **AUTH-02 — Make all provider state account-bound.**
-  - Plan cache, current result, last-good result, error, cooldown, debounce, alerts, and later history all carry the account key.
-  - A credential/account change immediately increments generation and clears data from the previous identity.
-  - An old worker result is discarded even when it finishes successfully after a switch.
-  - Login completion invalidates state before starting the replacement fetch.
-
-- [x] **AUTH-03 — Make credential parsing tolerant but explicit.**
-  - Do not require `expiresAt` when it is not authoritative.
-  - Give Codex credential reads the same atomic-replacement retry discipline as Claude.
-  - Distinguish missing, temporarily unreadable, malformed, and unsupported credential shapes.
-
-### 8.5 Correctness fixes
-
-- [x] **ALERT-01 — Deliver provider-specific fresh events.**
-  - Include provider/request identity in completion events.
-  - Evaluate alerts only for the newly accepted successful result.
-  - A completion for one provider can never reclassify another provider’s stored result as fresh.
-
-- [x] **ALERT-02 — Fix missing-reset deduplication.**
-  - With no reset timestamp, re-arm only after an observed below-threshold state; do not invent a reset boundary from wall-clock time.
-  - Scope receipts by account, provider, stable limit ID, threshold, and reset instance.
-
-- [x] **CAPS-01 — Replace the Caps LED boolean with a real state.**
-  - States: unavailable, installed-disabled, installed-enabled, and error.
-  - Check that the script and relevant hook configuration exist.
-  - Honor `CLAUDE_CONFIG_DIR` consistently.
-  - Return and display write/launch errors.
-  - Never show enabled on a clean installation.
-
-- [x] **TIME-01 — Format reset time at the target instant.**
-  - Use a timezone-aware Windows conversion for the reset timestamp.
-  - Test weekly resets crossing both DST boundaries.
-
-- [x] **POLL-01 — Define one freshness rule.**
-  - Opening the flyout does not bypass the chosen refresh interval after 15 seconds.
-  - Manual refresh during cooldown shows its next eligible time.
-  - Non-429 results reset the consecutive 429 streak.
-  - No immediate source fallback after a 429 or authentication failure.
-
-### 8.6 Accurate privacy contract
-
-- [x] **PRIV-01 — Add `PRIVACY.md`.**
-  - Network table: destination, trigger, transmitted data, frequency, and control.
-  - Local file table: reads, writes, retention, and deletion behavior.
-  - Registry keys, child processes, toast registration, update files, power changes, and Caps marker.
-  - State explicitly that bearer tokens are held in memory and sent only to the corresponding provider.
-  - State explicitly that no telemetry, analytics, response logging, or crash upload exists.
-
-- [x] **PRIV-02 — Add update-check control and enforcement.**
-  - Preserve automatic checks for migrated existing installations, but default them off for genuinely new installs until the Welcome flow can disclose and offer the choice.
-  - Provide the control in Settings immediately; `ONBOARD-01` later presents the same choice during first run rather than creating a second onboarding flow.
-  - Centralize network destination constants.
-  - Add a CI allowlist test so a new URL/request site requires a privacy update.
-
-### `v0.8` acceptance
-
-- Switching or signing out clears visible old-account data before the next fetch.
-- A failed first fetch after a switch cannot restore the previous account’s snapshot, plan, alert receipt, or cooldown.
-- Every injected Vibecode failure leaves verified original values or a durable actionable journal.
-- No Vibecode failure reports success after partial application.
-- Corrupt/interrupted settings preserve the previous valid file and produce a visible diagnostic.
-- Missing-reset alerts can re-arm safely without duplicate spam.
-- Network/file/registry/system behavior in documentation matches an instrumented clean-VM run.
-- No new provider, dashboard, or visual redesign lands in this milestone.
-
-## 9. `v0.9`: authenticated, crash-safe updates
-
-**Goal:** ensure Claudometer cannot execute an unauthenticated release and can recover from interruption at every mutation boundary.
-
-### 9.1 Immediate containment
-
-- [x] **UPD-00 — Fail closed on current release metadata.**
-  - Implement the channel contract from `DIST-00`: portable may self-swap; a managed install must hand off to its signed installer/package manager and must never rename its managed executable in place.
-  - Require the checksum asset rather than treating it as optional.
-  - Build fixed repository/tag/asset URLs and reject unexpected schemes or hosts.
-  - Restrict redirects to documented GitHub release hosts.
-  - Hash in-process through Windows CNG; remove PATH-resolved `certutil`.
-  - Read at most `MAX + 1` bytes and reject oversize downloads rather than silently truncating them.
-  - Do not automatically open a browser after failure; show an explicit release-page action.
-
-### 9.2 Signed manifest
-
-- [x] **UPD-01 — Define and verify a signed release manifest.**
-  - Fields: schema, channel, monotonically increasing release sequence, version, tag, issued-at, policy expiry, architecture, exact asset name, exact size, SHA-256, and minimum updater version.
-  - Sign the exact manifest bytes with an offline/protected Ed25519 key.
-  - Embed only the release public key in the application.
-  - Use a maintained verifier; no handwritten cryptography.
-  - Support key rotation only through a manifest cross-signed by an already trusted key.
-  - Accept only a newer sequence/version on the selected channel. A downgrade requires an explicit separately signed rollback authorization naming the exact target and expiry.
-  - Reject replayed/older manifests, missing or malformed timestamps, expired policy, wrong channel, architecture, version, host, key, size, or hash before filesystem mutation.
-
-- [x] **UPD-02 — Record the bootstrap decision.**
-  - The current updater cannot securely establish a new embedded trust root.
-  - Existing users must manually install and independently verify the first trust-root release; no automatic update or consent-based exception may bridge the boundary.
-  - This limitation must be visible in release notes; do not pretend code can retroactively authenticate the old channel.
-  - The verification procedure and dated production provisioning record are maintained in `docs/release-manifest-v1.md`; unprovisioned builds remain fail-closed.
-
-### 9.3 Crash-safe handover
-
-- [x] **UPD-03 — Add `update-operation.v1.json`.**
-  - Phases: `verified`, `current_moved`, `candidate_installed`, `candidate_ready`, and `committed`.
-  - Use unique candidate/backup names per attempt.
-  - Never delete the last verified executable before commit.
-
-- [x] **UPD-04 — Add readiness and rollback.**
-  - Verify before swap and again at the canonical path.
-  - On spawn failure, reverse the rename and restart the old binary.
-  - The old binary/watchdog creates a unique attempt nonce and waits for readiness bound to that nonce, expected candidate PID, version, and hash.
-  - Ignore stale/spoofed readiness events and require readiness only after normal non-destructive initialization.
-  - Defer irreversible configuration/system migrations until update commit; candidate startup before commit may perform only backward-compatible reads/writes.
-  - Candidate crash or readiness timeout automatically restores the last-known-good executable.
-  - Delete backups only after readiness and journal commit, preferably on the following healthy launch.
-  - Startup recovery is idempotent for every journal phase.
-
-### 9.4 Release supply chain
-
-- [ ] **REL-02 — Produce verifiable release evidence.**
-  - Build once with `--locked` after all required checks.
-  - Generate the manifest and checksum from that exact artifact.
-  - Generate an SBOM and GitHub artifact attestation.
-  - Upload to a draft release and smoke-test the downloaded assets.
-  - Publish immutable releases; never edit/reuse an existing version or tag.
-  - Protect `main`, release tags, and the signing environment.
-  - Local pipeline complete. This solo-maintainer repository uses pull requests
-    plus required checks with zero approvals and an owner-approved `release`
-    environment. Production key/sequence variables and the first live release
-    remain external blockers; repository release immutability is enabled.
-
-### `v0.9` acceptance
-
-- The updater cannot execute a release without a valid embedded-trust-root signature.
-- Replayed manifests, unsigned downgrades, stale readiness events, and wrong-channel assets are rejected.
-- Crash/failure injection after every write, rename, spawn, readiness, and cleanup boundary converges to one verified launchable version.
-- At least one last-known-good executable remains until commit.
-- Repeated startup recovery is idempotent.
-- No release publishes without source gates, version consistency, manifest verification, smoke tests, SBOM, and provenance.
-
-## 10. `v0.10`: supported sources and diagnostics
-
-**Goal:** prefer documented provider-owned data surfaces, disclose compatibility fallbacks, and make failures supportable.
-
-### 10.1 Normalize state before changing sources
-
-- [ ] **MODEL-01 — Extract the normalized domain model.**
-  - Expand the minimal identities from `MODEL-00` into the complete normalized model and move shared types out of `api.rs` without changing behavior.
-  - Convert parsers, alerts, tray, and renderer to typed IDs/classes.
-  - Keep rendering and network behavior unchanged in this pull request.
-
-- [ ] **STATE-01 — Implement the pure provider reducer.**
-  - Inject the clock.
-  - Reproduce and test debounce, stale expiry, cooldown, account invalidation, provider disable, and obsolete completion.
-  - Derive loading, fresh, refreshing-with-data, cached, stale-with-error, cooldown, unavailable, and failed views.
+| `v0.8` | Persistent lid override defaults disabled until its suite passes; an unresolved journal blocks re-apply | Dual-read/write legacy settings for two releases; `state.json` safe to delete; power journal is not |
+| `v0.9` | Disable automatic update checks; direct users to manual signed downloads | Last-known-good executable kept until commit; every journal phase has an idempotent recovery test |
+| `v0.10` | Per-provider source selector returns to the compatibility source; a broken adapter can be disabled without disabling the provider | `state.json` optional and backward compatible |
+| `v0.11` | Roll back the binary; no irreversible migration in UI work | New settings are additive; older binaries ignore them |
+| `v0.12` | Reset tray/alert/display choices to defaults or roll back the binary | Settings additive; alert receipt schema stays readable |
+| `v1.0` | Keep the previous signed installer as an explicit rollback release authorized by signed policy | Managed installs never self-modify; install/update/uninstall smoke tests on both architectures |
+| `v1.1` | Disable history and delete its bounded file | Live quota never depends on history |
+| `v1.2` | Disable the new provider independently | No other provider's state, icon, alert, or history changes |
+
+Abort a rollout immediately if: cross-account data is rendered, cached, alerted, or logged; a safety/update journal cannot converge; an unsigned or untrusted executable reaches an execution boundary; a migration stops the previous release from starting; the hard size or memory budget is exceeded without an ADR; or a critical Narrator/keyboard regression appears.
+
+---
+
+## 7. R0: ship the trust-root release
+
+Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authenticated release is also the trust-root bootstrap (UPD-02): existing users must install it manually and verify it independently; the old updater cannot authenticate it.
+
+- [ ] **REL-03 — Prepare the trust-root release (agent prepares; human publishes).**
+  - Do this after WIP-00, so the release does not include half-finished accessibility work.
+  - Draft `CHANGELOG.md` for the next version covering all `v0.8` and `v0.9` work. Lead with the manual-install requirement and the verification steps from `docs/release-manifest-v1.md`.
+  - Draft release notes at `docs/release-notes/<version>.md` with: what changed for users, the manual install and verification procedure, the Vibecode legacy-recovery notice, and the update-check default for new installs.
+  - Run `ci/check-release.ps1` and `ci/check-release-infrastructure.ps1` locally where they can run without secrets; report which checks need the release environment.
+  - Write a human checklist in the handoff report and stop. Human-only steps, in this order:
+    1. Generate and store the offline Ed25519 release key; set `CLAUDOMETER_RELEASE_PUBLIC_KEY_HEX` and `CLAUDOMETER_RELEASE_SEQUENCE`; provision `CLAUDOMETER_RELEASE_ADMIN_READ_TOKEN` in the `release` environment.
+    2. Choose the version (recommended `0.9.0`), bump `Cargo.toml`, commit, and wait for `build` to go green.
+    3. Push the tag and approve the `release` environment. The workflow smoke-tests and publishes automatically; then apply the drafted notes with `gh release edit <tag> --notes-file docs/release-notes/<version>.md`.
+    4. Record the dated provisioning entry in `docs/release-manifest-v1.md`.
+
+---
+
+## 8. `v0.10`: state core, diagnostics, Codex documented source
+
+**Goal:** one testable state machine per provider, actionable errors, supportable diagnostics, and the documented Codex source.
+
+### 8.1 State core
+
+- [ ] **MODEL-01 — Complete the normalized domain model.**
+  - Expand `provider/model.rs` to §4.3, including `window_seconds`. Move shared types out of `api.rs`/`codex.rs`.
+  - Convert parsers, alerts, tray, renderer, and UIA to typed IDs and classes.
+  - No rendering or network behavior change in this commit; existing fixtures must pass unchanged.
+  - Acceptance: no string comparison decides limit class or kind; fixtures cover weekly-as-primary, weekly-only (no invented Session row), missing reset, non-finite, and out-of-range values.
+
+- [ ] **STATE-01 — Pure provider reducer.**
+  - Implement §4.4 in `provider/state.rs` with an injected clock; absorb `state_policy.rs`.
+  - Derive view states: loading, fresh, updating-with-data, cached, outdated, cooldown, unavailable, failed.
+  - Acceptance: table-driven tests for every §4.4 row plus arbitrary event orders; no test sleeps.
 
 - [ ] **APP-01 — Move provider state to the UI thread.**
-  - Introduce the event queue.
-  - Remove the current mutex/atomic `SLOTS` cluster only after behavior-parity tests pass.
-  - Keep Win32 message procedures thin and preserve current window behavior.
+  - Add `app.rs` and `poller.rs`; introduce the `AppEvent` queue; keep window procedures thin.
+  - Remove the mutex/atomic `SLOTS` cluster only after behavior-parity tests pass.
+  - Acceptance: all demo scenarios render identically (compare screenshots before/after); `main.rs` shrinks; memory/CPU re-measured within budget.
 
-- [ ] **CACHE-01 — Add sanitized `state.json`.**
-  - Extend the `STATE-00` envelope with bounded normalized snapshots, retry deadline, and source choice; retain its alert receipts and install salt.
-  - Load a snapshot only after its account key matches current local identity.
-  - Label restored values `cached`; never present them as freshly fetched.
-  - Bound provider count, rows, strings, timestamps, and age.
+- [ ] **CACHE-01 — Sanitized runtime cache.**
+  - Extend the `state.json` envelope (`runtime_state.rs`) with bounded normalized snapshots, the persisted 429 retry deadline, and the selected source.
+  - Load a snapshot only after its account key matches the current local identity.
+  - A snapshot restored at launch shows instantly with its true age and is **never fresh**: the first poll after launch always fetches unless a persisted retry deadline is still in the future.
+  - Bound provider count, rows, strings, timestamps, and age (drop snapshots older than 8 days).
+  - Acceptance: tests for account mismatch, restart inside a 429 window, deleted/corrupt `state.json`, and a cached window whose reset already passed (drop that limit's value).
 
-### 10.2 Source provenance
+### 8.2 Actionable errors
 
-- [ ] **SRC-00 — Add source/freshness metadata everywhere.**
-  - Compact states: `Documented · fresh`, `Documented · cached`, `Compatibility · fresh`, `Compatibility · cached`, and `Unavailable`.
-  - Show compact source/age in each provider section and full detail in diagnostics.
-  - Do not change source priority until provenance is visible and tested.
+- [ ] **ERR-01 — Map every failure to a §5.3 state.**
+  - Add a stable error category and code to `FetchError`; map 401/403, 429 (with `Retry-After`), timeout, connect failure, and parse failure.
+  - Detect an inference-only Claude credential before any request: if the credential's `scopes` array exists and lacks `user:profile`, enter the `Sign in again for live usage` state and make no usage request. Confirm the field name against a real credential file without logging values.
+  - Acceptance: one test per §5.3 row; UIA and tooltip expose the detail text; no raw response body appears in any string.
 
-### 10.3 Codex documented source
+### 8.3 Diagnostics
 
-- [ ] **CODEX-01 — Add Codex app-server support.**
-  - Prefer documented `codex app-server` RPC `account/rateLimits/read`.
-  - Request account state without forcing token refresh.
-  - Parse dynamic `rateLimitsByLimitId`, plan, reset metadata, spend-control state, and reset-credit availability.
-  - Reset credits are display-only; Claudometer never consumes them.
-  - Apply a strict startup/request deadline and terminate the child/process tree afterward.
-  - Retain `wham/usage` only as a separately labeled compatibility fallback.
+- [ ] **DIAG-01 — Operational diagnostics snapshot.**
+  - Version, architecture, Windows build, install channel, provider detected/authenticated state, selected source and fallback reason, last attempt/success, freshness, cooldown, next retry, stable error code, update/recovery state, non-secret settings.
+  - Show it in Settings (Diagnostics section) with a `Copy diagnostics` action.
+
+- [ ] **DIAG-02 — Bounded redacted log and support commands.**
+  - `diagnostics.log`, rotating at 3 × 256 KiB.
+  - `--diagnose` prints the snapshot to stdout; `--version` prints the version.
+  - Redact bearer/refresh tokens, raw account IDs, email, username, home path, account hash, and response bodies.
+  - Rendering, config, and registry failures become visible diagnostics instead of silent no-ops.
+  - Acceptance: a redaction corpus test proves no token, identifier, PII, home path, or body reaches the log or snapshot.
+
+### 8.4 Codex documented source
+
+- [ ] **CODEX-01 — Codex app-server adapter.**
+  - Prefer the documented `codex app-server` JSON-RPC `account/rateLimits/read`. Request account state without forcing a token refresh.
+  - Parse dynamic `rateLimitsByLimitId`, plan, reset metadata, spend-control state, and reset-credit availability (display only; never consume credits).
+  - Model-specific limits (for example the `additional_rate_limits` entries in the compatibility payload) become `LimitKind::Model` rows using duration-based classification; omit them when absent.
+  - Plan display names: `prolite` → `Pro 100`, `pro` → `Pro 200`, `promax` → `Pro 500`, `self_serve_business_prolite` → `Business Premium`; unknown identifiers are title-cased. (Source: openusage provider docs, 2026-10; re-verify against a fixture.)
+  - Enforce the §3.3 deadline and terminate the process tree with `taskkill /T` afterward.
+  - Keep `wham/usage` as the separately labeled compatibility fallback.
+  - Acceptance: fake app-server fixtures for success, missing fields, malformed JSON-RPC, timeout, hung descendant; no leaked process.
 
 - [ ] **CODEX-02 — Gate the default source on measured behavior.**
-  - Documented-source success causes no direct ChatGPT request in that cycle.
-  - Default eligibility requires at most 2 seconds p95 on the reference VM and no leaked child.
-  - If it misses that budget, keep it opt-in until a persistent process can be justified without breaking the product contract.
-
-### 10.4 Claude documented local signal
-
-- [ ] **CLAUDE-01 — Add an opt-in statusline bridge.**
-  - `claudometer.exe --claude-statusline` reads statusline JSON on stdin.
-  - Store only normalized rate-limit fields; never store transcript path, session name, cwd, prompt, or cost payload.
-  - Print one useful one-line statusline and return within the performance budget.
-  - Throttle unchanged writes to at most once per 30 seconds.
-  - Deliver a fresh sample to the running app within two seconds.
-  - Tag each sample with the locally derived credential revision/account key and current app generation; the running app accepts only an exact current match.
-  - Quarantine samples while login/account transition is in progress and test an old Claude session emitting after sign-out or account switch.
-  - If the documented payload cannot be proven to belong to the current account, keep it as statusline/diagnostic output and do not use it for tray, cache, history, or alerts.
-
-- [ ] **CLAUDE-02 — Preserve user configuration.**
-  - Offer one-click installation only when no existing `statusLine` exists.
-  - Never overwrite or attempt to chain an arbitrary existing command.
-  - Remove the integration only when the setting still exactly matches Claudometer’s owned value.
-  - If a recent bridge sample does not exist, use the OAuth endpoint only when compatibility fallback is enabled.
-
-### 10.5 Diagnostics
-
-- [ ] **DIAG-01 — Add stable operational diagnostics.**
-  - Version, architecture, Windows build, and install channel.
-  - Provider detected/authenticated state.
-  - Selected source and fallback reason.
-  - Last attempt, success, freshness, cooldown, and next retry.
-  - Stable error category and code; never raw response body.
-  - Update/recovery state and relevant non-secret settings.
-
-- [ ] **DIAG-02 — Add bounded local logging and support commands.**
-  - Rotating redacted log bounded to the 3 × 256 KiB limit in Section 4.
-  - `--diagnose`, `--version`, and “Copy diagnostics.”
-  - Redact bearer/refresh tokens, raw account IDs, email, username, home path, account hash, and response body.
-  - Rendering/config/registry failures must become visible diagnostics rather than silent no-ops.
+  - App-server success makes no `chatgpt.com` request in that cycle.
+  - It becomes the default only at ≤ 2 s p95 on the reference machine with no leaked child; otherwise it stays opt-in.
 
 ### `v0.10` acceptance
 
-- Codex app-server success performs no direct compatibility request and leaves no process behind.
-- Existing Claude statusline configuration remains byte-for-byte unchanged.
-- Source adapters have fixture coverage for null/missing/extra/malformed data, timeouts, and fallback decisions.
-- No two sources poll one provider unnecessarily in the same cycle.
-- Compatibility failures retain honest same-account cached data with source and freshness labels.
-- A redaction corpus proves diagnostics contain no token, account identifier, PII, home path, or response body.
-- Deleting `state.json` or diagnostics affects only cached display/support information.
+- Every §4.4 transition and every §5.3 error state is tested.
+- Codex app-server success makes no compatibility request and leaves no process behind.
+- No two sources poll one provider in the same cycle.
+- Cached values are labeled by age and never treated as fresh after restart.
+- The redaction corpus passes.
+- Deleting `state.json` or `diagnostics.log` loses only cache/support information.
 
-## 11. `v0.11`: accessible, adaptive first run
+---
 
-**Goal:** make every surface understandable and operable with keyboard, Narrator, High Contrast, text scaling, and small screens.
+## 9. `v0.11`: accessible, adaptive first run
 
-### 11.1 Accessibility
+**Goal:** every surface is operable with keyboard and Narrator, readable in High Contrast and at large text sizes, and usable on small screens.
 
-- [ ] **A11Y-01 — Expose a UI Automation fragment tree through `WM_GETOBJECT`.**
-  - Buttons implement Invoke.
-  - Switches implement Toggle.
-  - Interval and metric choices expose Selection.
-  - Quota bars expose read-only RangeValue.
-  - Accessible names include provider, window, used/remaining value, reset, source, and freshness.
-  - Dynamic changes raise targeted property events; the ticking age footer must not cause repeated announcements.
+### 9.1 Accessibility
 
-- [ ] **A11Y-02 — Add non-color semantics.**
-  - Warning, critical, stale, unavailable, and source state are available in text/UIA, not color alone.
-  - Focus is always visible.
-  - Contrast is computed for text placed on the Windows accent color.
+- [ ] **WIP-00 — Land or park the uncommitted A11Y-01 work.**
+  - Run all §0.3 gates on the working tree. Record x64/ARM64 size with and without the change.
+  - Verify with Accessibility Insights or `inspect.exe`: the flyout and Settings expose a tree; every button Invokes; every switch Toggles; Narrator reads each control.
+  - If gates pass and the size delta is acceptable under SIZE-01, commit as `feat(a11y): expose UI Automation tree` and continue A11Y-01 from what is missing. Otherwise `git stash push -m "a11y-wip"` and report.
 
-### 11.2 Adaptive layout and rendering
+- [ ] **A11Y-01 — Complete the UI Automation fragment tree.**
+  - Buttons: Invoke. Switches: Toggle. Interval and metric choices: Selection. Quota bars: read-only RangeValue.
+  - Accessible names include provider, window, used/left value, reset, pace verdict, and freshness.
+  - Dynamic changes raise targeted property events; the ticking `Updated …` and `Next update in …` captions must not cause repeated announcements.
+
+- [ ] **A11Y-02 — Non-color semantics.**
+  - Warning, critical, stale, unavailable, and pace states are available as text and through UIA.
+  - Focus is always visible. Compute contrast for text drawn on the Windows accent color.
+
+### 9.2 Adaptive layout and rendering
 
 - [ ] **LAYOUT-01 — Bound all windows to the monitor work area.**
-  - Add scrolling to Settings and long flyouts.
-  - Keep all controls reachable at 1280×720 and 1366×768 from 100% through 225% scaling.
-  - Support DPI changes while a window is open.
-  - Preserve keyboard focus across polling, resizing, and rerendering.
+  - Scroll Settings and long flyouts. All controls reachable at 1280×720 and 1366×768 from 100% to 225% scaling.
+  - Handle `WM_DPICHANGED` while open. Preserve keyboard focus across polling, resizing, and re-rendering.
 
-- [ ] **LAYOUT-02 — Honor text scaling and High Contrast.**
-  - Derive text metrics and layout from Windows text-scale settings.
-  - Use system High Contrast colors and disable acrylic when required.
-  - Validate High Contrast Black and White.
+- [ ] **LAYOUT-02 — Text scaling and High Contrast.**
+  - Derive text metrics from the Windows text-scale setting.
+  - Use system High Contrast colors and disable acrylic when High Contrast is on. Validate High Contrast Black and White (`--demo-contrast`).
 
-- [ ] **RENDER-01 — Recover from device/render failure.**
-  - Classify D2D/DXGI recreate-target/device-loss failures.
-  - Drop and recreate a broken surface once.
-  - If recreation fails, show a minimal native diagnostic surface/action rather than a blank resident process.
-  - Log only the safe HRESULT/category.
+- [ ] **RENDER-01 — Recover from device or render failure.**
+  - Classify D2D/DXGI recreate-target and device-loss failures; recreate once.
+  - If recreation fails, show a minimal native diagnostic surface instead of a blank resident process. Log only the HRESULT category.
 
-### 11.3 First run and single instance
+### 9.3 First run, second launch, and shortcut
 
-- [ ] **ONBOARD-01 — Add one compact Welcome page.**
-  - Explain what Claudometer monitors and touches.
-  - Show Claude/Codex as Ready, Sign in required, CLI unavailable, or Unsupported.
-  - Explain documented versus compatibility sources.
-  - Offer the Claude bridge only under its safe installation rules.
-  - Do not enable autostart, history, or provider-setting changes without direct user action.
-  - One Done action; “Run setup again” remains available.
+- [ ] **ONBOARD-01 — Inline first-run card (replaces the separate Welcome page).**
+  - Show a card at the top of the flyout on genuinely new installs only (the same new-install detection that chose the `update_checks_enabled` default). Persist `welcome_dismissed`.
+  - Contents: one sentence on what Claudometer monitors and what it never touches; each provider as `Ready`, `Sign in required`, or `CLI not found`; the `Check for updates automatically` switch (bound to `update_checks_enabled`); a one-line hint about pinning the icon from the tray overflow; a dismiss button (`✕`, keyboard reachable, UIA name “Dismiss welcome”).
+  - Nothing is enabled, written, or launched without a direct action. No browser launch.
+  - Settings gets `Show welcome again`.
 
-- [ ] **ONBOARD-02 — Make second launch useful.**
-  - Signal the existing instance to open its flyout or Settings instead of exiting silently.
-  - First launch explains tray overflow/pinning without requiring a second failed launch.
+- [ ] **ONBOARD-02 — Useful second launch.**
+  - A second launch signals the running instance (registered window message or `WM_COPYDATA` to the `Claudometer.Main` window) to open the flyout, instead of exiting silently.
 
-- [ ] **UI-TEST-01 — Add deterministic UI and accessibility proof.**
-  - Demo-state screenshots for no provider, Claude only, Codex only, both, stale, cooldown, error, and long dynamic rows.
-  - UI Automation smoke tests for discoverability, names, roles, values, focus order, and invocation.
+- [ ] **KEY-01 — Global shortcut to toggle the flyout.**
+  - Setting `global_shortcut`: `Off` (default), `Ctrl+Alt+U`, `Ctrl+Shift+Alt+U`.
+  - `RegisterHotKey` on the main window with `MOD_NOREPEAT`; `WM_HOTKEY` toggles the flyout and puts keyboard focus on its first control.
+  - If registration fails, show `This shortcut is used by another app` in Settings and leave the setting effectively off.
+  - Unregister on change and on exit. Document it in `PRIVACY.md` only if it adds a registry or system effect (it should not).
+
+- [ ] **UI-TEST-01 — Deterministic UI and accessibility proof.**
+  - Demo screenshots for every scenario in §2.2, light and dark and High Contrast, at 100% and 200%.
+  - UIA smoke tests for discoverability, names, roles, values, focus order, and invocation.
   - Accessibility Insights FastPass as a release checklist item.
 
 ### `v0.11` acceptance
 
 - Narrator can discover, read, and operate every control without a mouse.
-- A quota row announces provider, window, value, reset, source, and freshness.
-- Tab order matches visual order; Space/Enter/arrows/Escape behave consistently.
-- Refreshing never resets focus.
-- Every control remains reachable at the required resolutions/scales through reflow or scrolling.
-- High Contrast and text scaling remain readable and preserve state distinctions.
-- Device loss cannot leave a permanently blank flyout/settings window.
-- Welcome performs no browser launch, integration write, or system mutation without a direct action.
+- A quota row announces provider, window, value, reset, pace, and freshness.
+- Tab order matches visual order; Space/Enter/arrows/Escape behave consistently; refresh never resets focus.
+- Every control is reachable at the required resolutions and scales.
+- High Contrast and text scaling keep all state distinctions readable.
+- Device loss cannot leave a permanently blank window.
+- The first-run card performs no write, launch, or system change without a direct action.
 
-## 12. `v0.12`: actionable tray and alerts
+---
 
-**Goal:** make the one glance answer the question the user actually cares about.
+## 10. `v0.12`: glanceable status, tray, and alerts
 
-### Tasks
+**Goal:** one glance answers “am I going to run out before the reset, and is this number current?”
 
-- [ ] **TRAY-01 — Support correct provider selection.**
+### 10.1 Glanceable rows
+
+- [ ] **PACE-01 — Stateless pace verdict.** Needs no history file.
+  - Pure function in `provider/pace.rs`: `fn pace(limit: &UsageLimit, now_unix: i64) -> Pace`.
+  - Inputs: used `u` (0–100), reset `R`, window length `W` seconds, now `t`. Window start `S = R − W`; elapsed `e = t − S`.
+  - **Projectable** only if: class is `Quota`; `R` and `W` are known; `R > t`; `S ≤ t`; `u > 0`; and `e ≥ max(0.05 × W, 900)` seconds.
+  - Projection at reset: `p = u × W / e`.
+  - Verdicts, checked in this order:
+
+    | Verdict | Condition | Bar color | Note next to the limit name |
+    |---|---|---|---|
+    | `LimitReached` | `u ≥ 99.5` | critical | `Limit reached` |
+    | `Over` | projectable and `p ≥ 100` | critical | `Limit in 3h 5m` when the run-out time `t + (100 − u) × e / u` is more than 60 s before `R`; otherwise `At limit by reset` |
+    | `Tight` | projectable and `90 < p < 100` | warning | `~N% spare` with `N = max(1, floor(100 − p))` |
+    | `OnTrack` | projectable and `p ≤ 90` | normal | none |
+    | `Level` | not projectable | the existing used-% severity, unchanged | none |
+
+  - `Tight` and `Over` also draw an even-pace tick on the bar at fraction `e / W`.
+  - Run-out and reset times follow the `reset_format` setting.
+  - Setting `pace_colors_enabled` (default on): when off, every row uses `Level`.
+  - Scope: pace changes **only** flyout bar color, the note, and the UIA name. The tray icon and alerts keep using used-% thresholds (decision D-06).
+  - Acceptance: table tests for every verdict boundary (`p` = 90, 90.01, 99.99, 100), `u = 0`, missing reset, missing window, `e` just below and at the minimum, `R ≤ t`, clock skew (`S > t`), a Spend-class limit, and DST weeks (pure Unix arithmetic must make DST irrelevant; prove it).
+
+- [ ] **ROW-01 — Reset format, “Not started”, and click shortcuts.**
+  - Setting `reset_format`: `clock` (default; today's behavior) or `countdown`. Formats per §5.1.
+  - Claude session with no reset timestamp shows `Not started` (§5.1).
+  - Mouse shortcuts: clicking a row's value flips `quota_display`; clicking a reset label flips `reset_format`. Both apply everywhere and persist. The keyboard path for both is the Settings control (no extra Tab stops per row).
+  - Countdown text repaints at most once per 30 s, only while the flyout is visible.
+
+- [ ] **FRESH-01 — Updating, Outdated, and next-update footer.**
+  - Implement the §5.2 header tokens and footer from the STATE-01 view states.
+  - `Next update in 4m` is minute-granular; the footer action refreshes now or shows `Retry at …` during cooldown.
+  - Acceptance: demo scenarios `loading`, `stale`, `cooldown`, and `error` show the right token; UIA exposes each; idle CPU stays within budget with the flyout open for ten minutes.
+
+### 10.2 Tray and alerts
+
+- [ ] **TRAY-01 — Provider/window selection.**
   - Modes: `Auto: highest used visible quota` and any currently available provider/window.
-  - Claude-only, Codex-only, both, and neither all behave correctly.
-  - An unavailable explicit selection temporarily falls back to Auto but retains the preference.
-  - Auto tie-breaking is deterministic.
+  - Claude-only, Codex-only, both, and neither behave correctly. An unavailable explicit choice falls back to Auto while keeping the preference. Auto tie-breaking is deterministic.
 
-- [ ] **TRAY-02 — Add used versus remaining display.**
-  - The display can invert, but severity and alerts always use normalized used percentage.
-  - Stale values retain the ring only with explicit stale text in tooltip/UIA.
-  - The alert icon appears only when no selected/fallback value is usable.
+- [ ] **TRAY-02 — Used versus left.**
+  - Setting `quota_display`: `used` (default) or `left`. The tray ring and text may invert; severity and alerts always use used %.
+  - A stale value keeps the ring, with explicit stale text in the tooltip and UIA. The alert icon appears only when no selected or fallback value is usable.
 
-- [ ] **ALERT-03 — Add constrained alert controls.**
-  - One threshold: Off, 50%, 75%, or 90%; default 75%.
-  - Optional reset notification.
-  - Windows Do Not Disturb remains the quiet-hours mechanism.
-  - No custom scheduler, sound system, webhook, or multi-rule engine.
+- [ ] **TRAY-03 — Deterministic, bounded tooltip.**
+  - Priority: selected metric, then error/freshness, then other providers. Respect the Windows tooltip length limit without cutting the most actionable line.
 
-- [ ] **ALERT-04 — Add visible testing and timing.**
-  - “Send test notification” with visible success/failure.
-  - Show cooldown and next retry rather than silently ignoring refresh.
-  - Reset alerts require an observed previous window; first observation is never a reset.
+- [ ] **ALERT-03 — Constrained alert controls.**
+  - One threshold: Off, 50%, 75%, or 90% (default 75%). Optional reset notification.
+  - Windows Do Not Disturb is the quiet-hours mechanism. No custom scheduler, sound system, webhook, or rule engine.
 
-- [ ] **TRAY-03 — Make tooltips deterministic and bounded.**
-  - Prioritize selected metric, error/freshness, then other providers.
-  - Respect Windows tooltip limits without cutting the most actionable information.
-  - Include source/freshness only in compact form.
+- [ ] **ALERT-04 — Visible testing and timing.**
+  - `Send test notification` with visible success or failure.
+  - Reset notifications require an observed previous window; first observation is never a reset.
+
+- [ ] **PRIV-03 — Hide windows from screen capture.**
+  - Setting `hide_from_capture_enabled` (default off): applies `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` (`0x11`; define a local const if `windows 0.58` does not export it) to the flyout and Settings on creation and when toggled.
+  - Settings caption: `Usage windows stay out of screen shares and screenshots. The tray icon stays visible.`
+  - Verify on real hardware with Snipping Tool and a Teams/OBS capture: the windows must be absent, not black. If the DirectComposition flyout renders black or the call fails, report it and keep the feature off (do not fall back to `WDA_MONITOR`).
+  - Document the behavior in `PRIVACY.md`.
 
 ### `v0.12` acceptance
 
 - Deterministic tests cover Claude-only, Codex-only, both, neither, provider error, disabled provider, disappearing window, and explicit fallback.
-- Metric and used/remaining changes update immediately and survive restart.
+- Pace verdicts match the PACE-01 table; tray and alerts are unaffected by pace.
+- Display and format changes apply immediately and survive restart.
 - Threshold boundary, reset drift, missing reset, account switch, stale result, and restart deduplication are tested.
 - Reset notifications fire once and never from stale or first-observed data.
-- Test-notification failure produces a useful diagnostic.
-- No extra tray icon or resident process is introduced.
+- No extra tray icon, resident process, or continuous animation is introduced.
 
-## 13. `v1.0`: signed distribution
+---
 
-**Goal:** make install, update, rollback, and removal verifiable and uneventful.
+## 11. `v1.0`: signed distribution
 
-### Tasks
+**Goal:** install, update, rollback, and removal are verifiable and uneventful. Most tasks need human-provisioned credentials (§0.6).
 
 - [ ] **SIGN-01 — Authenticode-sign every Windows artifact.**
-  - Sign x64/ARM64 executables and installers through a protected, approval-gated signing environment.
-  - Timestamp signatures.
-  - Verify with `WinVerifyTrust` in release smoke tests and before update application.
-  - Pin the expected publisher/signing identity in updater policy.
-  - Manifest signature remains the updater’s independent artifact-integrity trust root.
-  - Authenticode-sign first, then hash the immutable signed bytes and sign the release manifest; never mutate an artifact after its manifest is produced.
+  - Sign x64/ARM64 executables and installers in the protected, approval-gated `release` environment; timestamp signatures.
+  - Verify with `WinVerifyTrust` in release smoke tests and before applying an update. Pin the expected publisher in updater policy.
+  - Sign first, then hash the signed bytes and sign the manifest. Never mutate an artifact after its manifest exists.
 
-- [ ] **DIST-01 — Produce native x64 and ARM64 artifacts.**
-  - Portable signed executable for each architecture.
-  - Signed per-user installer requiring no administrator privileges.
-  - Architecture-aware manifest and update selection.
+- [ ] **DIST-01 — Native x64 and ARM64 artifacts.**
+  - Portable signed executable per architecture; signed per-user installer needing no admin rights; architecture-aware manifest selection.
 
-- [ ] **DIST-02 — Publish through Winget.**
-  - Proposed ID: `Dvaderfun.Claudometer`.
-  - Verify clean install, launch, upgrade, repair, and uninstall for x64 and ARM64.
-  - Keep installed and portable update paths distinct so package state cannot drift from an in-place swap.
+- [ ] **DIST-02 — Winget.**
+  - Proposed ID `Dvaderfun.Claudometer`. Verify install, launch, upgrade, repair, and uninstall on clean x64 and ARM64.
+  - Installed and portable update paths stay distinct.
 
-- [ ] **DIST-03 — Make uninstall system-safe.**
-  - Ask the running app to restore/recover Vibecode and exit before removal.
-  - Remove binaries, updater debris, Run entry, AUMID registration, toast icon, and Claudometer-owned bridge configuration.
-  - Never remove unrelated Claude/Codex configuration.
-  - Offer an explicit retain/remove choice for ordinary settings and optional history.
-  - If a safety journal cannot be resolved, stop uninstall and show the recovery action.
+- [ ] **DIST-03 — System-safe uninstall.**
+  - Ask the running app to recover Vibecode and exit before removal.
+  - Remove binaries, updater debris, Run entry, AUMID registration, toast icon, and Claudometer-owned bridge configuration. Never remove unrelated Claude/Codex configuration.
+  - Offer retain/remove for settings and optional history. If a safety journal cannot resolve, stop and show the recovery action.
 
-- [ ] **DOCS-01 — Complete the public product surface.**
-  - `README.md`: screenshot/GIF, accurate footprint, quick start, source/freshness explanation, uninstall, verification, and troubleshooting.
-  - `SECURITY.md`: supported versions, private-reporting route, credential/update threat model.
-  - `PRIVACY.md`: authoritative data/system-effects inventory.
+- [ ] **DOCS-01 — Public product surface.**
+  - `README.md`: screenshot, accurate footprint, quick start, uninstall, verification, troubleshooting.
+  - `SECURITY.md`: supported versions, private reporting, credential/update threat model.
   - `CONTRIBUTING.md`: setup, tests, architecture, fixture/redaction rules.
-  - Release checklist, source compatibility matrix, and recovery guide.
-  - GitHub topics, homepage, social preview, issue/PR templates, and support links.
+  - `docs/providers/claude.md` and `docs/providers/codex.md`, each with: what is tracked, where credentials come from (read-only), “Under the hood” (exact endpoints/RPCs), and “Troubleshooting” that maps every §5.3 short text to its fix.
+  - `docs/flyout.md`, `docs/refreshing.md`, `docs/settings.md`: one behavior doc per surface.
+  - Release checklist, source compatibility matrix, recovery guide; GitHub topics, social preview, issue/PR templates.
 
 ### `v1.0` acceptance
 
-- `Get-AuthenticodeSignature` and `WinVerifyTrust` report the expected valid publisher for every executable and installer.
-- The updater rejects unsigned, wrong-publisher, wrong-manifest, wrong-host, wrong-version, or wrong-architecture artifacts.
-- Winget install/upgrade/uninstall passes on clean Windows 11 x64 and ARM64 environments.
+- `Get-AuthenticodeSignature` and `WinVerifyTrust` report the expected publisher for every executable and installer.
+- The updater rejects unsigned, wrong-publisher, wrong-manifest, wrong-host, wrong-version, and wrong-architecture artifacts.
+- Winget install/upgrade/uninstall passes on clean Windows 11 x64 and ARM64.
 - Uninstall removes all selected Claudometer-owned state and restores every recoverable system effect.
 - Tag, Cargo version, VERSIONINFO, installer, manifest, and artifact names match.
-- Release jobs cannot bypass source, security, architecture, size, signature, provenance, and smoke-test gates.
-- The installed runtime still satisfies the performance budgets.
-- No critical accessibility or recovery defect remains open.
+- The installed runtime meets §3.1 budgets. No critical accessibility or recovery defect is open.
 
-## 14. `v1.1`: bounded local pacing
+---
 
-**Goal:** answer exactly one new question: “At my current pace, will I hit this quota before it resets?”
+## 12. `v1.1`: history-refined pacing (gated)
 
-### Storage
+**Gate:** start only if real use shows the stateless PACE-01 verdict misleads (for example, bursty sessions flip between `Over` and `OnTrack`), recorded with examples in an ADR. If the gate never opens, `v1.1` ships reliability and polish instead.
 
-- [ ] **HIST-01 — Add opt-in normalized sample history.**
-  - Fresh accepted samples only.
-  - Partition by account, provider, stable limit ID, and reset instance.
-  - At most one point per five minutes unless value/reset identity changes.
-  - Eight-day retention and hard 1 MiB cap.
-  - Retain at most 32 current-account limit identities and compact each to at most 96 representative points.
-  - Evict oldest reset instances first; never evict or merge data across account identities.
-  - Atomic compaction and corruption recovery.
-  - Enable, disable, and clear actions; no history file while disabled.
+- [ ] **HIST-01 — Opt-in normalized sample history.**
+  - Fresh accepted samples only; partitioned by account, provider, stable limit ID, and reset instance.
+  - At most one point per five minutes unless the value or reset identity changes. Eight-day retention, hard 1 MiB cap, 32 limits × 96 points.
+  - Atomic compaction, corruption recovery, enable/disable/clear actions, no file while disabled.
 
-### Forecast
+- [ ] **PACE-02 — Robust projection from history.**
+  - Current reset instance only; ignore stale points, decreases, and reset transitions.
+  - Bounded Theil–Sen (or an ADR-approved linear-time robust fit) over ≤ 96 points; require ≥ 4 points spanning ≥ 20 minutes and ≥ 1% change; otherwise fall back to PACE-01.
+  - Same verdict vocabulary and colors as PACE-01; always “at current pace”, never a guarantee.
 
-- [ ] **PACE-01 — Add conservative exhaustion projection.**
-  - Analyze only the current reset instance.
-  - Ignore stale points, decreases, reset transitions, and implausible samples.
-  - Downsample to at most 96 points before fitting; use bounded Theil–Sen or an ADR-approved linear-time robust fit.
-  - Require at least four points spanning 20 minutes and at least 1% change.
-  - Show only `Need more data`, `On pace for reset`, or `May reach 100% around …, before reset`.
-  - Always say “at current pace”; never present a forecast as a guarantee.
+Acceptance: no cross-account history; a simulated year of 30-second polling stays under 1 MiB; history adds ≤ 1 MiB private memory and ≤ 0.01 CPU percentage point idle.
 
-### `v1.1` acceptance
+Non-goals: token or dollar accounting, per-project/session/model attribution, charts, exports, ML predictions, reimplementing `ccusage`.
 
-- No history crosses account identities.
-- Clearing history removes it atomically.
-- A simulated year of 30-second polling remains under 1 MiB.
-- Tests cover steady, bursty, flat, decreasing, reset, DST, stale, corrupt, and insufficient-evidence cases.
-- Exhaustion time appears only when it is earlier than reset.
-- The flyout adds at most one compact pace line per qualifying row; there is no analytics window.
-- Compared with history disabled, history adds at most 1 MiB private memory, 0.01 CPU percentage point while idle, and remains inside the executable budget.
-- Worst-case tests cover 32 limits × 96 points, repeated account switches, and windows longer than the eight-day retention horizon; pacing is unavailable when retained data cannot support the window.
+---
 
-### Explicit `v1.1` non-goals
+## 13. `v1.2`: one gated provider
 
-- Token or dollar accounting.
-- Per-project/session/model attribution.
-- Charts, exports, reports, cloud backup, or indefinite retention.
-- Machine-learning predictions.
-- Reimplementation of `ccusage`.
+A candidate needs all of: a documented machine-readable quota API or official local CLI IPC; provider-reported usage and reset identity; reuse of the provider's existing login; no copied, persisted, refreshed, or user-entered secret; no scraping or cookie extraction; no WebView or resident helper; a clean mapping to §4.3; legal sanitized fixtures; independent failure behavior within budgets.
 
-## 15. `v1.2`: one gated provider
+Gemini/Antigravity and Copilot qualify only after their documented surfaces pass. If none passes, `v1.2` ships reliability and polish.
 
-**Goal:** add at most one provider only if it strengthens the product without weakening its trust model.
+Acceptance: an ADR records the evidence first; new-only, new+Claude, new+Codex, and all-three states work; one provider's failure never changes another's data, alerts, icon, cooldown, or history; at most three providers through `v1.x`.
 
-### Qualification gate
+---
 
-A candidate must have all of the following:
+## 14. Test strategy
 
-- A documented machine-readable quota API or official local CLI IPC.
-- Provider-reported used amount and reset identity/time.
-- Reuse of the provider’s existing login.
-- No copied, persisted, refreshed, or user-entered provider secret.
-- No browser scraping, cookie extraction, or terminal-output scraping.
-- No WebView or resident helper.
-- Clean mapping to the normalized source/account/freshness model.
-- Legal, sanitized contract fixtures that can live in the repository.
-- Independent failure behavior and compliance with the executable/runtime budgets.
+- **Unit/property:** parsers (complete, partial, unknown, malformed, oversized, hostile-but-valid), `Percent`, time formatting, source selection, stable IDs, tooltip truncation, reducer sequences with fake time, every config migration, alert crossing/reset/drift/missing-reset/account-switch/restart, PACE-01 boundaries. Fuzz parsers and manifest parsing for no panics and bounded allocation.
+- **Fault injection:** filesystem create/write/flush/replace/delete and interruption; Vibecode after every journal and power-API transition; updater after every download, verification, journal, rename, spawn, readiness, and cleanup step; child process missing/bad protocol/timeout/hung descendant; renderer creation/resize/EndDraw/Present/device loss.
+- **Contract/integration:** no live endpoints; sanitized fixtures and fake HTTP/app-server processes; fallback verified without contacting the fallback; redaction corpus over diagnostics and persisted state; a manual maintainer-only live smoke command, disabled in CI.
+- **Windows UI matrix:** x64 and ARM64; 1280×720 and 1366×768; 100/125/150/200/225% scaling; light, dark, High Contrast Black/White; multi-monitor with different DPI, all taskbar edges, Explorer restart; keyboard-only and Narrator; notifications on/off, Do Not Disturb, toast activation; screen capture with PRIV-03 on/off.
+- **Release evidence (every release):** source commit and toolchain; gate results; hashes, signatures, SBOM, provenance; size, startup, memory, CPU, GDI; UIA result; install/update/rollback/uninstall result.
 
-Gemini/Antigravity and Copilot are candidates only after their documented surfaces satisfy this gate. If nobody passes, `v1.2` ships reliability and polish instead of a provider.
+---
 
-### `v1.2` acceptance
+## 15. Task dependencies
 
-- An ADR records the qualification evidence before implementation.
-- New-provider-only, new+Claude, new+Codex, and all-three states work independently.
-- One provider’s failure cannot change another provider’s data, alerts, icon, cooldown, or history.
-- The adapter passes the same source, account-isolation, redaction, timeout, fixture, and accessibility contracts.
-- Supported providers remain capped at three throughout `v1.x`.
-
-## 16. Test strategy
-
-### 16.1 Unit and property tests
-
-- Provider parsers: complete, partial, unknown, malformed, oversized, and hostile-but-valid payloads.
-- `Percent`, time conversion, source selection, stable IDs, tooltip truncation, and view derivation.
-- Reducer sequences with fake time and arbitrary event order.
-- Configuration validation and every schema migration.
-- Alert crossing, reset, drift, missing reset, account switch, and restart behavior.
-- Fuzz parsers, manifest parsing, Base64/JWT hint parsing, and string/row limits for no-panics and bounded allocation.
-
-### 16.2 Fault-injection tests
-
-- Filesystem: create/write/flush/replace/delete failure and simulated interruption.
-- Vibecode: fail/crash after every journal and power-API transition.
-- Updater: fail/crash after every download, verification, journal, rename, spawn, readiness, and cleanup transition.
-- Child process: missing CLI, bad protocol, malformed JSON-RPC, timeout, hung descendant, and forced termination.
-- Renderer: surface creation, resize, EndDraw, Present, and device-loss failure.
-
-### 16.3 Contract and integration tests
-
-- No automated test calls a live provider endpoint.
-- Use sanitized committed fixtures and fake HTTP/app-server processes.
-- Verify fallback policy without contacting the fallback source unnecessarily.
-- Verify diagnostics and persisted state contain none of the redaction corpus.
-- Add an explicit manual live-source smoke command for maintainers, disabled in CI.
-
-### 16.4 Windows UI matrix
-
-- Windows 11 supported builds, x64 and ARM64.
-- 1280×720 and 1366×768 minimum work areas.
-- 100%, 125%, 150%, 200%, and 225% display/text scaling.
-- Light, dark, High Contrast Black, and High Contrast White.
-- Primary/secondary monitors, different DPI per monitor, taskbar edges, Explorer restart.
-- Keyboard-only and Narrator workflows.
-- Notifications enabled/disabled, Do Not Disturb, and toast activation.
-
-### 16.5 Release evidence
-
-Every release records:
-
-- Source commit and toolchain.
-- Test/lint/format/security results.
-- Executable and installer hashes, signatures, SBOM, and provenance.
-- Executable size, startup, hidden/open memory, idle CPU, and GDI handles.
-- UI Automation/accessibility result.
-- Clean install, update, rollback, and uninstall result.
-
-## 17. Pull-request sequence
-
-This is the preferred implementation order. Do not combine adjacent rows merely because they touch similar files.
-
-| PR | Scope | Depends on |
-|---:|---|---|
-| 0 | Emergency `VIBE-00` containment: disable new persistent lid mutations and preserve recovery data | — |
-| 1 | Format baseline, unified source gate, and repository rulesets | 0 |
-| 2 | Parser/state fixtures and injected clock | 1 |
-| 3 | Deterministic no-side-effect demo mode and performance baseline | 1 |
-| 4 | Distribution/channel/signing ADR and long-lead procurement | 1 |
-| 5 | `AtomicJsonStore`, verified backup generation, and failure injection | 2 |
-| 6 | Typed settings and compatibility migration | 5 |
-| 7 | Minimal provider/account/limit identities and initial `state.json` envelope | 5–6 |
-| 8 | Vibecode journal, recovery, and lifecycle handling | 0, 5–6 |
-| 9 | Account generation isolation and plan-cache fix | 2, 6–7 |
-| 10 | Fresh-event alerts, missing-reset handling, Caps state, DST, and poll policy | 2, 6–9 |
-| 11 | Accurate privacy inventory, update preference, and network allowlist | 6–10 |
-| 12 | Channel-aware updater containment and in-process hash | 4–5 |
-| 13 | Signed manifest, replay/downgrade policy, and key handling | 4, 12 |
-| 14 | Update journal, nonce-bound readiness, rollback, and startup recovery | 5, 13 |
-| 15 | Complete normalized provider model | 2, 7, 9 |
-| 16 | Pure provider reducer and sanitized runtime-cache extension | 5–7, 15 |
-| 17 | UI-owned `App` state and worker event queue | 16 |
-| 18 | Source provenance and redacted diagnostics | 11, 15–17 |
-| 19 | Codex app-server adapter | 18 |
-| 20 | Optional account-correlated Claude statusline bridge | 18 |
-| 21 | Render recovery and bounded adaptive layout | 3, 17 |
-| 22 | UI Automation, High Contrast, and text scaling | 21 |
-| 23 | Welcome and useful second-launch behavior | 18, 22 |
-| 24 | Tray metric, used/remaining, alert controls, and retry countdown | 16–23 |
-| 25 | Authenticode, x64/ARM64 installer, Winget, and uninstall recovery | 4, 8, 14, 23–24 |
-| 26 | Public docs, release evidence, and `v1.0` hardening | all `v1.0` work |
-| 27 | Opt-in bounded history and conservative pacing | `v1.0` |
-| 28 | One-provider qualification ADR and implementation, or reliability work | `v1.1` |
-
-## 18. Decisions to record before implementation
-
-Use these defaults unless an ADR accepts a different tradeoff.
-
-| ADR | Default decision |
+| Task | Depends on |
 |---|---|
-| Update trust | Embedded Ed25519 manifest trust root plus Authenticode before `v1.0` |
-| Existing-user trust bootstrap | Manual verification/install of the first trust-root release |
-| Installer | Signed per-user native installer plus portable executables and Winget |
-| Update channels | Portable uses journaled self-swap; managed install uses signed-installer/package-manager handoff and never self-modifies |
-| Runtime concurrency | UI-owned state + short-lived std threads + message wakeup; no Tokio |
-| Claude documented source | Explicit opt-in statusline bridge only when no existing statusline is configured |
-| Codex documented source | Deadline-bound app-server first; compatibility endpoint fallback |
-| Statusline coexistence | Never overwrite, execute, or chain arbitrary existing statusline commands; unprovable account binding makes a sample display-ineligible |
-| History storage | Bounded native JSON sample store; no SQLite through `v1.x` |
-| Vibecode | Wake lock is separate; persistent lid override is Advanced and journaled |
-| OS scope | Windows 11 x64/ARM64 through `v1.x`; Windows 10 only after explicit demand/testing |
-| Provider scope | Claude + Codex through `v1.0`; at most one additional provider in `v1.x` |
+| WIP-00 | — |
+| SIZE-01 | WIP-00 |
+| REL-03 | WIP-00 |
+| MODEL-01 | — |
+| STATE-01 | MODEL-01 |
+| APP-01 | STATE-01 |
+| CACHE-01 | STATE-01 |
+| ERR-01 | MODEL-01 |
+| DIAG-01 | ERR-01, APP-01 |
+| DIAG-02 | DIAG-01 |
+| CODEX-01 | MODEL-01, ERR-01 |
+| CODEX-02 | CODEX-01, DIAG-01 |
+| A11Y-01 | WIP-00 |
+| A11Y-02 | A11Y-01 |
+| LAYOUT-01 | WIP-00 |
+| LAYOUT-02 | LAYOUT-01 |
+| RENDER-01 | — |
+| ONBOARD-01 | A11Y-01, ERR-01 |
+| ONBOARD-02 | — |
+| KEY-01 | A11Y-01 |
+| UI-TEST-01 | A11Y-02, LAYOUT-02 |
+| PACE-01 | MODEL-01 |
+| ROW-01 | MODEL-01 |
+| FRESH-01 | STATE-01, APP-01 |
+| TRAY-01, TRAY-02, TRAY-03 | APP-01 |
+| ALERT-03, ALERT-04 | APP-01 |
+| PRIV-03 | — |
+| SIGN-01, DIST-01..03 | human provisioning, `v0.12` |
+| DOCS-01 | `v0.12` |
+| HIST-01, PACE-02 | `v1.0` and the §12 gate |
 
-## 19. Explicit non-goals through `v1.x`
+---
 
-- Cross-platform UI rewrite.
-- Electron, Tauri, WebView, WinUI migration, or managed runtime.
-- Runtime provider plugin SDK or provider marketplace.
-- Dozens of providers.
-- Browser cookie extraction or web-page scraping.
-- Owning provider login/token refresh.
-- User-entered API keys.
-- Consuming Codex reset credits or buying provider credits.
-- Multiple simultaneously active accounts per provider.
-- Full token/cost analytics, project dashboards, or transcript indexing.
-- Cloud sync, remote dashboard, team administration, email, webhook, or mobile alerts.
-- Internal quiet-hours scheduler that duplicates Windows Do Not Disturb.
-- Arbitrary theme, font, color, or alert-rule editors.
+## 16. Decisions
+
+### 16.1 Recorded
+
+| ID | Decision |
+|---|---|
+| D-01 | Update trust: embedded Ed25519 manifest trust root, plus Authenticode before `v1.0` |
+| D-02 | Existing-user trust bootstrap: manual install and verification of the first trust-root release |
+| D-03 | Installer and channels: ADR 0001 (portable self-swap; managed installs hand off and never self-modify) |
+| D-04 | Concurrency: UI-owned state, short-lived std threads, message wakeup; no Tokio |
+| D-05 | Vibecode: wake lock separate; persistent lid override Advanced and journaled |
+
+### 16.2 New in revision 2 (record each as a short ADR under `docs/adr/` when its task starts)
+
+| ID | Decision | Rationale |
+|---|---|---|
+| D-06 | Pace drives flyout bar color and notes only; tray and alerts keep used-% thresholds | Pace is a projection; alerts must stay predictable |
+| D-07 | Source provenance lives in diagnostics, Settings, and UIA, not in the flyout | Users need “is it current?”, not transport details |
+| D-08 | First run is an inline flyout card, not a separate Welcome window | Same disclosure, less UI and code |
+| D-09 | Claude statusline bridge moves to post-`v1.x` | High complexity; useless when a `statusLine` already exists; data only while a session runs |
+| D-10 | History-based pacing is gated on evidence (§12) | Stateless pace answers the question without storage |
+| D-11 | Screen-capture exclusion and global shortcut default off | Avoid breaking users' own screenshots and existing shortcuts |
+| D-12 | No continuous animation; visible timers repaint ≤ once per 30 s | Footprint and idle-CPU budget |
+
+### 16.3 Scope
+
+- Windows 11 x64/ARM64 through `v1.x`; Windows 10 only after explicit demand and testing.
+- Claude + Codex through `v1.0`; at most one more provider in `v1.x`.
+
+---
+
+## 17. Non-goals through `v1.x`
+
+- Cross-platform UI rewrite; Electron, Tauri, WebView, WinUI migration, or managed runtime.
+- Runtime provider plugins or a provider marketplace; dozens of providers.
+- Browser cookie extraction, web scraping, or terminal-output scraping.
+- Owning provider login or token refresh; user-entered API keys.
+- Consuming Codex reset credits or Claude reset grants; buying credits.
+- Multiple simultaneous accounts per provider.
+- Token/cost analytics, spend tiles from local logs, project dashboards, transcript indexing.
+- Loopback HTTP API, cloud sync, remote dashboard, email/webhook/mobile alerts, crash upload.
+- Custom quiet-hours scheduler, theme/font/color/alert-rule editors, drag-to-reorder customization, undo stacks.
 - More power-management features.
 
-## 20. Post-`v1.x` candidates
+---
 
-Consider these only after the v1 product contract and performance budgets are demonstrated in real releases:
+## 18. Post-`v1.x` candidates
 
-- Multiple account profiles with strict partitioning and explicit switching.
-- Optional `ccusage --json` interoperability instead of duplicating its analytics engine.
-- A stable machine-readable `claudometer --json` snapshot for statuslines and scripts.
+- Opt-in Claude statusline bridge, under revision 1's safety rules (never overwrite or chain an existing `statusLine`; account-correlated samples only).
+- A stable `claudometer --json` one-shot snapshot for statuslines, scripts, and agents (reads `state.json`; no server).
+- Claude reset-grant count, display only (requires an undocumented query flag; label Compatibility).
+- Multiple account profiles with strict partitioning.
+- Optional `ccusage --json` interoperability.
 - Windows 10 fallback visuals.
-- A fourth provider only if the provider cap is deliberately revisited in an ADR.
 
-## 21. Definition of done for `v1.0`
+---
 
-`v1.0` is complete when all of the following are true:
+## 19. Definition of done for `v1.0`
 
-- No known P0/P1 correctness, safety, security, accessibility, install, update, or uninstall issue remains open.
-- Old-account data cannot appear after an identity change, including late worker completion and failed first fetch.
+- No open P0/P1 correctness, safety, security, accessibility, install, update, or uninstall issue.
+- Old-account data never appears after an identity change, including late completions and failed first fetches.
 - Vibecode failure always ends in verified original state or a durable visible recovery state.
-- No unauthenticated executable can be installed by the updater.
-- Update interruption at every mutation boundary recovers automatically.
-- Claude/Codex documented sources are preferred where eligible; compatibility paths are labeled and controllable.
-- Every failure has a stable redacted diagnostic without telemetry or secret leakage.
+- The updater cannot install an unauthenticated executable; interruption at every mutation boundary recovers automatically.
+- Codex prefers its documented source where eligible; compatibility paths are labeled in diagnostics and controllable.
+- Every failure shows a §5.3 state and has a stable redacted diagnostic.
+- Every quota row answers “used/left, when does it reset, am I on pace, is it current” in text and through UIA.
 - Narrator, keyboard, High Contrast, text scaling, DPI changes, and minimum work areas pass the UI matrix.
 - Claude-only, Codex-only, both, and neither are complete experiences.
-- Signed x64/ARM64 portable and per-user installations can install, update, roll back, and uninstall cleanly.
-- All release evidence is published and performance budgets remain satisfied.
-- Public documentation accurately describes every network request and persistent/system side effect.
+- Signed x64/ARM64 portable and per-user installs install, update, roll back, and uninstall cleanly.
+- Release evidence is published; §3.1 budgets hold; public docs describe every network request and side effect.
 
-## 22. Reference implementations and primary contracts
+---
 
-Borrow ideas, not scope:
+## 20. Reference implementations and contracts
 
-- [CodexBar](https://github.com/steipete/CodexBar): source provenance, provider contracts, diagnostics, and documentation structure.
-- [Win-CodexBar](https://github.com/nesszer/Win-CodexBar): Windows installation, Winget, localization, and support diagnostics; do not copy its WebView/provider breadth.
-- [WhereMyTokens](https://github.com/jeongwookie/WhereMyTokens): account-bound normalized state, Claude statusline-first behavior, and privacy-safe fallback descriptions.
-- [RateTray](https://github.com/nowrap/rate-tray): Codex app-server integration, explicit thresholds, persistent last-good data, and publishing/security documentation.
-- [ccusage](https://github.com/ccusage/ccusage): optional future JSON interoperability and bounded analytics ideas.
-- [Claude Code statusline contract](https://code.claude.com/docs/en/statusline): documented Claude rate-limit fields.
-- [Codex app-server contract](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md): documented Codex account/rate-limit RPC.
-- [Microsoft WinVerifyTrust](https://learn.microsoft.com/en-us/windows/win32/api/wintrust/nf-wintrust-winverifytrust): Authenticode verification.
-- [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations): release provenance.
+Borrow ideas, not scope.
 
-The stopping rule is simple: if a proposed feature does not improve trust, reliability, accessibility, actionability, or distribution while staying inside the native footprint contract, it is not part of this roadmap.
+- [OpenUsage](https://github.com/robinebers/openusage) (macOS, Swift): pace-verdict bar colors with an even-pace tick; click-to-flip used/left and countdown/clock; an `Outdated` tag after about two refresh cycles; a per-provider in-flight indicator and `Next update in …` footer; “Not started” sessions; specific errors for inference-only tokens and provider throttling; previous-session cache shown instantly but never treated as fresh; hide-from-screen-share; global shortcut; one behavior doc per surface and one page per provider with Troubleshooting. **Do not copy:** its token refresh and credential write-back, crash telemetry, loopback HTTP API, cloud sync, API-key providers, local-log spend analytics, or the reset-credit claim button.
+- [CodexBar](https://github.com/steipete/CodexBar): source provenance, provider contracts, diagnostics, docs structure.
+- [Win-CodexBar](https://github.com/nesszer/Win-CodexBar): Windows install, Winget, support diagnostics. Not its WebView or provider breadth.
+- [WhereMyTokens](https://github.com/jeongwookie/WhereMyTokens): account-bound normalized state, statusline-first Claude behavior.
+- [RateTray](https://github.com/nowrap/rate-tray): Codex app-server integration, explicit thresholds, persistent last-good data.
+- [ccusage](https://github.com/ccusage/ccusage): future JSON interoperability only.
+- [Claude Code statusline contract](https://code.claude.com/docs/en/statusline).
+- [Codex app-server contract](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md).
+- [WinVerifyTrust](https://learn.microsoft.com/en-us/windows/win32/api/wintrust/nf-wintrust-winverifytrust).
+- [SetWindowDisplayAffinity](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowdisplayaffinity).
+- [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations).
