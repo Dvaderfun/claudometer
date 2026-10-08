@@ -1,0 +1,22 @@
+[
+  {
+    "artifact": "arm64-provisioned.exe",
+    "bytes": 940544,
+    "sha256": "2e0355b78ee6d10bbd314f9a948c18d5788ea8dec314f68fab52975a2709159e"
+  },
+  {
+    "artifact": "arm64-unprovisioned.exe",
+    "bytes": 892928,
+    "sha256": "8bb7046ecaa419c45fa50da8bee7b599cb583055667c228f621fe4134a0d0ed9"
+  },
+  {
+    "artifact": "x64-provisioned.exe",
+    "bytes": 1058304,
+    "sha256": "96316d68928b560c8d0580413944ea3aace480974695db81964b81517b05ad52"
+  },
+  {
+    "artifact": "x64-unprovisioned.exe",
+    "bytes": 947712,
+    "sha256": "f01245b490e5eb315dd324c5cc96e5074589e7d0f79c85ddf45fa7d9a296ff60"
+  }
+]

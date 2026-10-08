@@ -4,12 +4,12 @@
   "reference_release_x64_bytes": 815104,
   "targets": {
     "x86_64-pc-windows-msvc": {
-      "baseline_bytes": 1097728,
-      "baseline_slice": "REL-02 / provisioned authenticated updater"
+      "baseline_bytes": 1058304,
+      "baseline_slice": "SIZE-01 / opt-level z, provisioned UIA and updater"
     },
     "aarch64-pc-windows-msvc": {
-      "baseline_bytes": 995840,
-      "baseline_slice": "REL-02 / provisioned authenticated updater"
+      "baseline_bytes": 940544,
+      "baseline_slice": "SIZE-01 / opt-level z, provisioned UIA and updater"
     }
   }
 }
