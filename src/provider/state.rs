@@ -134,26 +134,14 @@ pub enum UnavailableReason {
     Authentication,
 }
 
-// Adapter-specific categories and copy belong to ERR-01. The reducer needs
-// only enough classification to decide whether data may survive a failure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FailureKind {
-    Transient,
-    RateLimited,
-    Authentication,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FetchError {
-    pub kind: FailureKind,
-    pub message: String,
-    pub retry_after: Option<u64>,
-}
+pub use super::error::{FailureKind, FetchError};
 
 impl From<FetchOutcome> for Result<UsageSnapshot, FetchError> {
     fn from(outcome: FetchOutcome) -> Self {
         match outcome {
             FetchOutcome::Ok(snapshot) => Ok(snapshot),
+            FetchOutcome::Failure(error) => Err(error),
+            #[cfg(test)]
             FetchOutcome::Err {
                 msg,
                 retry_after,
@@ -452,6 +440,15 @@ impl ProviderState {
 
     pub fn is_cached(&self) -> bool {
         self.cached
+    }
+
+    pub fn next_attempt_unix(&self, clock: &impl Clock, interval: Duration) -> i64 {
+        let now = clock.read();
+        let remaining = self
+            .last_attempt
+            .map(|last| interval.saturating_sub(now.monotonic.saturating_duration_since(last)))
+            .unwrap_or_default();
+        deadline_unix(now, remaining)
     }
 
     fn clear_account(&mut self) {

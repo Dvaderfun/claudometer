@@ -111,6 +111,13 @@ fn flyout_items(hwnd: HWND) -> Vec<Item> {
             Role::Text,
         ));
     }
+    if let Some(detail) = crate::app::error_details(std::time::Duration::from_secs(u64::from(
+        config::settings().poll_interval_seconds,
+    ))) {
+        for item in &mut result {
+            item.help = detail.clone();
+        }
+    }
     result
 }
 

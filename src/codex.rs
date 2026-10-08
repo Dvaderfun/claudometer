@@ -11,6 +11,7 @@ use crate::api::{
     bounded_text, plain, prettify, read_bounded, read_json_with_retry, CredentialReadError,
     FetchErr, PreparationFailure, PreparationFailureKind, MAX_LIMIT_ROWS,
 };
+use crate::provider::error::{request_error, FailureKind, FetchError};
 use crate::provider::model::{
     derive_account_context, AccountContext, AccountKey, FetchOutcome, LimitKind, ProviderId,
     SecretString, SourceProvenance, UsageLimit, UsageSnapshot,
@@ -147,11 +148,7 @@ struct Window {
 pub fn fetch(request: PreparedRequest) -> FetchOutcome {
     match fetch_inner(request) {
         Ok(s) => FetchOutcome::Ok(s),
-        Err((msg, retry_after, rate_limited)) => FetchOutcome::Err {
-            msg,
-            retry_after,
-            rate_limited,
-        },
+        Err(error) => FetchOutcome::Failure(error),
     }
 }
 
@@ -161,11 +158,11 @@ fn fetch_inner(request: PreparedRequest) -> Result<UsageSnapshot, FetchErr> {
     if let Some(exp) = jwt_exp(request.access_token.expose()) {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         if now > exp {
-            return Err(plain("Sign-in expired — open Codex to refresh."));
+            return Err(FetchError::new(FailureKind::Authentication));
         }
     }
 
-    let tls = native_tls::TlsConnector::new().map_err(|_| plain("TLS init failed"))?;
+    let tls = native_tls::TlsConnector::new().map_err(|_| FetchError::new(FailureKind::Offline))?;
     let agent = ureq::AgentBuilder::new()
         .tls_connector(std::sync::Arc::new(tls))
         .timeout(std::time::Duration::from_secs(10))
@@ -179,17 +176,7 @@ fn fetch_inner(request: PreparedRequest) -> Result<UsageSnapshot, FetchErr> {
             concat!("claudometer/", env!("CARGO_PKG_VERSION")),
         )
         .call()
-        .map_err(|e| match e {
-            ureq::Error::Status(401 | 403, _) => plain("Sign-in expired — open Codex to refresh."),
-            ureq::Error::Status(429, resp) => {
-                let retry_after = resp
-                    .header("retry-after")
-                    .and_then(|v| v.trim().parse::<u64>().ok());
-                ("Rate limited by the API.".to_string(), retry_after, true)
-            }
-            ureq::Error::Status(code, _) => plain(format!("OpenAI API error {code}.")),
-            _ => plain("Network error."),
-        })?;
+        .map_err(|error| request_error(error, time::OffsetDateTime::now_utc().unix_timestamp()))?;
 
     let body = read_bounded(resp.into_reader())?;
     parse_usage_json(

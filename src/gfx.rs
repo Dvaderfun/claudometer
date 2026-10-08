@@ -53,6 +53,7 @@ use crate::util;
 pub struct Section {
     pub title: &'static str,
     pub plan: String,
+    pub status: Option<String>,
     pub body: SectionBody,
 }
 
@@ -172,6 +173,9 @@ fn content_h(view: &View) -> f32 {
                     h += SEC_GAP + 1.0 + SEC_GAP;
                 }
                 h += TITLE_H + SECTION_GAP + section_body_h(&sec.body);
+                if sec.status.is_some() {
+                    h += CAPTION_H + GAP;
+                }
             }
             h
         }
@@ -230,6 +234,13 @@ pub fn accessible_rows(view: &View) -> Vec<(D2D_RECT_F, String)> {
             y += SEC_GAP + 1.0 + SEC_GAP;
         }
         y += TITLE_H + SECTION_GAP;
+        if let Some(status) = &section.status {
+            rows.push((
+                rect(PAD, y, FLYOUT_W - PAD, y + CAPTION_H),
+                format!("{}, {status}", section.title),
+            ));
+            y += CAPTION_H + GAP;
+        }
         match &section.body {
             SectionBody::Rows(limits) => {
                 for (index, limit) in limits.iter().enumerate() {
@@ -794,6 +805,17 @@ impl Surface {
                 )?;
             }
             y += TITLE_H + SECTION_GAP;
+
+            if let Some(status) = &sec.status {
+                self.text(
+                    status,
+                    &self.fmt_caption_1,
+                    rect(PAD, y, w - PAD, y + CAPTION_H),
+                    &b.dim,
+                    false,
+                )?;
+                y += CAPTION_H + GAP;
+            }
 
             match &sec.body {
                 SectionBody::Rows(rows) => {
@@ -1534,5 +1556,33 @@ mod tests {
             settings_view(true).toggle_for(CARD_UPDATE_CHECKS),
             Some(true)
         );
+    }
+
+    #[test]
+    fn error_status_height_and_accessible_bounds_match_rows() {
+        let mut data = FlyoutData {
+            fetched_unix: Some(1000),
+            note: None,
+            sections: vec![Section {
+                title: "Claude",
+                plan: "Synthetic".to_string(),
+                status: None,
+                body: SectionBody::Rows(vec![LimitRow {
+                    label: "Session".to_string(),
+                    percent: 50.0,
+                    severity: None,
+                    reset_text: String::new(),
+                }]),
+            }],
+        };
+        let before = View::Data(data.clone());
+        let height = flyout_height(&before);
+        let row_top = accessible_rows(&before)[0].0.top;
+        data.sections[0].status = Some("Timed out".to_string());
+        let after = View::Data(data);
+        assert_eq!(flyout_height(&after), height + CAPTION_H + GAP);
+        let rows = accessible_rows(&after);
+        assert_eq!(rows[0].1, "Claude, Timed out");
+        assert_eq!(rows[1].0.top, row_top + CAPTION_H + GAP);
     }
 }

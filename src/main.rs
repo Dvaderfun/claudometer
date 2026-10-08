@@ -39,7 +39,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
     CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
 };
-use windows::Win32::UI::Controls::MARGINS;
+use windows::Win32::UI::Controls::{
+    MARGINS, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH,
+    TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+};
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_END, VK_ESCAPE, VK_HOME,
@@ -96,6 +99,8 @@ fn effective(provider: ProviderId) -> (Option<UsageSnapshot>, Option<String>) {
     app::effective(provider)
 }
 struct Ui {
+    error_tooltip: Option<HWND>,
+    error_tooltip_text: Vec<u16>,
     fly: Option<gfx::Surface>,
     set: Option<gfx::Surface>,
     fly_hover: gfx::FlyHover,
@@ -117,6 +122,8 @@ const FLY_FOCUS_N: i32 = 3;
 thread_local! {
     static UI: RefCell<Ui> = const {
         RefCell::new(Ui {
+            error_tooltip: None,
+            error_tooltip_text: Vec::new(),
             fly: None,
             set: None,
             fly_hover: gfx::FlyHover::None,
@@ -1237,7 +1244,11 @@ unsafe fn apply_flyout_theme(h: HWND) {
 /// only appears when nothing was ever fetched from any provider. Per-provider
 /// failures degrade to a dim note line inside that provider's section.
 fn current_view() -> gfx::View {
-    let (c_snap, c_err) = effective(ProviderId::Claude);
+    let (c_snap, mut c_err) = effective(ProviderId::Claude);
+    let interval = Duration::from_secs(u64::from(POLL_SECS.load(Ordering::SeqCst)));
+    if let Some((short, detail)) = app::error_text(ProviderId::Claude, interval) {
+        c_err = Some(format!("{short}\n{detail}"));
+    }
     let codex_on = codex_active();
     let refresh_note = join_notes(app::cached_notes(), manual_cooldown_note());
 
@@ -1260,7 +1271,10 @@ fn current_view() -> gfx::View {
         };
     }
 
-    let (x_snap, x_err) = effective(ProviderId::Codex);
+    let (x_snap, mut x_err) = effective(ProviderId::Codex);
+    if let Some((short, detail)) = app::error_text(ProviderId::Codex, interval) {
+        x_err = Some(format!("{short}\n{detail}"));
+    }
     if c_snap.is_none() && c_err.is_none() && x_snap.is_none() && x_err.is_none() {
         return gfx::View::Loading;
     }
@@ -1285,6 +1299,7 @@ fn current_view() -> gfx::View {
             (None, Some(msg)) => sections.push(gfx::Section {
                 title,
                 plan: String::new(),
+                status: None,
                 body: gfx::SectionBody::Note(
                     msg.lines().next().unwrap_or("Can't load usage").to_string(),
                 ),
@@ -1292,6 +1307,7 @@ fn current_view() -> gfx::View {
             (None, None) => sections.push(gfx::Section {
                 title,
                 plan: String::new(),
+                status: None,
                 body: gfx::SectionBody::Note("Loading…".to_string()),
             }),
         }
@@ -1353,6 +1369,11 @@ fn section(title: &'static str, s: UsageSnapshot) -> gfx::Section {
     gfx::Section {
         title,
         plan: s.plan.unwrap_or_default(),
+        status: app::error_text(
+            s.provider,
+            Duration::from_secs(u64::from(POLL_SECS.load(Ordering::SeqCst))),
+        )
+        .map(|(short, _)| short),
         body: gfx::SectionBody::Rows(s.rows.into_iter().map(gfx::LimitRow::from).collect()),
     }
 }
@@ -1494,6 +1515,7 @@ unsafe fn signal_demo_ready(state: &demo::State) {
 }
 
 unsafe fn render_demo_flyout(fh: HWND, state: &demo::State, width: u32, height: u32, dpi: f32) {
+    update_error_tooltip(fh);
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
         if ui.fly.is_none() {
@@ -1530,6 +1552,7 @@ unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f
     let contrast = ui_contrast();
     let fetching = any_fetching();
     let vibe_on = vibecode::is_on();
+    update_error_tooltip(fh);
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
         if ui.fly.is_none() {
@@ -1555,6 +1578,61 @@ unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f
                 updater::has_update(),
                 vibe_on,
                 vibecode::flyout_caption(),
+            );
+        }
+    });
+}
+
+unsafe fn update_error_tooltip(flyout: HWND) {
+    let detail = app::error_details(Duration::from_secs(u64::from(
+        POLL_SECS.load(Ordering::SeqCst),
+    )))
+    .unwrap_or_default();
+    UI.with_borrow_mut(|ui| {
+        let text: Vec<u16> = detail.encode_utf16().chain(std::iter::once(0)).collect();
+        if ui.error_tooltip_text == text {
+            return;
+        }
+        ui.error_tooltip_text = text;
+        let newly_created = ui.error_tooltip.is_none();
+        if newly_created && !detail.is_empty() {
+            ui.error_tooltip = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                TOOLTIPS_CLASSW,
+                PCWSTR::null(),
+                WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
+                0,
+                0,
+                0,
+                0,
+                flyout,
+                None,
+                None,
+                None,
+            )
+            .ok();
+        }
+        if let Some(tooltip) = ui.error_tooltip {
+            let tool = TTTOOLINFOW {
+                // The native control accepts the V2 size on this Win32 app.
+                cbSize: (std::mem::size_of::<TTTOOLINFOW>()
+                    - std::mem::size_of::<*mut std::ffi::c_void>()) as u32,
+                uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+                hwnd: flyout,
+                uId: flyout.0 as usize,
+                lpszText: PWSTR(ui.error_tooltip_text.as_mut_ptr()),
+                ..Default::default()
+            };
+            SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM(360));
+            SendMessageW(
+                tooltip,
+                if newly_created {
+                    TTM_ADDTOOLW
+                } else {
+                    TTM_UPDATETIPTEXTW
+                },
+                WPARAM(0),
+                LPARAM(std::ptr::from_ref(&tool) as isize),
             );
         }
     });
@@ -2043,6 +2121,11 @@ unsafe fn update_tray(owner: HWND) {
         }
     }
 
+    if let Some(detail) = app::error_details(Duration::from_secs(u64::from(
+        POLL_SECS.load(Ordering::SeqCst),
+    ))) {
+        tip = detail.replace('\n', " ");
+    }
     let icon = trayicon::build(&style, dark).unwrap_or_default();
     let mut nid = base_nid(owner);
     nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;

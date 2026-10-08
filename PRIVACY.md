@@ -105,7 +105,7 @@ them.
 
 | Path | Data read | When |
 | --- | --- | --- |
-| `%CLAUDE_CONFIG_DIR%\.credentials.json`, or `%USERPROFILE%\.claude\.credentials.json` | Claude OAuth access token and optional expiry hint | Account status checks and each attempted Claude refresh; a changing file is also used to detect completion of explicit Claude Code sign-in |
+| `%CLAUDE_CONFIG_DIR%\.credentials.json`, or `%USERPROFILE%\.claude\.credentials.json` | Claude OAuth access token, optional expiry hint, and optional `claudeAiOauth.scopes` | Account status checks and each attempted Claude refresh; an existing scopes array without `user:profile` blocks request preparation and asks for a normal Claude sign-in. A changing file is also used to detect completion of explicit Claude Code sign-in. |
 | `%CLAUDE_CONFIG_DIR%\.claude.json`, or `%USERPROFILE%\.claude.json` when no custom directory is set | Cached Claude account/organization identifier and organization type | Account status and Claude request preparation |
 | `%CODEX_HOME%\auth.json`, or `%USERPROFILE%\.codex\auth.json` | Codex OAuth access token and account ID; the token's JWT expiry claim is decoded locally | Each attempted Codex refresh while the Codex section is enabled |
 | `%CLAUDE_CONFIG_DIR%\hooks\caps-led.ps1` and `%CLAUDE_CONFIG_DIR%\settings.json`, or their `%USERPROFILE%\.claude` equivalents | File presence and Claude hook configuration referencing `caps-led.ps1` | Settings rendering and Caps helper toggles, only when the optional helper appears to be installed |
@@ -125,6 +125,14 @@ the user's Windows notification settings.
 
 Bearer tokens are held in process memory and sent only to their corresponding
 provider:
+
+Provider failures use fixed categories/codes and local recovery text. HTTP
+401/403 clears account-bound displayed/cache data; 429 keeps same-account
+last-good values and persists its bounded retry deadline. Error response
+bodies/status text and transport error strings are discarded and never shown
+or logged. Native flyout tooltips and UIA HelpText expose only generated
+recovery details. Optional Claude scopes are checked locally without login,
+token exchange, credential writes, or network requests.
 
 - A Claude token is sent only to `api.anthropic.com` for Claude usage and
   profile requests.

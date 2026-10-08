@@ -27,6 +27,7 @@ struct ProviderSlot {
     // Compatibility presentation survives entering Fetching. FRESH-01 will
     // expose the richer reducer view without changing APP-01 screenshots.
     last_error: Option<String>,
+    error: Option<FetchError>,
     manual_cooldown_notice: bool,
 }
 
@@ -37,6 +38,7 @@ impl ProviderSlot {
             pending: None,
             next_operation: 1,
             last_error: None,
+            error: None,
             manual_cooldown_notice: false,
         }
     }
@@ -44,6 +46,7 @@ impl ProviderSlot {
     fn invalidate(&mut self, disabled: bool, clock: &impl Clock) {
         self.pending = None;
         self.last_error = None;
+        self.error = None;
         self.manual_cooldown_notice = false;
         self.state.reduce(
             if disabled {
@@ -140,6 +143,7 @@ impl ProviderSlot {
             .is_none_or(|current| current.key != account.key)
         {
             self.last_error = None;
+            self.error = None;
             self.manual_cooldown_notice = false;
             let cache = load(preparation.provider, &account, clock.read().unix_seconds);
             self.state
@@ -180,16 +184,13 @@ impl ProviderSlot {
         self.pending = None;
         let invalidates = failure.invalidates_account();
         self.last_error = Some(failure.message.to_string());
+        self.error = Some(failure.error());
         if invalidates {
             self.manual_cooldown_notice = false;
         }
         self.state.reduce(
             ProviderEvent::PreparationFailed {
-                error: FetchError {
-                    kind: FailureKind::Transient,
-                    message: failure.message.to_string(),
-                    retry_after: None,
-                },
+                error: failure.error(),
                 invalidates_account: invalidates,
             },
             clock,
@@ -203,7 +204,21 @@ impl ProviderSlot {
         clock: &impl Clock,
     ) -> Transition {
         let error = match &completion.payload {
-            FetchOutcome::Err { msg, .. } => Some(msg.clone()),
+            FetchOutcome::Failure(error) => Some(error.clone()),
+            #[cfg(test)]
+            FetchOutcome::Err {
+                msg,
+                retry_after,
+                rate_limited,
+            } => Some(FetchError {
+                kind: if *rate_limited {
+                    FailureKind::RateLimited
+                } else {
+                    FailureKind::Transient
+                },
+                message: msg.clone(),
+                retry_after: *retry_after,
+            }),
             _ => None,
         };
         let transition = self.state.reduce(
@@ -217,7 +232,8 @@ impl ProviderSlot {
             clock,
         );
         if !matches!(transition, Transition::Ignored) {
-            self.last_error = error;
+            self.last_error = error.as_ref().map(|error| error.message.clone());
+            self.error = error;
         }
         transition
     }
@@ -272,6 +288,44 @@ pub fn any_fetching() -> bool {
             slot.pending.is_some() || matches!(slot.state.phase(), ProviderPhase::Fetching { .. })
         })
     })
+}
+
+pub fn error_text(provider: ProviderId, interval: Duration) -> Option<(String, String)> {
+    APP.with_borrow(|app| {
+        let slot = &app.providers[provider.index()];
+        let error = slot.error.as_ref().or_else(|| match slot.state.phase() {
+            ProviderPhase::Backoff { error, .. } => Some(error),
+            _ => None,
+        })?;
+        let retry = slot
+            .state
+            .view(&SystemClock, interval)
+            .retry_at_unix
+            .or_else(|| {
+                (error.kind == FailureKind::Timeout)
+                    .then(|| slot.state.next_attempt_unix(&SystemClock, interval))
+            });
+        let retry = retry.map(crate::api::fmt_unix_hhmm);
+        Some((
+            error.message.clone(),
+            error.detail(provider, retry.as_deref()),
+        ))
+    })
+}
+
+pub fn error_details(interval: Duration) -> Option<String> {
+    if crate::demo::active().is_some_and(|state| state.scenario == crate::demo::Scenario::Error) {
+        return Some(FetchError::new(FailureKind::Offline).detail(ProviderId::Claude, None));
+    }
+    if crate::demo::is_active() {
+        return None;
+    }
+    let details: Vec<_> = [ProviderId::Claude, ProviderId::Codex]
+        .into_iter()
+        .filter(|provider| *provider != ProviderId::Codex || crate::codex_active())
+        .filter_map(|provider| error_text(provider, interval).map(|(_, detail)| detail))
+        .collect();
+    (!details.is_empty()).then(|| details.join("\n"))
 }
 
 pub fn invalidate(provider: ProviderId, disabled: bool) {
@@ -367,11 +421,9 @@ pub fn drain_events(interval: Duration) -> bool {
                                     generation: ticket.generation,
                                     request_id: ticket.request_id,
                                     account: ticket.account,
-                                    payload: FetchOutcome::Err {
-                                        msg: "Request preparation timed out".to_string(),
-                                        retry_after: None,
-                                        rate_limited: false,
-                                    },
+                                    payload: FetchOutcome::Failure(FetchError::new(
+                                        FailureKind::Timeout,
+                                    )),
                                 },
                                 &SystemClock,
                             );
@@ -429,8 +481,13 @@ pub fn drain_events(interval: Duration) -> bool {
                             );
                         }
                     }
-                    (!matches!(transition, Transition::Ignored), alert)
+                    let accepted = !matches!(transition, Transition::Ignored);
+                    (accepted, alert, accepted && slot.state.account().is_none())
                 });
+                if accepted.2 {
+                    let _ = crate::runtime_state::clear_provider_cache(provider);
+                    crate::alerts::account_changed(provider, None);
+                }
                 if let Some((account, snapshot)) = accepted.1 {
                     if provider != ProviderId::Codex || crate::codex_active() {
                         crate::alerts::check(provider, &account, &snapshot);
@@ -913,6 +970,95 @@ mod tests {
                 Duration::from_secs(60)
             )
             .is_some());
+    }
+
+    #[test]
+    fn typed_authentication_failure_clears_account_and_cached_values() {
+        let clock = FakeClock::new();
+        let mut slot = ProviderSlot::new(ProviderId::Claude);
+        let ticket = request(&mut slot, &clock, 1);
+        slot.complete(
+            completion(
+                &ticket,
+                FetchOutcome::Failure(FetchError::new(FailureKind::Authentication)),
+            ),
+            &clock,
+        );
+        assert!(slot.state.account().is_none());
+        assert!(slot.state.snapshot().is_none());
+        assert_eq!(slot.error.as_ref().unwrap().code(), "sign_in_expired");
+        assert!(matches!(
+            slot.state.phase(),
+            ProviderPhase::Unavailable(UnavailableReason::Authentication)
+        ));
+    }
+
+    #[test]
+    fn typed_transient_failures_keep_values_and_retry_time_does_not_slide() {
+        for kind in [
+            FailureKind::Offline,
+            FailureKind::Timeout,
+            FailureKind::UnexpectedResponse,
+            FailureKind::RateLimited,
+        ] {
+            let mut clock = FakeClock::new();
+            let mut slot = ProviderSlot::new(ProviderId::Claude);
+            let first = request(&mut slot, &clock, 1);
+            slot.complete(
+                completion(&first, FetchOutcome::Ok(snapshot(1, 1000))),
+                &clock,
+            );
+            clock.advance(3);
+            let next = request(&mut slot, &clock, 1);
+            slot.complete(
+                completion(&next, FetchOutcome::Failure(FetchError::new(kind))),
+                &clock,
+            );
+            assert!(slot.effective(clock.read()).0.is_some());
+            assert_eq!(slot.error.as_ref().unwrap().kind, kind);
+            assert_eq!(
+                slot.state
+                    .next_attempt_unix(&clock, Duration::from_secs(60)),
+                1063
+            );
+            clock.advance(10);
+            assert_eq!(
+                slot.state
+                    .next_attempt_unix(&clock, Duration::from_secs(60)),
+                1063
+            );
+        }
+    }
+
+    #[test]
+    fn scope_preparation_failure_clears_previous_account_and_keeps_actionable_error() {
+        let mut clock = FakeClock::new();
+        let mut slot = ProviderSlot::new(ProviderId::Claude);
+        let ticket = request(&mut slot, &clock, 1);
+        slot.complete(
+            completion(&ticket, FetchOutcome::Ok(snapshot(1, 1000))),
+            &clock,
+        );
+        clock.advance(3);
+        let preparation = slot
+            .reserve(
+                ProviderId::Claude,
+                RefreshTrigger::Manual,
+                &clock,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        slot.preparation_failed(
+            preparation,
+            PreparationFailure {
+                kind: PreparationFailureKind::UsageScope,
+                message: "Sign in again for live usage",
+            },
+            &clock,
+        );
+        assert!(slot.state.snapshot().is_none());
+        assert!(slot.state.account().is_none());
+        assert_eq!(slot.error.unwrap().kind, FailureKind::UsageScope);
     }
 
     #[test]

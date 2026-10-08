@@ -14,6 +14,7 @@ use windows::Win32::System::Time::{
     SystemTimeToTzSpecificLocalTimeEx, DYNAMIC_TIME_ZONE_INFORMATION,
 };
 
+use crate::provider::error::{request_error, FailureKind, FetchError};
 use crate::provider::model::{
     derive_account_context, AccountContext, AccountKey, FetchOutcome, LimitKind, ProviderId,
     ProviderSeverity, SecretString, SourceProvenance, UsageLimit, UsageSnapshot,
@@ -50,6 +51,7 @@ struct CredsFile {
 struct Oauth {
     access_token: SecretString,
     expires_at: Option<i64>,
+    scopes: Option<Vec<String>>,
 }
 
 pub struct PreparedRequest {
@@ -71,6 +73,7 @@ pub enum PreparationFailureKind {
     Malformed,
     Unsupported,
     IdentityUnavailable,
+    UsageScope,
 }
 
 pub struct PreparationFailure {
@@ -81,6 +84,18 @@ pub struct PreparationFailure {
 impl PreparationFailure {
     pub fn invalidates_account(&self) -> bool {
         self.kind != PreparationFailureKind::TemporarilyUnreadable
+    }
+
+    pub fn error(&self) -> FetchError {
+        FetchError::new(match self.kind {
+            PreparationFailureKind::Missing | PreparationFailureKind::Unsupported => {
+                FailureKind::MissingCredentials
+            }
+            PreparationFailureKind::UsageScope => FailureKind::UsageScope,
+            PreparationFailureKind::TemporarilyUnreadable
+            | PreparationFailureKind::IdentityUnavailable => FailureKind::Transient,
+            PreparationFailureKind::Malformed => FailureKind::UnexpectedResponse,
+        })
     }
 }
 
@@ -286,6 +301,7 @@ struct ExtraUsage {
 
 pub fn prepare() -> Result<PreparedRequest, PreparationFailure> {
     let credentials = read_credentials()?;
+    validate_usage_scope(&credentials.oauth)?;
     if credentials.oauth.access_token.is_empty() {
         return Err(PreparationFailure {
             kind: PreparationFailureKind::Malformed,
@@ -312,21 +328,31 @@ pub fn prepare() -> Result<PreparedRequest, PreparationFailure> {
     })
 }
 
+fn validate_usage_scope(oauth: &Oauth) -> Result<(), PreparationFailure> {
+    if oauth
+        .scopes
+        .as_ref()
+        .is_some_and(|scopes| !scopes.iter().any(|scope| scope == "user:profile"))
+    {
+        return Err(PreparationFailure {
+            kind: PreparationFailureKind::UsageScope,
+            message: "Sign in again for live usage",
+        });
+    }
+    Ok(())
+}
+
 pub fn fetch(request: PreparedRequest) -> FetchOutcome {
     match fetch_inner(request) {
         Ok(s) => FetchOutcome::Ok(s),
-        Err((msg, retry_after, rate_limited)) => FetchOutcome::Err {
-            msg,
-            retry_after,
-            rate_limited,
-        },
+        Err(error) => FetchOutcome::Failure(error),
     }
 }
 
-pub(crate) type FetchErr = (String, Option<u64>, bool);
+pub(crate) type FetchErr = FetchError;
 
-pub(crate) fn plain(msg: impl Into<String>) -> FetchErr {
-    (msg.into(), None, false)
+pub(crate) fn plain(_msg: &'static str) -> FetchErr {
+    FetchError::new(FailureKind::UnexpectedResponse)
 }
 
 fn read_credentials() -> Result<CredsFile, PreparationFailure> {
@@ -355,13 +381,13 @@ fn read_credentials() -> Result<CredsFile, PreparationFailure> {
 }
 
 fn fetch_inner(request: PreparedRequest) -> Result<UsageSnapshot, FetchErr> {
-    let tls = native_tls::TlsConnector::new().map_err(|_| plain("TLS init failed"))?;
+    let tls = native_tls::TlsConnector::new().map_err(|_| FetchError::new(FailureKind::Offline))?;
     let agent = ureq::AgentBuilder::new()
         .tls_connector(std::sync::Arc::new(tls))
         .timeout(std::time::Duration::from_secs(10))
         .build();
     let authorization = SecretString::new(format!("Bearer {}", request.access_token.expose()));
-    let response = || -> Result<ureq::Response, RequestFailure> {
+    let response = || -> Result<ureq::Response, FetchError> {
         crate::network::get(&agent, crate::network::ANTHROPIC_USAGE_URL)
             .set("Authorization", authorization.expose())
             .set("anthropic-beta", "oauth-2025-04-20")
@@ -370,9 +396,9 @@ fn fetch_inner(request: PreparedRequest) -> Result<UsageSnapshot, FetchErr> {
                 concat!("claudometer/", env!("CARGO_PKG_VERSION")),
             )
             .call()
-            .map_err(compact_request_error)
+            .map_err(|error| request_error(error, OffsetDateTime::now_utc().unix_timestamp()))
     };
-    let resp = response().map_err(RequestFailure::into_fetch_error)?;
+    let resp = response()?;
 
     let body = read_bounded(resp.into_reader())?;
 
@@ -477,38 +503,6 @@ pub fn plan_label(raw: &str) -> String {
         "pro" => "Pro".to_string(),
         "team" => "Team".to_string(),
         other => prettify(other),
-    }
-}
-
-enum RequestFailure {
-    Auth,
-    Other(FetchErr),
-}
-
-impl RequestFailure {
-    fn into_fetch_error(self) -> FetchErr {
-        match self {
-            Self::Auth => {
-                plain("Claude Code needs to refresh sign-in.\nOpen Claude Code once, then refresh.")
-            }
-            Self::Other(err) => err,
-        }
-    }
-}
-
-fn compact_request_error(e: ureq::Error) -> RequestFailure {
-    match e {
-        ureq::Error::Status(401 | 403, _) => RequestFailure::Auth,
-        ureq::Error::Status(429, resp) => {
-            let retry_after = resp
-                .header("retry-after")
-                .and_then(|v| v.trim().parse::<u64>().ok());
-            RequestFailure::Other(("Rate limited by the API.".to_string(), retry_after, true))
-        }
-        ureq::Error::Status(code, _) => {
-            RequestFailure::Other(plain(format!("Anthropic API error {code}.")))
-        }
-        _ => RequestFailure::Other(plain("Network error.\nCheck your connection.")),
     }
 }
 
@@ -674,7 +668,7 @@ pub(crate) fn read_bounded(reader: impl Read) -> Result<Vec<u8>, FetchErr> {
     reader
         .take((MAX_PROVIDER_RESPONSE_BYTES + 1) as u64)
         .read_to_end(&mut body)
-        .map_err(|_| plain("Bad API response."))?;
+        .map_err(|error| crate::provider::error::io_error(&error))?;
     if body.len() > MAX_PROVIDER_RESPONSE_BYTES {
         return Err(plain("API response exceeded the 1 MiB safety limit."));
     }
@@ -947,6 +941,44 @@ mod tests {
             serde_json::from_str(r#"{"claudeAiOauth":{"accessToken":"worker-only-token"}}"#)
                 .unwrap();
         assert_eq!(credentials.oauth.expires_at, None);
+    }
+
+    #[test]
+    fn inference_only_credentials_cannot_reach_request_preparation() {
+        for scopes in [
+            None,
+            Some("[]"),
+            Some("[\"user:inference\"]"),
+            Some("[\"user:profile\",\"user:inference\"]"),
+        ] {
+            let field = scopes
+                .map(|scopes| format!(",\"scopes\":{scopes}"))
+                .unwrap_or_default();
+            let json =
+                format!("{{\"claudeAiOauth\":{{\"accessToken\":\"synthetic-token\"{field}}}}}");
+            let credentials: CredsFile = serde_json::from_str(&json).unwrap();
+            let allowed = scopes.is_none() || scopes.unwrap().contains("user:profile");
+            assert_eq!(validate_usage_scope(&credentials.oauth).is_ok(), allowed);
+            if !allowed {
+                let error = validate_usage_scope(&credentials.oauth).err().unwrap();
+                assert_eq!(error.kind, PreparationFailureKind::UsageScope);
+                assert_eq!(error.error().code(), "usage_scope_missing");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_response_error_never_contains_the_body() {
+        let error = parse_usage_json(
+            b"synthetic-private-response",
+            String::new(),
+            1000,
+            AccountKey::from_digest([1; 32]),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind, FailureKind::UnexpectedResponse);
+        assert!(!format!("{error:?}").contains("synthetic-private"));
     }
 
     #[test]

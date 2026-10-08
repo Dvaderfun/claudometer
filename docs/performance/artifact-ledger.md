@@ -30,6 +30,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | APP-01 UI-owned state, synthetic trust root provisioned | 1,074,688 | +1.25% vs STATE-01 provisioned | not measured | — |
 | CACHE-01 normalized runtime cache, unprovisioned | 998,912 | +3.61% vs APP-01 unprovisioned | not measured | — |
 | CACHE-01 normalized runtime cache, synthetic trust root provisioned | 1,109,504 | +3.24% vs APP-01 provisioned | not measured | — |
+| ERR-01 actionable errors, unprovisioned | 1,038,336 | +3.95% vs CACHE-01 unprovisioned | not measured | — |
+| ERR-01 actionable errors, synthetic trust root provisioned | 1,148,928 | +3.55% vs CACHE-01 provisioned | not measured | — |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;
@@ -245,3 +247,20 @@ and `z` profile. Gates: 151 tests, fmt/clippy/release, demo safety, 22 UIA
 checks, screenshot review, privacy/dependency/workflow checks. No idle-CPU or
 ARM64-runtime claim is added. Rollback/compatibility:
 [`../verification/cache-01.md`](../verification/cache-01.md).
+
+## ERR-01 (2026-10-09)
+
+Typed failure mapping/copy, scopes validation, HTTP-date Retry-After parsing,
+and native tooltip/UIA status presentation add 39,424 bytes in each x64
+mode: 1,038,336 unprovisioned / 1,148,928 synthetic trust root provisioned.
+Growth +3.95% / +3.55% vs CACHE-01 is within unchanged regression/ceiling
+gates. Provisioned headroom is 161,792 bytes; remaining unsigned soft-target
+headroom is 96,256 bytes. No crate or profile/budget change. Continued v0.10
+planning pressure remains; this ledger does not raise milestone allowances.
+
+Verification: 161 tests, fmt/clippy/release, both x64 artifact checks,
+demo safety, 22 UIA checks, native tooltip registration/text and exact UIA
+HelpText. Tooltip uses the Win32 V2 TTTOOLINFO size confirmed at runtime.
+Scope shape checked locally with boolean-only output. No ARM64 or new
+ten-minute idle claim. Evidence/rollback:
+[`../verification/err-01.md`](../verification/err-01.md).

@@ -38,6 +38,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `provider/model.rs` | provider/account/source/limit/request identities, normalized snapshots, typed kind/class/severity/Percent/window duration, and completion envelope |
 | `runtime_state.rs` | atomic optional `state.json` envelope, CNG install salt, account-scoped receipts, bounded normalized provider cache and retry deadlines |
 | `provider/state.rs` | pure provider reducer, identity-checked fetch tickets, derived freshness/views, and injected-clock debounce/429 policy |
+| `provider/error.rs` | stable failure categories/codes, generated recovery copy, HTTP/IO mapping, and numeric/date Retry-After parsing |
 | `store.rs` | typed atomic JSON commit, verified `.bak` generation, corruption preservation, and failure injection |
 | `demo.rs` | deterministic provider/view scenarios and guarded no-side-effect launch mode |
 | `trayicon.rs` | CPU-rasterized ring/alert HICON (premultiplied DIB, no fonts) |
@@ -123,6 +124,17 @@ reset has passed lose their cached value. Unknown existing state fields survive
 atomic cache writes and older receipt writers; malformed cache remains optional.
 
 ## Alerts (`alerts.rs`)
+
+ERR-01 adapters emit typed `FetchOutcome::Failure`. The legacy string variant
+exists only under cfg(test) for the old parity reference. HTTP 401/403 and
+Codex's local expiry check map to Authentication; response bodies/status and
+transport strings are discarded. Missing optional Claude scopes retain legacy
+behavior, but an existing `claudeAiOauth.scopes` without `user:profile` rejects
+preparation before requests. The UI shows a short status below a data-bearing
+provider header, uses exact recovery detail for UIA HelpText/native tooltip,
+and keeps same-account stale values on transient errors. Authentication clears
+both reducer data and runtime cache. Timeout retry text uses the scheduled
+attempt deadline instead of sliding on every repaint.
 
 One native toast per limit window that crosses **75%** (`WARN_AT`), evaluated on the UI thread on `WM_DATA_READY`. Each accepted completion posts its provider and request identity; alert evaluation selects only the matching newly accepted success. An unrelated provider completion cannot re-evaluate another provider's stored result, and stale/error-preserved snapshots remain ineligible.
 
