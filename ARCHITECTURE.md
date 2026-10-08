@@ -28,6 +28,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | File | Owns |
 |---|---|
 | `main.rs` | windows, wndprocs, tray, menu, timers, per-provider fetch orchestration (`SLOTS`), hit-testing, keyboard nav, all statics |
+| `accessibility.rs` | `WM_GETOBJECT` UIA fragment roots, names and bounds from view/geometry, Invoke/Toggle dispatch to the UI thread, and focus events; Narrator verification pending |
 | `gfx.rs` | `Surface` (D3D/DXGI/DComp/D2D stack), all drawing, layout constants, Fluent palette, brush/format caches |
 | `auth.rs` | Claude account: identity from local files + explicit interactive browser sign-in (own console, cancellable) delegated to the resolved native `claude` executable |
 | `api.rs` | Claude credentials read + usage fetch; shared display model (`UsageSnapshot`, `LimitRow`, `FetchOutcome`), time formatting |
@@ -155,6 +156,6 @@ move to their own files in later slices.
 
 ## Known gaps
 
-- No UI Automation provider — keyboard works, screen readers see nothing. The honest next step is `IRawElementProviderSimple`/fragment tree behind `WM_GETOBJECT` (~500 lines).
+- UI Automation fragment trees expose named buttons, switches, and quota text. Narrator speech is unverified; Selection/RangeValue and targeted property events remain incomplete. See `docs/verification/wip-00.md`.
 - Unofficial endpoint can change shape any day; failure mode is a visible parse error, not a crash.
 - Unsigned exe (SmartScreen warning on first run).
