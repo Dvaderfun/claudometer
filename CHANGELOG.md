@@ -20,6 +20,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 - Usage alerts evaluate only newly accepted successful fetches and deduplicate by provider, account, limit, and reset-window instance; stale snapshots cannot trigger alerts.
 - Credential reads handle atomic CLI file replacement without unnecessary sign-in work. Weekly reset formatting respects local daylight-saving offsets, and missing/partial/oversized provider data is handled defensively with bounded rows and text.
 
+### Changed
+- Optimize release builds for size with `opt-level = "z"`: the local provisioned x64 executable shrinks by 74,240 bytes and ARM64 by 88,576 bytes. The size audit records startup measurements and milestone allowances; dependency features and runtime behavior are preserved.
+
 ### Security
 - Release tags now build once with `--locked`, publish signed manifests and an SPDX SBOM, create GitHub provenance/SBOM attestations, verify downloaded draft assets, smoke-test the downloaded x64 executable, and publish only with immutable releases enabled.
 - **Manual trust-root bootstrap required.** Versions without an embedded Ed25519 release key—including all published versions through 0.7.3—cannot authenticate a trust-root-enabled update. They will not update automatically across that boundary. Existing users must manually download and independently verify the first trust-root-enabled release using its published hash and Authenticode identity before installing it. Later releases can use signed-manifest updates. See the [bootstrap verification procedure](docs/release-manifest-v1.md#trust-root-bootstrap).
