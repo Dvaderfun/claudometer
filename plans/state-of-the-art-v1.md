@@ -152,7 +152,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | `v0.8` | Trustworthy state and system safety | **Done on `main`, unreleased** |
 | `v0.9` | Authenticated, crash-safe updates | **Done on `main`, unreleased** |
 | R0 | Ship the trust-root release | **Notes prepared (REL-03)**; publication blocked on human signing/provisioning (§7) |
-| `v0.10` | State core, diagnostics, Codex documented source | **In progress** (MODEL-01 merged; STATE-01, APP-01, CACHE-01 complete locally; ERR-01 next) |
+| `v0.10` | State core, diagnostics, Codex documented source | **In progress** (MODEL-01 merged; state/cache/ERR-01 complete locally; DIAG-01 next) |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
 | `v0.12` | Glanceable status, tray, and alerts | Not started |
 | `v1.0` | Signed distribution | Not started |
@@ -167,7 +167,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
   - SIZE-01 selects `opt-level = "z"`: provisioned x64 **1,058,304 bytes**, ARM64 **940,544 bytes**; unprovisioned **947,712 / 892,928 bytes**. The size-reducing change updates CI comparison baselines, preserves the 1.25 MiB ceiling, and records a **1,245,184-byte unsigned provisioned soft target** and milestone allowances in the ledger.
 - Commit `0ed4ea9` on `feat/a11y-uia-and-plan-v2` contains the A11Y-01 implementation in `src/accessibility.rs`, `src/main.rs`, `src/gfx.rs`, `src/util.rs`, `src/demo.rs`, `Cargo.toml`, and `Cargo.lock` (UIA fragment tree via `WM_GETOBJECT`, new `windows` features `implement`, `Win32_UI_Accessibility`, `Win32_System_Ole`, `Win32_System_Variant`, plus a direct `windows-core` dependency). WIP-00 passed all §0.3 gates, both architecture builds, demo safety, and 22 UIA client checks on 2026-10-08; Narrator speech remains unverified. See `docs/verification/wip-00.md`.
 - HTTP requests already use a 10-second `ureq` timeout (`api.rs`, `codex.rs`).
-- Existing runtime modules: `accessibility`, `alerts`, `api`, `app`, `auth`, `codex`, `config`, `demo`, `gfx`, `main`, `network`, `poller`, `provider/{mod,model,state}`, `release_manifest`, `runtime_state`, `store`, `trayicon`, `updater`, `util`, `vibecode`. `state_reference` is test-only legacy parity code.
+- Existing runtime modules: `accessibility`, `alerts`, `api`, `app`, `auth`, `codex`, `config`, `demo`, `gfx`, `main`, `network`, `poller`, `provider/{mod,error,model,state}`, `release_manifest`, `runtime_state`, `store`, `trayicon`, `updater`, `util`, `vibecode`. `state_reference` is test-only legacy parity code.
 - Demo scenarios: `claude-only`, `codex-only`, `both`, `loading`, `stale`, `cooldown`, `error`, `neither`, `settings`, `many`.
 - Codex-family agents auto-load `AGENTS.md`, which points here and to `CLAUDE.md`. Read both explicitly either way.
 
@@ -179,8 +179,8 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 2. **SIZE-01** — **done**: size audit, measured `z` profile, and headroom plan (§3.2) on `chore/size-audit`, branched from PR #2.
 3. **REL-03** — **done (notes only)**: proposed `docs/release-notes/0.9.0.md`, expanded Unreleased changelog, local release-input check, and live protection audit (§7). Human publishes.
 4. **MODEL-01 done** → **STATE-01 done** → **APP-01 done** → **CACHE-01 done** (§8.1).
-5. **ERR-01 next** — actionable error states (§8.2).
-6. **DIAG-01** → **DIAG-02** (§8.3).
+5. **ERR-01 done** — actionable error states (§8.2).
+6. **DIAG-01 next** → **DIAG-02** (§8.3).
 7. **CODEX-01** → **CODEX-02** (§8.4).
 8. **PACE-01** → **ROW-01** → **FRESH-01** (§10.1). If the v0.10 tail is blocked, PACE-01 and ROW-01 may start once MODEL-01 is done, and FRESH-01 once APP-01 is done.
 9. **A11Y-02**, **LAYOUT-01**, **LAYOUT-02**, **RENDER-01** (§9).
@@ -506,10 +506,11 @@ Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authentic
 
 ### 8.2 Actionable errors
 
-- [ ] **ERR-01 — Map every failure to a §5.3 state.**
+- [x] **ERR-01 — Map every failure to a §5.3 state.**
   - Add a stable error category and code to `FetchError`; map 401/403, 429 (with `Retry-After`), timeout, connect failure, and parse failure.
   - Detect an inference-only Claude credential before any request: if the credential's `scopes` array exists and lacks `user:profile`, enter the `Sign in again for live usage` state and make no usage request. Confirm the field name against a real credential file without logging values.
   - Acceptance: one test per §5.3 row; UIA and tooltip expose the detail text; no raw response body appears in any string.
+  - Completed 2026-10-09: shared typed provider failures with stable category/code and §5.3 short/detail text; HTTP 401/403, 429 numeric/date Retry-After, timeout/connect/parse failures mapped without exposing bodies/transport strings. Real local credential confirms `claudeAiOauth.scopes` shape through boolean-only inspection; present scopes lacking `user:profile` reject preparation before any request. Accepted auth failures clear account data/cache/alerts, transient values remain. Status is below the provider header to preserve name/plan/button layout. UIA HelpText and native tooltip registration/text verified with deterministic Offline demo; 161 tests and §0.3 gates pass. Copy diagnostics itself remains DIAG-01's action. Rollback: prior binary/revert; state schema unchanged. See `docs/verification/err-01.md`.
 
 ### 8.3 Diagnostics
 

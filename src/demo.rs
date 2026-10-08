@@ -194,7 +194,9 @@ fn build_state(request: Request, now_unix: i64) -> State {
             "Demo · retry in 2m",
         ),
         Scenario::Error => (
-            View::Error("Can't load usage\nDemo network failure · no request was made".to_string()),
+            View::Error(
+                "Offline\nCan't reach api.anthropic.com. Showing the last values.".to_string(),
+            ),
             false,
             None,
             "Demo · usage unavailable",
@@ -204,6 +206,7 @@ fn build_state(request: Request, now_unix: i64) -> State {
                 sections: vec![Section {
                     title: "Providers",
                     plan: String::new(),
+                    status: None,
                     body: SectionBody::Note("Claude and Codex are not signed in".to_string()),
                 }],
                 fetched_unix: None,
@@ -291,6 +294,7 @@ fn provider_section(
     Section {
         title,
         plan: plan.to_string(),
+        status: None,
         body: SectionBody::Rows(vec![
             LimitRow {
                 label: "Session (5h)".to_string(),

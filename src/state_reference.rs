@@ -137,6 +137,9 @@ fn effective_at(s: &Slot, now: ClockReading) -> (Option<UsageSnapshot>, Option<S
         {
             match &completion.payload {
                 FetchOutcome::Ok(snapshot) => (Some(snapshot.clone()), None),
+                FetchOutcome::Failure(_) => {
+                    unreachable!("legacy reference accepts legacy fixtures only")
+                }
                 FetchOutcome::Err { msg, .. } => {
                     let recent = matching_last_good().filter(|snapshot| {
                         provider_state::within_stale_window(now, snapshot.fetched_unix)
@@ -167,6 +170,7 @@ fn alert_candidate(s: &Slot, event: CompletionEvent) -> Option<(AccountContext, 
                     Some((identity.account.as_ref()?.clone(), snapshot.clone()))
                 }
                 FetchOutcome::Err { .. } => None,
+                FetchOutcome::Failure(_) => None,
             }
         }
         Some(_) | None => None,
@@ -275,7 +279,7 @@ fn record_fetch_completion(
             FetchOutcome::Ok(snapshot) => {
                 snapshot.provider == completion.provider && snapshot.account == completion.account
             }
-            FetchOutcome::Err { .. } => true,
+            FetchOutcome::Err { .. } | FetchOutcome::Failure(_) => true,
         }
         && identity.pending_request_id == Some(completion.request_id)
         && identity.generation == completion.generation
@@ -322,6 +326,7 @@ fn record_fetch_completion(
             );
             s.rl_streak.store(streak, Ordering::SeqCst);
         }
+        FetchOutcome::Failure(_) => unreachable!("legacy reference accepts legacy fixtures only"),
     }
     *s.preparation_error.lock().unwrap() = None;
     *s.state.lock().unwrap() = Some(completion);

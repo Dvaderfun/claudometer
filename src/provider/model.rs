@@ -140,6 +140,8 @@ pub struct UsageSnapshot {
 #[derive(Clone)]
 pub enum FetchOutcome {
     Ok(UsageSnapshot),
+    Failure(super::error::FetchError),
+    #[cfg(test)]
     Err {
         msg: String,
         retry_after: Option<u64>,
