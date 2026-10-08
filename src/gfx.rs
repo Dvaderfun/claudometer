@@ -95,6 +95,8 @@ pub enum CapsControl {
 }
 
 pub struct SettingsView {
+    pub diagnostics: String,
+    pub diagnostics_copy: &'static str,
     pub account_caption: String,
     pub account_action: &'static str,
     pub account_connected: bool,
@@ -295,7 +297,7 @@ pub const SET_W: f32 = 400.0;
 const SET_PAD: f32 = 24.0;
 const CARD_H: f32 = 56.0;
 const CARD_GAP: f32 = 4.0;
-pub const N_CARDS: usize = 11;
+pub const N_CARDS: usize = 12;
 pub const CARD_ACCOUNT: usize = 0;
 pub const CARD_CAPS: usize = 1;
 pub const CARD_AUTOSTART: usize = 2;
@@ -309,18 +311,25 @@ pub const CARD_INTERVAL: usize = 7;
 pub const CARD_REFRESH: usize = 8;
 pub const CARD_ABOUT: usize = 9;
 pub const CARD_QUIT: usize = 10;
+pub const CARD_DIAGNOSTICS: usize = 11;
+const DIAGNOSTICS_H: f32 = 720.0;
 
 pub fn settings_height() -> f32 {
     let cards = N_CARDS as f32 * CARD_H + (N_CARDS as f32 - 1.0) * CARD_GAP;
-    SET_PAD + cards + SET_PAD
+    SET_PAD + cards + DIAGNOSTICS_H - CARD_H + SET_PAD
 }
 
 pub fn settings_rects(scroll: f32) -> [D2D_RECT_F; N_CARDS] {
     let mut out = [rect(0.0, 0.0, 0.0, 0.0); N_CARDS];
     let mut y = SET_PAD - scroll;
-    for r in out.iter_mut() {
-        *r = rect(SET_PAD, y, SET_W - SET_PAD, y + CARD_H);
-        y += CARD_H + CARD_GAP;
+    for (index, r) in out.iter_mut().enumerate() {
+        let height = if index == CARD_DIAGNOSTICS {
+            DIAGNOSTICS_H
+        } else {
+            CARD_H
+        };
+        *r = rect(SET_PAD, y, SET_W - SET_PAD, y + height);
+        y += height + CARD_GAP;
     }
     out
 }
@@ -1033,13 +1042,14 @@ impl Surface {
                 st.refresh_label.as_str(),
                 st.about.as_str(),
                 "Quit Claudometer",
+                "Diagnostics",
             ];
             // Segoe Fluent Icons: account, keyboard, power, command prompt,
             // bell (EA8F Ringer — E7ED is the muted bell), download, clock,
             // refresh, info, cancel
             let icons = [
                 "\u{E77B}", "\u{E765}", "\u{E7E8}", "\u{E756}", "\u{EA8F}", "\u{E895}", "\u{E7BA}",
-                "\u{E823}", "\u{E72C}", "\u{E946}", "\u{E711}",
+                "\u{E823}", "\u{E72C}", "\u{E946}", "\u{E711}", "\u{E9D9}",
             ];
             let cards = settings_rects(scroll);
             for (i, card) in cards.iter().enumerate() {
@@ -1066,6 +1076,38 @@ impl Surface {
                     &b.card_stroke
                 };
                 self.dc.DrawRoundedRectangle(&rr, border, 1.0, None);
+
+                if i == CARD_DIAGNOSTICS {
+                    self.text(
+                        "Diagnostics",
+                        &self.fmt_body_sb,
+                        rect(
+                            card.left + 16.0,
+                            card.top + 16.0,
+                            card.right - 100.0,
+                            card.top + 36.0,
+                        ),
+                        &b.text,
+                        false,
+                    )?;
+                    self.button(card.right - 16.0, card.top + 26.0, st.diagnostics_copy)?;
+                    self.text(
+                        &st.diagnostics,
+                        &self.fmt_caption,
+                        rect(
+                            card.left + 16.0,
+                            card.top + 52.0,
+                            card.right - 16.0,
+                            card.bottom - 16.0,
+                        ),
+                        &b.dim,
+                        false,
+                    )?;
+                    if st.focus == i as i32 {
+                        self.focus_ring(*card, 4.0)?;
+                    }
+                    continue;
+                }
 
                 let cy0 = (card.top + card.bottom) / 2.0;
                 let icon_brush = if (i == CARD_ACCOUNT && st.account_connected)
@@ -1521,6 +1563,8 @@ mod tests {
 
     fn settings_view(update_checks_on: bool) -> SettingsView {
         SettingsView {
+            diagnostics: String::new(),
+            diagnostics_copy: "Copy",
             account_caption: String::new(),
             account_action: "",
             account_connected: false,
@@ -1555,6 +1599,21 @@ mod tests {
         assert_eq!(
             settings_view(true).toggle_for(CARD_UPDATE_CHECKS),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn diagnostics_card_adds_scrollable_bounds_after_existing_controls() {
+        let cards = settings_rects(0.0);
+        assert_eq!(
+            cards[CARD_DIAGNOSTICS].bottom - cards[CARD_DIAGNOSTICS].top,
+            DIAGNOSTICS_H
+        );
+        assert!(cards[CARD_DIAGNOSTICS].top > cards[CARD_QUIT].bottom);
+        assert_eq!(settings_height(), cards[CARD_DIAGNOSTICS].bottom + SET_PAD);
+        assert_eq!(
+            settings_rects(100.0)[CARD_DIAGNOSTICS].top,
+            cards[CARD_DIAGNOSTICS].top - 100.0
         );
     }
 

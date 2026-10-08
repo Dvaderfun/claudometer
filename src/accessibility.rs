@@ -272,6 +272,14 @@ fn settings_items(hwnd: HWND) -> Vec<Item> {
         rects[gfx::CARD_QUIT],
         Role::Button,
     ));
+    let mut diagnostics = item(
+        "CopyDiagnostics",
+        "Copy diagnostics",
+        rects[gfx::CARD_DIAGNOSTICS],
+        Role::Button,
+    );
+    diagnostics.help = crate::diagnostics::text();
+    result.push(diagnostics);
     result
 }
 

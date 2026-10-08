@@ -41,6 +41,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `provider/error.rs` | stable failure categories/codes, generated recovery copy, HTTP/IO mapping, and numeric/date Retry-After parsing |
 | `store.rs` | typed atomic JSON commit, verified `.bak` generation, corruption preservation, and failure injection |
 | `demo.rs` | deterministic provider/view scenarios and guarded no-side-effect launch mode |
+| `diagnostics.rs` | bounded local operational snapshot, Windows build, and explicit Unicode clipboard export; no provider requests or diagnostics log |
 | `trayicon.rs` | CPU-rasterized ring/alert HICON (premultiplied DIB, no fonts) |
 | `alerts.rs` | 75% toast alerts: WinRT toast pipeline, AUMID registration, per-window dedup |
 | `updater.rs` | GitHub-Releases self-update: daily check, verified download, rename-swap handover |
@@ -49,6 +50,14 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `vibecode.rs` | independent wake lock plus journaled Advanced lid override, conservative recovery, legacy one-shot restore, and lifecycle reconciliation |
 
 ## Rendering (`gfx::Surface`)
+
+DIAG-01 adds a scrollable Diagnostics card after the existing Settings actions,
+with Invoke/Tab/Enter/Space copy. Snapshot/provider projection is read-only;
+attempt/success metadata changes only on reserved/accepted events. The card
+renders fixed operational fields from the same text exported through UIA
+HelpText and Clipboard. Settings retains a bounded initial window height and
+scrolls to the diagnostics header on keyboard focus. Only explicit copy uses
+the clipboard; demo mode reports success without any clipboard side effect.
 
 WARP D3D11 device → DXGI **composition** swapchain (premultiplied alpha) → `IDCompositionVisual` → window. D2D device context draws onto the swapchain buffer; DirectWrite for text. Window uses `WS_EX_NOREDIRECTIONBITMAP` so there's no GDI redirection surface at all.
 

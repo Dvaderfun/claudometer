@@ -112,6 +112,31 @@ pub fn can_self_update() -> bool {
         .is_some_and(|exe| install_channel(&exe) == InstallChannel::Portable)
 }
 
+pub fn diagnostic_channel() -> &'static str {
+    match std::env::current_exe()
+        .ok()
+        .map(|exe| install_channel(&exe))
+    {
+        Some(InstallChannel::Portable) => "portable",
+        Some(InstallChannel::Managed) => "managed",
+        _ => "ambiguous",
+    }
+}
+
+pub fn diagnostic_recovery() -> &'static str {
+    let Ok(exe) = std::env::current_exe() else {
+        return "unknown";
+    };
+    let Some(directory) = exe.parent() else {
+        return "unknown";
+    };
+    if directory.join(UPDATE_JOURNAL).exists() {
+        "journal pending"
+    } else {
+        "none"
+    }
+}
+
 fn set_status(s: Status) {
     *STATUS.lock().unwrap() = s;
     let h = crate::MAIN_HWND.load(Ordering::SeqCst);

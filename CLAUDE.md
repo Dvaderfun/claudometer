@@ -55,6 +55,7 @@ SIZE-01 selects release `opt-level = "z"`: current x64 **947,712 bytes unprovisi
 - Errors: stale data beats error UI. Never wipe `LAST_GOOD` on a failed fetch.
 - Runtime snapshots restore only after worker preparation matches a persistent opaque account and selected source. Restored data stays cached until accepted success; it never alerts or suppresses the first poll except for a persisted 429 deadline. Keep cache fields additive inside state schema 1 so old receipt writers preserve them.
 - Provider errors come from typed categories in `provider/error.rs`; never classify by message or show a transport/response string. `claudeAiOauth.scopes` is optional for legacy credentials; if present without `user:profile`, preparation must stop before usage/profile requests. Native tooltip text buffers stay owned by UI for the tooltip lifetime.
+- Diagnostics projects only fixed operational fields; never add raw error strings, account hashes, plan/limit labels, paths, or credential material to the snapshot. Clipboard writes require explicit Copy diagnostics; demos must leave clipboard unchanged.
 
 ## Release process
 
