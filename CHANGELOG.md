@@ -32,6 +32,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 - **Manual trust-root bootstrap required.** Versions without an embedded Ed25519 release key—including all published versions through 0.7.3—cannot authenticate a trust-root-enabled update. They will not update automatically across that boundary. Existing users must manually download and independently verify the first trust-root-enabled release using its published hash and Authenticode identity before installing it. Later releases can use signed-manifest updates. See the [bootstrap verification procedure](docs/release-manifest-v1.md#trust-root-bootstrap).
 - Portable self-updates now use an atomic `update-operation.v1.json` journal, attempt-unique candidate and backup names, and hash-reconciled startup recovery. The previous verified executable remains available until the candidate commit is durable.
 
+### Known gaps
+- The planned Codex app-server source remains incomplete: installed Codex 0.159.1 can proactively refresh and persist managed credentials during a limits read, conflicting with Claudometer's read-only credential contract. Compatibility polling remains in place until a safe source is demonstrated; see [CODEX-01 preflight](docs/verification/codex-01-preflight.md).
+
 ## [0.7.3] — 2026-08-29
 
 ### Fixed
