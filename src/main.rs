@@ -16,7 +16,6 @@ mod network;
 pub mod provider;
 mod release_manifest;
 pub mod runtime_state;
-mod state_policy;
 pub mod store;
 mod trayicon;
 mod updater;
@@ -50,7 +49,9 @@ use provider::model::{
     AccountContext, AccountKey, CompletionEvent, FetchCompletion, FetchOutcome, Generation,
     LimitKind, ProviderId, RequestId, UsageSnapshot,
 };
-use state_policy::{Clock, ClockReading, RefreshGate, RefreshTrigger, SystemClock};
+use provider::state::{
+    self as provider_state, Clock, ClockReading, RefreshGate, RefreshTrigger, SystemClock,
+};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_DATA_READY: u32 = WM_APP + 2;
@@ -168,7 +169,7 @@ fn effective_at(s: &Slot, now: ClockReading) -> (Option<UsageSnapshot>, Option<S
     };
     if let Some(error) = s.preparation_error.lock().unwrap().clone() {
         let recent = matching_last_good()
-            .filter(|snapshot| state_policy::within_stale_window(now, snapshot.fetched_unix));
+            .filter(|snapshot| provider_state::within_stale_window(now, snapshot.fetched_unix));
         return (recent, Some(error));
     }
     let state = s.state.lock().unwrap();
@@ -181,7 +182,7 @@ fn effective_at(s: &Slot, now: ClockReading) -> (Option<UsageSnapshot>, Option<S
                 FetchOutcome::Ok(snapshot) => (Some(snapshot.clone()), None),
                 FetchOutcome::Err { msg, .. } => {
                     let recent = matching_last_good().filter(|snapshot| {
-                        state_policy::within_stale_window(now, snapshot.fetched_unix)
+                        provider_state::within_stale_window(now, snapshot.fetched_unix)
                     });
                     (recent, Some(msg.clone()))
                 }
@@ -1420,7 +1421,7 @@ fn manual_cooldown_deadlines() -> Vec<(ProviderId, i64)> {
             continue;
         }
         let cooldown_until = *slot(provider).cooldown_until.lock().unwrap();
-        if let Some(deadline) = state_policy::cooldown_deadline_unix(now, cooldown_until) {
+        if let Some(deadline) = provider_state::cooldown_deadline_unix(now, cooldown_until) {
             active |= bit;
             deadlines.push((provider, deadline));
         }
@@ -2297,7 +2298,7 @@ fn spawn_fetch(p: ProviderId, trigger: RefreshTrigger) {
         return;
     }
     let s = slot(p);
-    let gate = state_policy::refresh_gate(
+    let gate = provider_state::refresh_gate(
         trigger,
         SystemClock.read(),
         *s.cooldown_until.lock().unwrap(),
@@ -2459,9 +2460,9 @@ fn record_preparation_failure(
     *s.preparation_error.lock().unwrap() = Some(failure.message.to_string());
     *s.last_fetch.lock().unwrap() = Some(completed_at.monotonic);
     s.rl_streak.store(
-        state_policy::next_rate_limit_streak(
+        provider_state::next_rate_limit_streak(
             s.rl_streak.load(Ordering::SeqCst),
-            state_policy::CompletionKind::OtherFailure,
+            provider_state::CompletionKind::OtherFailure,
         ),
         Ordering::SeqCst,
     );
@@ -2505,9 +2506,9 @@ fn record_fetch_completion(
                 snapshot: snapshot.clone(),
             });
             *s.cooldown_until.lock().unwrap() = None;
-            let streak = state_policy::next_rate_limit_streak(
+            let streak = provider_state::next_rate_limit_streak(
                 s.rl_streak.load(Ordering::SeqCst),
-                state_policy::CompletionKind::Success,
+                provider_state::CompletionKind::Success,
             );
             s.rl_streak.store(streak, Ordering::SeqCst);
         }
@@ -2517,18 +2518,18 @@ fn record_fetch_completion(
             ..
         } => {
             let current = s.rl_streak.load(Ordering::SeqCst);
-            let consecutive = state_policy::next_rate_limit_streak(
+            let consecutive = provider_state::next_rate_limit_streak(
                 current,
-                state_policy::CompletionKind::RateLimited,
+                provider_state::CompletionKind::RateLimited,
             );
             s.rl_streak.store(consecutive, Ordering::SeqCst);
-            let delay = state_policy::rate_limit_delay(*retry_after, consecutive);
+            let delay = provider_state::rate_limit_delay(*retry_after, consecutive);
             *s.cooldown_until.lock().unwrap() = Some(completed_at.monotonic + delay);
         }
         FetchOutcome::Err { .. } => {
-            let streak = state_policy::next_rate_limit_streak(
+            let streak = provider_state::next_rate_limit_streak(
                 s.rl_streak.load(Ordering::SeqCst),
-                state_policy::CompletionKind::OtherFailure,
+                provider_state::CompletionKind::OtherFailure,
             );
             s.rl_streak.store(streak, Ordering::SeqCst);
         }

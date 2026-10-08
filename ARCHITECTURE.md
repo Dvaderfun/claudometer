@@ -35,7 +35,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `codex.rs` | Codex (OpenAI) credentials read + usage fetch → same `UsageSnapshot` |
 | `provider/model.rs` | provider/account/source/limit/request identities, normalized snapshots, typed kind/class/severity/Percent/window duration, and completion envelope |
 | `runtime_state.rs` | atomic optional `state.json` envelope, CNG install salt, and account-scoped receipt schema |
-| `state_policy.rs` | fake-clock-testable debounce, stale, flyout-refresh, and 429 policy |
+| `provider/state.rs` | pure provider reducer, identity-checked fetch tickets, derived freshness/views, and injected-clock debounce/429 policy; runtime ownership moves in APP-01 |
 | `store.rs` | typed atomic JSON commit, verified `.bak` generation, corruption preservation, and failure injection |
 | `demo.rs` | deterministic provider/view scenarios and guarded no-side-effect launch mode |
 | `trayicon.rs` | CPU-rasterized ring/alert HICON (premultiplied DIB, no fonts) |
@@ -86,7 +86,7 @@ are interpreted only inside their adapters.
 
 Every provider HTTP body is read as at most 1 MiB plus one sentinel byte and rejected when oversized. Parsed output is bounded to 64 rows and 512 UTF-8 bytes per provider-controlled display string. Sanitized fixtures under `tests/fixtures/` cover normal, partial, unknown, malformed, missing-reset, weekly-primary, non-finite, and out-of-range shapes without live network access.
 
-Resilience rules (in `main.rs`, per provider via `SLOTS`, with time decisions isolated in `state_policy.rs`):
+Resilience rules (in `main.rs`, per provider via `SLOTS`, with time decisions isolated in `provider/state.rs`):
 
 - Credential parsing and secret-bearing request preparation run only on short-lived provider workers. A stable provider account ID is salted with the CNG-generated install salt and SHA-256; when none exists, an access-token fingerprint uses a process-only salt and is never persisted. Secret strings have no `Debug`/serialization surface and overwrite their buffers on drop.
 - Every slot has a current opaque account, generation, reserved request ID, and account-bound completion/last-good state. Credential changes clear snapshot, plan, error, cooldown, debounce, and alerts before replacement work. A completion must match provider + generation + request + account before any side effect; obsolete work cannot clear a newer fetch flag.
@@ -96,6 +96,15 @@ Resilience rules (in `main.rs`, per provider via `SLOTS`, with time decisions is
 - 3 s debounce on refresh; `fetching` flag dedupes concurrent spawns. Characterization uses an injected fake clock and never sleeps.
 - Fetch threads publish via mutexed statics + `PostMessageW(WM_DATA_READY)` — UI mutations stay on the UI thread.
 - Codex enablement (`codex_active`) = settings toggle AND auth file present — checked per poll, so signing in/out of Codex shows/hides the section without restart.
+
+STATE-01 adds the pure `ProviderState` event reducer for APP-01 integration.
+It owns phase, account generation, request identity, snapshot origin/age,
+debounce, and consecutive-429 state. A successful accepted transition is the
+only alert/cache candidate; rejected completions produce no effects. Cache
+loads are account-checked and never fresh. Transient failures retain the
+same-account snapshot, with an Outdated view at the §5.2 age threshold. The
+existing shell retains its characterized ten-minute stale display until the
+UI-thread move; no persisted cache is introduced by STATE-01.
 
 ## Alerts (`alerts.rs`)
 

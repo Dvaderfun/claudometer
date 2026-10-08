@@ -24,6 +24,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | SIZE-01 `opt-level = "z"`, synthetic trust root provisioned | 1,058,304 | -6.56% vs WIP-00 provisioned | 940,544 | -8.61% vs WIP-00 provisioned |
 | MODEL-01 typed domain model, unprovisioned | 950,784 | +0.32% vs SIZE-01 unprovisioned | not measured | — |
 | MODEL-01 typed domain model, synthetic trust root provisioned | 1,061,376 | +0.29% vs SIZE-01 provisioned | 942,592 | +0.22% vs SIZE-01 provisioned |
+| STATE-01 pure reducer, unprovisioned | 950,784 | 0.00% vs MODEL-01 unprovisioned | not measured | — |
+| STATE-01 pure reducer, synthetic trust root provisioned | 1,061,376 | 0.00% vs MODEL-01 provisioned | not measured | — |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;

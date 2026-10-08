@@ -142,7 +142,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 
 ---
 
-## 2. Status board (2026-10-08)
+## 2. Status board (2026-10-09)
 
 ### 2.1 Milestones
 
@@ -152,7 +152,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | `v0.8` | Trustworthy state and system safety | **Done on `main`, unreleased** |
 | `v0.9` | Authenticated, crash-safe updates | **Done on `main`, unreleased** |
 | R0 | Ship the trust-root release | **Notes prepared (REL-03)**; publication blocked on human signing/provisioning (§7) |
-| `v0.10` | State core, diagnostics, Codex documented source | **In progress** (MODEL-01 complete on its feature branch; STATE-01 next) |
+| `v0.10` | State core, diagnostics, Codex documented source | **In progress** (MODEL-01 merged; STATE-01 complete locally; APP-01 next) |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
 | `v0.12` | Glanceable status, tray, and alerts | Not started |
 | `v1.0` | Signed distribution | Not started |
@@ -167,7 +167,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
   - SIZE-01 selects `opt-level = "z"`: provisioned x64 **1,058,304 bytes**, ARM64 **940,544 bytes**; unprovisioned **947,712 / 892,928 bytes**. The size-reducing change updates CI comparison baselines, preserves the 1.25 MiB ceiling, and records a **1,245,184-byte unsigned provisioned soft target** and milestone allowances in the ledger.
 - Commit `0ed4ea9` on `feat/a11y-uia-and-plan-v2` contains the A11Y-01 implementation in `src/accessibility.rs`, `src/main.rs`, `src/gfx.rs`, `src/util.rs`, `src/demo.rs`, `Cargo.toml`, and `Cargo.lock` (UIA fragment tree via `WM_GETOBJECT`, new `windows` features `implement`, `Win32_UI_Accessibility`, `Win32_System_Ole`, `Win32_System_Variant`, plus a direct `windows-core` dependency). WIP-00 passed all §0.3 gates, both architecture builds, demo safety, and 22 UIA client checks on 2026-10-08; Narrator speech remains unverified. See `docs/verification/wip-00.md`.
 - HTTP requests already use a 10-second `ureq` timeout (`api.rs`, `codex.rs`).
-- Existing modules: `accessibility`, `alerts`, `api`, `auth`, `codex`, `config`, `demo`, `gfx`, `main`, `network`, `provider/{mod,model}`, `release_manifest`, `runtime_state`, `state_policy`, `store`, `trayicon`, `updater`, `util`, `vibecode`.
+- Existing modules: `accessibility`, `alerts`, `api`, `auth`, `codex`, `config`, `demo`, `gfx`, `main`, `network`, `provider/{mod,model,state}`, `release_manifest`, `runtime_state`, `store`, `trayicon`, `updater`, `util`, `vibecode`.
 - Demo scenarios: `claude-only`, `codex-only`, `both`, `loading`, `stale`, `cooldown`, `error`, `neither`, `settings`, `many`.
 - Codex-family agents auto-load `AGENTS.md`, which points here and to `CLAUDE.md`. Read both explicitly either way.
 
@@ -178,7 +178,7 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 1. **WIP-00** — verify the committed accessibility work (§9.1); **Narrator verification deferred by the owner on 2026-10-08**. WIP-00 and A11Y-01 remain unchecked; the owner explicitly authorized proceeding to SIZE-01 and release-note preparation without this check.
 2. **SIZE-01** — **done**: size audit, measured `z` profile, and headroom plan (§3.2) on `chore/size-audit`, branched from PR #2.
 3. **REL-03** — **done (notes only)**: proposed `docs/release-notes/0.9.0.md`, expanded Unreleased changelog, local release-input check, and live protection audit (§7). Human publishes.
-4. **MODEL-01 done** → **STATE-01 next** → **APP-01** → **CACHE-01** (§8.1).
+4. **MODEL-01 done** → **STATE-01 done** → **APP-01 next** → **CACHE-01** (§8.1).
 5. **ERR-01** — actionable error states (§8.2).
 6. **DIAG-01** → **DIAG-02** (§8.3).
 7. **CODEX-01** → **CODEX-02** (§8.4).
@@ -483,10 +483,11 @@ Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authentic
   - Acceptance: no string comparison decides limit class or kind; fixtures cover weekly-as-primary, weekly-only (no invented Session row), missing reset, non-finite, and out-of-range values.
   - Completed 2026-10-08 on `feat/model-01-normalized-model`: shared snapshots/outcomes/limits moved to provider model with account/provider/source, typed kind/class/severity, validated Percent, stable LimitId, and window duration. Formatted resets stay in the rendering view, not snapshots. Both compatibility sources retain their requests; Codex missing-duration captions remain unchanged but typed kind is Unknown/Other instead of inferred from position. Fixture files are unchanged; 118 tests, all §0.3 gates, demo safety, 22 UIA checks, screenshot review, and provisioned x64/ARM64 artifact checks pass. Error category expansion remains ERR-01; raw strings are parsed only at adapter boundaries. Rollback: revert the binary/code; no store migration. See `docs/verification/model-01.md` and the artifact ledger.
 
-- [ ] **STATE-01 — Pure provider reducer.**
+- [x] **STATE-01 — Pure provider reducer.**
   - Implement §4.4 in `provider/state.rs` with an injected clock; absorb `state_policy.rs`.
   - Derive view states: loading, fresh, updating-with-data, cached, outdated, cooldown, unavailable, failed.
   - Acceptance: table-driven tests for every §4.4 row plus arbitrary event orders; no test sleeps.
+  - Completed 2026-10-09 on `feat/state-01-provider-reducer`: pure event reducer, identity-checked fetch tickets, explicit accepted-success/retry effects, and all eight derived view states. Policy/helpers and characterization tests moved from `state_policy.rs`; the current SLOTS shell still owns runtime state until APP-01. The §4.4 table, boundary tests, and 12,288 generated event steps pass with an injected clock. All §0.3 gates pass (131 tests); demo safety and both x64 trust-root artifact checks pass at unchanged sizes (950,784 / 1,061,376 bytes). Snapshot/retry persistence is an effect contract for CACHE-01. ERR-01 supplies stable adapter error categories later. Rollback: revert the binary/code; no durable schema change. See `docs/verification/state-01.md`.
 
 - [ ] **APP-01 — Move provider state to the UI thread.**
   - Add `app.rs` and `poller.rs`; introduce the `AppEvent` queue; keep window procedures thin.
