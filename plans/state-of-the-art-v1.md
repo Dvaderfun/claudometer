@@ -148,12 +148,12 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 
 | Milestone | Theme | State |
 |---|---|---|
-| Foundation | Baseline and required gates | **Done** |
+| Foundation | Baseline and required gates | **Done**; SIZE-01 profile audit complete on `chore/size-audit` |
 | `v0.8` | Trustworthy state and system safety | **Done on `main`, unreleased** |
 | `v0.9` | Authenticated, crash-safe updates | **Done on `main`, unreleased** |
 | R0 | Ship the trust-root release | **Blocked on human provisioning** (§7) |
 | `v0.10` | State core, diagnostics, Codex documented source | Not started |
-| `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; WIP-00 awaits Narrator verification) |
+| `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
 | `v0.12` | Glanceable status, tray, and alerts | Not started |
 | `v1.0` | Signed distribution | Not started |
 | `v1.1` | History-refined pacing | **Gated** on field evidence |
@@ -163,7 +163,8 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 
 ### 2.2 Facts an executor needs now
 
-- WIP-00 measures x64 at **1,132,544 bytes** with a synthetic public trust root, above the 1.0 MiB soft target and **178,176 bytes** below the hard ceiling. ARM64 is **1,029,120 bytes**. Growth versus the matching REL-02 rows is +3.17% / +3.34%; the CI baseline has not advanced. Measure every task (§3.1).
+- WIP-00 measured x64 at **1,132,544 bytes** with a synthetic public trust root, above the former 1.0 MiB soft target and **178,176 bytes** below the hard ceiling. ARM64 was **1,029,120 bytes**. Growth versus the matching REL-02 rows was +3.17% / +3.34%; those historical rows remain in the ledger. Measure every task (§3.1).
+  - SIZE-01 selects `opt-level = "z"`: provisioned x64 **1,058,304 bytes**, ARM64 **940,544 bytes**; unprovisioned **947,712 / 892,928 bytes**. The size-reducing change updates CI comparison baselines, preserves the 1.25 MiB ceiling, and records a **1,245,184-byte unsigned provisioned soft target** and milestone allowances in the ledger.
 - Commit `0ed4ea9` on `feat/a11y-uia-and-plan-v2` contains the A11Y-01 implementation in `src/accessibility.rs`, `src/main.rs`, `src/gfx.rs`, `src/util.rs`, `src/demo.rs`, `Cargo.toml`, and `Cargo.lock` (UIA fragment tree via `WM_GETOBJECT`, new `windows` features `implement`, `Win32_UI_Accessibility`, `Win32_System_Ole`, `Win32_System_Variant`, plus a direct `windows-core` dependency). WIP-00 passed all §0.3 gates, both architecture builds, demo safety, and 22 UIA client checks on 2026-10-08; Narrator speech remains unverified. See `docs/verification/wip-00.md`.
 - HTTP requests already use a 10-second `ureq` timeout (`api.rs`, `codex.rs`).
 - Existing modules: `accessibility`, `alerts`, `api`, `auth`, `codex`, `config`, `demo`, `gfx`, `main`, `network`, `provider/{mod,model}`, `release_manifest`, `runtime_state`, `state_policy`, `store`, `trayicon`, `updater`, `util`, `vibecode`.
@@ -174,8 +175,8 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 
 Work strictly top to bottom, skipping only tasks whose dependencies are not done.
 
-1. **WIP-00** — verify the committed accessibility work (§9.1); **blocked on the human Narrator listening check**. SIZE-01 and REL-03 remain pending.
-2. **SIZE-01** — size audit and headroom plan (§3.2).
+1. **WIP-00** — verify the committed accessibility work (§9.1); **Narrator verification deferred by the owner on 2026-10-08**. WIP-00 and A11Y-01 remain unchecked; the owner explicitly authorized proceeding to SIZE-01 and release-note preparation without this check.
+2. **SIZE-01** — **done**: size audit, measured `z` profile, and headroom plan (§3.2) on `chore/size-audit`, branched from PR #2.
 3. **REL-03** — prepare the trust-root release for the human (§7).
 4. **MODEL-01** → **STATE-01** → **APP-01** → **CACHE-01** (§8.1).
 5. **ERR-01** — actionable error states (§8.2).
@@ -215,12 +216,13 @@ Rules:
 
 ### 3.2 SIZE-01 — size audit and headroom plan
 
-- [ ] **SIZE-01**
+- [x] **SIZE-01**
   - Build x64 and ARM64 with and without the A11Y WIP; record both in the ledger.
   - Produce a size breakdown (for example `cargo bloat --release --crates` run locally, not added as a dependency) and list the five largest contributors.
   - Evaluate, with measurements, at least: `opt-level = "z"` versus `"s"` (also re-measure startup and the 50-start p95), trimming unused `windows` features, and feature-gating heavy `ed25519-dalek` options.
   - Decide a new soft target that fits the remaining roadmap. Record the decision and the expected per-milestone allowance in the ledger. The 1.25 MiB hard ceiling does not move without an ADR.
   - Acceptance: ledger has per-crate numbers, a chosen profile, and a per-milestone allowance; `ci/release-budgets.json` is updated only if a size-reducing change lands.
+  - Completed 2026-10-08 on `chore/size-audit`: chose `z` with fat LTO; measured both architectures and both trust-root modes, compared the existing with/without-UIA builds, evaluated Windows feature trimming and Ed25519 `fast`, and recorded raw crate/startup data and milestone allowances. All §0.3 gates, artifact/policy checks, demo safety, and 22 UIA checks passed. Narrator remains deferred, not completed. Rollback: restore `opt-level = "s"` and the previous CI comparison baselines together; no data migration. See `docs/performance/size-01.md` and the ledger.
 
 ### 3.3 Defensive bounds (adjust only with fixture evidence)
 
@@ -455,7 +457,7 @@ Abort a rollout immediately if: cross-account data is rendered, cached, alerted,
 Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authenticated release is also the trust-root bootstrap (UPD-02): existing users must install it manually and verify it independently; the old updater cannot authenticate it.
 
 - [ ] **REL-03 — Prepare the trust-root release (agent prepares; human publishes).**
-  - Do this after WIP-00, so the release does not include half-finished accessibility work.
+  - Prepare notes after WIP-00 local verification. The owner deferred Narrator on 2026-10-08 and authorized proceeding; notes must disclose incomplete A11Y-01 and do not authorize publishing or claim screen-reader support.
   - Draft `CHANGELOG.md` for the next version covering all `v0.8` and `v0.9` work. Lead with the manual-install requirement and the verification steps from `docs/release-manifest-v1.md`.
   - Draft release notes at `docs/release-notes/<version>.md` with: what changed for users, the manual install and verification procedure, the Vibecode legacy-recovery notice, and the update-check default for new installs.
   - Run `ci/check-release.ps1` and `ci/check-release-infrastructure.ps1` locally where they can run without secrets; report which checks need the release environment.
@@ -553,6 +555,7 @@ Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authentic
   - Verify with Accessibility Insights or `inspect.exe`: the flyout and Settings expose a tree; every button Invokes; every switch Toggles; Narrator reads each control.
   - The implementation is already committed as `0ed4ea9`; do not stash or rewrite it. Record verification on its existing branch. Mark done only after the gates, size review, and Narrator check pass, then continue A11Y-01 from what is missing.
   - 2026-10-08: fmt, clippy, 115 tests, x64/ARM64 builds, both trust-root build modes, artifact checks, demo safety, and all 22 UIA client checks pass. `inspect.exe` confirms focused controls on both windows. **Blocked:** Narrator announcements require a human listening check (§0.6); checkbox stays open. Rollback: use the pre-UIA binary from `89241c1`, with no data migration or journal edits. Evidence: `docs/verification/wip-00.md` and the artifact ledger.
+  - Owner decision, 2026-10-08: defer Narrator and proceed to SIZE-01/REL-03 because accessibility is lower priority. This authorizes the queue dependency exception, not a completed Narrator result; WIP-00 and A11Y-01 stay unchecked.
 
 - [ ] **A11Y-01 — Complete the UI Automation fragment tree.**
   - Buttons: Invoke. Switches: Toggle. Interval and metric choices: Selection. Quota bars: read-only RangeValue.
@@ -773,8 +776,8 @@ Acceptance: an ADR records the evidence first; new-only, new+Claude, new+Codex, 
 | Task | Depends on |
 |---|---|
 | WIP-00 | — |
-| SIZE-01 | WIP-00 |
-| REL-03 | WIP-00 |
+| SIZE-01 | WIP-00 local gates/size/UIA checks; owner deferred Narrator on 2026-10-08 |
+| REL-03 | WIP-00 local gates/size/UIA checks; owner deferred Narrator for notes preparation only on 2026-10-08 |
 | MODEL-01 | — |
 | STATE-01 | MODEL-01 |
 | APP-01 | STATE-01 |

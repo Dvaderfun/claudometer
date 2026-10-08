@@ -20,6 +20,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | REL-02 authenticated updater, trust root provisioned | 1,097,728 | +8.61% | 995,840 | +5.36% |
 | WIP-00 UIA `0fdfd19`, unprovisioned | 1,045,504 | +3.44% vs REL-02 unprovisioned | 978,432 | +3.52% vs REL-02 unprovisioned |
 | WIP-00 UIA `0fdfd19`, synthetic trust root provisioned | 1,132,544 | +3.17% vs REL-02 provisioned | 1,029,120 | +3.34% vs REL-02 provisioned |
+| SIZE-01 `opt-level = "z"`, unprovisioned | 947,712 | -9.35% vs WIP-00 unprovisioned | 892,928 | -8.74% vs WIP-00 unprovisioned |
+| SIZE-01 `opt-level = "z"`, synthetic trust root provisioned | 1,058,304 | -6.56% vs WIP-00 provisioned | 940,544 | -8.61% vs WIP-00 provisioned |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;
@@ -80,3 +82,111 @@ checks on all four UIA artifacts. CI budgets remain at REL-02 pending SIZE-01.
 
 WIP-00 remains blocked on Narrator verification; these size results do not
 complete A11Y-01 or replace the later runtime-memory/CPU measurements.
+
+## SIZE-01 audit and selected profile (2026-10-08)
+
+Select `opt-level = "z"`; retain fat LTO, one codegen unit, stripping,
+abort-on-panic, and every existing dependency feature. No crate was added to
+the app. Local analysis used cargo-bloat 0.12.1; it is an installed development
+tool only. All builds use Rust 1.97.1, locked dependencies, and the synthetic
+public test key/sequence recorded above when provisioned. The with/without-UIA
+comparison reuses the WIP-00 builds of `0fdfd19` and `89241c1`; those sources
+and locked dependencies remain unchanged apart from the selected profile.
+
+| Experiment | x64 provisioned bytes | Delta vs `s` | Decision |
+|---|---:|---:|---|
+| `s`, all existing features | 1,132,544 | — | Measured baseline |
+| `z`, all existing features | 1,058,304 | -74,240 (-6.56%) | Selected |
+| `s`, remove explicit Windows `Foundation`/`UI` entries | 1,132,544 | 0 | Reject: already transitively enabled |
+| `s`, trimmed entries plus Ed25519 without `fast` | 1,113,600 | -18,944 (-1.67%) | Reject for this slice: retain existing crypto performance |
+
+Windows `Foundation_Numerics`, notifications, ViewManagement, Win32 UIA,
+Ole/Variant, and graphics features have direct call sites or binding-signature
+requirements. There is no measured unused feature reduction to land. Ed25519
+already disables defaults; `fast` enables precomputed curve tables. The audit
+measures their footprint without changing verifier behavior or adding a
+runtime feature selector.
+
+`cargo bloat --locked --release --target x86_64-pc-windows-msvc --crates`
+attributed the `s` baseline's 836,608-byte `.text` section as follows (five
+largest contributors first):
+
+| Contributor | Named code bytes |
+|---|---:|
+| `std` (includes core/alloc attribution) | 265,946 |
+| Claudometer | 255,140 |
+| `serde_json` | 55,743 |
+| `ureq` | 49,270 |
+| `serde_core` | 46,391 |
+| `url` | 28,654 |
+| `sha2` | 18,649 |
+| `curve25519_dalek` | 16,798 |
+| `windows` | 6,399 |
+
+Raw per-contributor data: [`size-01/s-crates.json`](size-01/s-crates.json).
+Fat LTO/inlining and MSVC PDB naming blur crate ownership; 27,681 `.text` bytes
+are not covered by the named sums, and 295,936 executable bytes are outside
+`.text`. These figures are code attribution, not additive whole-crate disk
+costs. cargo-bloat enables PDB/debug symbols for analysis; final release sizes
+above come from separately stripped normal builds.
+
+### Startup comparison
+
+Surface Laptop Studio, Windows 11 build 28020, eight logical processors;
+50 new demo processes per run, nonce-bound tray-readiness event, nearest-rank
+median/p95, isolated profile, no provider workers. The script's one-second
+memory/CPU sample is excluded from this audit's retained startup evidence;
+it cannot establish the ten-minute idle budget.
+
+| Profile / run | Median ms | p95 ms | Result |
+|---|---:|---:|---|
+| `s`, initial | 42.240 | 51.741 | Pass |
+| `z`, initial | 48.940 | 200.973 | Failed sample; retained, not hidden |
+| `z`, repeat without compilation | 40.118 | 51.509 | Pass |
+| `s`, quiet repeat | 39.130 | 45.285 | Pass |
+| `z`, final exact build | 47.774 | 58.141 | Pass |
+
+The initial `z` outlier did not reproduce; external scheduling/antimalware
+interference is plausible, not proven. All quiet/final runs pass 150 ms p95.
+The final executable was tested separately because rebuilds may change hashes
+without changing size. Every 50-sample sequence is retained under
+[`size-01/`](size-01/). Full methodology and limits are in
+[`size-01.md`](size-01.md).
+
+### Soft target and remaining milestone allowances
+
+Set the **unsigned, provisioned x64 soft target to 1,245,184 bytes (1.1875
+MiB)**, leaving **65,536 bytes** inside the unchanged 1,310,720-byte hard
+ceiling for Authenticode/certificate overhead and release contingency. This
+reserve is a planning allowance, not a measured signing size; signed artifacts
+must still pass the hard check. Prefer smaller artifacts and measure every
+slice rather than treating allowances as automatic baseline increases.
+
+| Remaining work | Additional x64 allowance | Cumulative provisioned bytes |
+|---|---:|---:|
+| SIZE-01 selected baseline | — | 1,058,304 |
+| `v0.10` model/state/cache/diagnostics/Codex | 32,768 | 1,091,072 |
+| `v0.11` remaining UIA/layout/first-run | 40,960 | 1,132,032 |
+| `v0.12` pace/rows/tray/alerts | 49,152 | 1,181,184 |
+| `v1.0` distribution/handshake code | 32,768 | 1,213,952 |
+| Unallocated roadmap contingency | 24,576 | 1,238,528 |
+| Remaining to unsigned soft target | 6,656 | 1,245,184 |
+
+These estimates are not acceptance proof for future features. If a milestone
+cannot fit, reduce its scope or optimize with measurements; the hard ceiling
+requires an ADR to change. ARM64's selected provisioned build is smaller by
+117,760 bytes, but both architecture artifacts must pass independently.
+
+`ci/release-budgets.json` lowers comparison baselines to 1,058,304 / 940,544
+bytes only because this measured size reduction lands. It preserves the hard
+ceiling and 10% regression gate. The new baselines are also below REL-02.
+
+Verification: all §0.3 gates (115 tests), both architectures in both trust-root
+modes, artifact checks, privacy/dependency/workflow policy, demo safety in both
+x64 modes, 22 UIA checks, and screenshot review passed. ARM64 is cross-compiled
+only; Narrator remains deferred by the owner. Final sizes/hashes are in
+[`size-01/artifacts.json`](size-01/artifacts.json).
+
+Rollback: restore `opt-level = "s"` and the previous comparison baselines
+together; no product state or data migration is involved. Never modify provider
+credentials or recovery journals for this rollback.
