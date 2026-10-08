@@ -36,7 +36,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `api.rs` | Claude credentials read + usage fetch; adapter to typed provider model, bounded parsing, Windows reset-time formatting |
 | `codex.rs` | Codex (OpenAI) credentials read + usage fetch → same `UsageSnapshot` |
 | `provider/model.rs` | provider/account/source/limit/request identities, normalized snapshots, typed kind/class/severity/Percent/window duration, and completion envelope |
-| `runtime_state.rs` | atomic optional `state.json` envelope, CNG install salt, and account-scoped receipt schema |
+| `runtime_state.rs` | atomic optional `state.json` envelope, CNG install salt, account-scoped receipts, bounded normalized provider cache and retry deadlines |
 | `provider/state.rs` | pure provider reducer, identity-checked fetch tickets, derived freshness/views, and injected-clock debounce/429 policy |
 | `store.rs` | typed atomic JSON commit, verified `.bak` generation, corruption preservation, and failure injection |
 | `demo.rs` | deterministic provider/view scenarios and guarded no-side-effect launch mode |
@@ -106,9 +106,21 @@ only alert/cache candidate; rejected completions produce no effects. Cache
 loads are account-checked and never fresh. Transient failures retain the
 same-account snapshot, with an Outdated view at the §5.2 age threshold. The
 compatibility presentation retains its characterized ten-minute stale display
-for APP-01 parity. FRESH-01 exposes richer freshness states later; CACHE-01
-adds persisted snapshots. `state_reference.rs` retains the old slot logic only
+for live errors. Restored snapshots carry a Cached values note and true age;
+FRESH-01 exposes richer freshness states later. `state_reference.rs` retains the old slot logic only
 under `cfg(test)` for direct behavior comparisons and original characterization.
+
+CACHE-01 adds optional `provider_cache` version 1 inside state schema 1.
+Only accepted results persist normalized snapshots/source and retry deadline;
+memory-only account fingerprints never persist. Worker credential preparation
+establishes opaque account identity before the UI restores matching cache.
+The first request proceeds even with cached data unless a valid future 429
+deadline blocks it. Restored snapshots never emit success or alerts; their
+age is unchanged. Cache bounds cover two providers, 64 rows each, 512-byte
+display strings, 128-byte IDs, finite percentages, timestamps, and durations.
+Snapshots older than eight days/future observations are ignored; rows whose
+reset has passed lose their cached value. Unknown existing state fields survive
+atomic cache writes and older receipt writers; malformed cache remains optional.
 
 ## Alerts (`alerts.rs`)
 

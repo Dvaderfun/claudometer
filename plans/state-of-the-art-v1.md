@@ -152,7 +152,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | `v0.8` | Trustworthy state and system safety | **Done on `main`, unreleased** |
 | `v0.9` | Authenticated, crash-safe updates | **Done on `main`, unreleased** |
 | R0 | Ship the trust-root release | **Notes prepared (REL-03)**; publication blocked on human signing/provisioning (§7) |
-| `v0.10` | State core, diagnostics, Codex documented source | **In progress** (MODEL-01 merged; STATE-01 and APP-01 complete locally; CACHE-01 next) |
+| `v0.10` | State core, diagnostics, Codex documented source | **In progress** (MODEL-01 merged; STATE-01, APP-01, CACHE-01 complete locally; ERR-01 next) |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
 | `v0.12` | Glanceable status, tray, and alerts | Not started |
 | `v1.0` | Signed distribution | Not started |
@@ -178,8 +178,8 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 1. **WIP-00** — verify the committed accessibility work (§9.1); **Narrator verification deferred by the owner on 2026-10-08**. WIP-00 and A11Y-01 remain unchecked; the owner explicitly authorized proceeding to SIZE-01 and release-note preparation without this check.
 2. **SIZE-01** — **done**: size audit, measured `z` profile, and headroom plan (§3.2) on `chore/size-audit`, branched from PR #2.
 3. **REL-03** — **done (notes only)**: proposed `docs/release-notes/0.9.0.md`, expanded Unreleased changelog, local release-input check, and live protection audit (§7). Human publishes.
-4. **MODEL-01 done** → **STATE-01 done** → **APP-01 done** → **CACHE-01 next** (§8.1).
-5. **ERR-01** — actionable error states (§8.2).
+4. **MODEL-01 done** → **STATE-01 done** → **APP-01 done** → **CACHE-01 done** (§8.1).
+5. **ERR-01 next** — actionable error states (§8.2).
 6. **DIAG-01** → **DIAG-02** (§8.3).
 7. **CODEX-01** → **CODEX-02** (§8.4).
 8. **PACE-01** → **ROW-01** → **FRESH-01** (§10.1). If the v0.10 tail is blocked, PACE-01 and ROW-01 may start once MODEL-01 is done, and FRESH-01 once APP-01 is done.
@@ -495,12 +495,14 @@ Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authentic
   - Acceptance: all demo scenarios render identically (compare screenshots before/after); `main.rs` shrinks; memory/CPU re-measured within budget.
   - Completed 2026-10-09 on `feat/state-01-provider-reducer`: UI-owned reducers/preparation in `app.rs`, worker-local credentials and AppEvent queue in `poller.rs`; SLOTS removed from runtime. `main.rs` shrinks from 2,958 to 2,125 lines. Legacy slot code is cfg(test)-only for direct parity proof. All §0.3 gates pass (140 tests), ten demo captures are pixel-identical, 22 UIA checks pass, demo safety and x64 artifact checks pass. Ten-minute isolated demo run: hidden/visible p95 1.61/4.75 MiB, idle CPU 0.0000/0.0045%, GDI 10/13; ten-start tray p95 80.454 ms. x64 964,096 unprovisioned / 1,074,688 provisioned (+1.40/+1.25%). Rollback: prior binary/revert; no schema change. See `docs/verification/app-01.md` and `docs/performance/app-01.md`. Interrupted runtime/UIA attempts are documented, not treated as passing evidence.
 
-- [ ] **CACHE-01 — Sanitized runtime cache.**
+- [x] **CACHE-01 — Sanitized runtime cache.**
   - Extend the `state.json` envelope (`runtime_state.rs`) with bounded normalized snapshots, the persisted 429 retry deadline, and the selected source.
   - Load a snapshot only after its account key matches the current local identity.
   - A snapshot restored at launch shows instantly with its true age and is **never fresh**: the first poll after launch always fetches unless a persisted retry deadline is still in the future.
   - Bound provider count, rows, strings, timestamps, and age (drop snapshots older than 8 days).
   - Acceptance: tests for account mismatch, restart inside a 429 window, deleted/corrupt `state.json`, and a cached window whose reset already passed (drop that limit's value).
+  - Completed 2026-10-09: additive `provider_cache` version 1 in state schema 1, normalized snapshots/source and accepted retry deadlines, persistent identity/source matching during worker preparation, cached labels/true age, and first-request cooldown enforcement. 151 tests pass including restart/account/source/expiry/bounds, old-reader preservation, and failed atomic writes. All §0.3 gates, demo safety, 22 UIA checks, and x64 artifact gates pass. Rollback: prior binary/revert; optional cache fields are ignored/preserved by older readers. See `docs/verification/cache-01.md`; stable HTTP authentication/error categories remain ERR-01.
+  - Size: x64 998,912 unprovisioned / 1,109,504 provisioned (+3.61/+3.24% vs APP-01), within unchanged hard/regression gates. Cumulative v0.10 work exceeds its initial SIZE-01 planning allowance; remaining slices must address footprint without raising the ceiling.
 
 ### 8.2 Actionable errors
 

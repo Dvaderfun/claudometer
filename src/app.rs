@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use crate::api::PreparationFailure;
 use crate::provider::model::{
-    AccountContext, FetchCompletion, FetchOutcome, Generation, ProviderId, RequestId, UsageSnapshot,
+    AccountContext, FetchCompletion, FetchOutcome, Generation, ProviderId, RequestId,
+    SourceProvenance, UsageSnapshot,
 };
 use crate::provider::state::{
     within_stale_window, Clock, ClockReading, FailureKind, FetchError, ProviderEvent,
@@ -101,6 +102,34 @@ impl ProviderSlot {
         clock: &impl Clock,
         interval: Duration,
     ) -> Option<FetchCompletion<()>> {
+        self.prepared_with_cache(
+            preparation,
+            account,
+            clock,
+            interval,
+            |provider, account, now| {
+                crate::runtime_state::cached_provider(
+                    provider,
+                    account,
+                    SourceProvenance::compatibility(provider),
+                    now,
+                )
+            },
+        )
+    }
+
+    fn prepared_with_cache(
+        &mut self,
+        preparation: Preparation,
+        account: AccountContext,
+        clock: &impl Clock,
+        interval: Duration,
+        load: impl FnOnce(
+            ProviderId,
+            &AccountContext,
+            i64,
+        ) -> Option<crate::runtime_state::CachedProvider>,
+    ) -> Option<FetchCompletion<()>> {
         if !self.matches_preparation(preparation) {
             return None;
         }
@@ -112,8 +141,20 @@ impl ProviderSlot {
         {
             self.last_error = None;
             self.manual_cooldown_notice = false;
+            let cache = load(preparation.provider, &account, clock.read().unix_seconds);
             self.state
                 .reduce(ProviderEvent::CredentialsChanged(account), clock);
+            if let Some(cache) = cache {
+                if let Some(snapshot) = cache.snapshot {
+                    self.state
+                        .reduce(ProviderEvent::CacheLoaded(snapshot), clock);
+                }
+                if let Some(deadline) = cache.retry_at_unix {
+                    self.state
+                        .reduce(ProviderEvent::RetryDeadlineLoaded(deadline), clock);
+                    self.manual_cooldown_notice = true;
+                }
+            }
         }
         match self.state.reduce(
             ProviderEvent::RefreshRequested {
@@ -186,10 +227,19 @@ impl ProviderSlot {
             .state
             .snapshot()
             .filter(|snapshot| {
-                self.last_error.is_none() || within_stale_window(now, snapshot.fetched_unix)
+                self.state.is_cached()
+                    || self.last_error.is_none()
+                    || within_stale_window(now, snapshot.fetched_unix)
             })
             .cloned();
-        (snapshot, self.last_error.clone())
+        let error = self
+            .last_error
+            .clone()
+            .or_else(|| match self.state.phase() {
+                ProviderPhase::Backoff { error, .. } => Some(error.message.clone()),
+                _ => None,
+            });
+        (snapshot, error)
     }
 }
 
@@ -227,6 +277,27 @@ pub fn any_fetching() -> bool {
 pub fn invalidate(provider: ProviderId, disabled: bool) {
     APP.with_borrow_mut(|app| app.providers[provider.index()].invalidate(disabled, &SystemClock));
     crate::alerts::account_changed(provider, None);
+    if !disabled {
+        let _ = crate::runtime_state::clear_provider_cache(provider);
+    }
+}
+
+pub fn cached_notes() -> Option<String> {
+    APP.with_borrow(|app| {
+        let notes: Vec<_> = app
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.state.is_cached())
+            .map(|(index, _)| {
+                format!(
+                    "{}: Cached values",
+                    if index == 0 { "Claude" } else { "Codex" }
+                )
+            })
+            .collect();
+        (!notes.is_empty()).then(|| notes.join(" · "))
+    })
 }
 
 pub fn refresh(provider: ProviderId, trigger: RefreshTrigger, interval: Duration) {
@@ -277,10 +348,10 @@ pub fn drain_events(interval: Duration) -> bool {
                     let generation = slot.state.generation();
                     let ticket =
                         slot.prepared(preparation, account.clone(), &SystemClock, interval);
-                    let account_changed = ticket.is_some() && generation != slot.state.generation();
+                    let account_changed = generation != slot.state.generation();
                     (ticket, account_changed)
                 });
-                if ticket.is_some() {
+                if ticket.is_some() || account_changed {
                     if account_changed {
                         crate::alerts::account_changed(preparation.provider, Some(&account));
                     }
@@ -323,6 +394,7 @@ pub fn drain_events(interval: Duration) -> bool {
                 if accepted {
                     if invalidates_account {
                         crate::alerts::account_changed(preparation.provider, None);
+                        let _ = crate::runtime_state::clear_provider_cache(preparation.provider);
                     }
                     changed = true;
                 }
@@ -340,6 +412,23 @@ pub fn drain_events(interval: Duration) -> bool {
                     } else {
                         None
                     };
+                    if !matches!(transition, Transition::Ignored) {
+                        if let Some(account) = slot.state.account() {
+                            let source = slot.state.snapshot().map_or_else(
+                                || SourceProvenance::compatibility(provider),
+                                |snapshot| snapshot.source,
+                            );
+                            let retry_at_unix =
+                                slot.state.view(&SystemClock, interval).retry_at_unix;
+                            let _ = crate::runtime_state::persist_provider_cache(
+                                provider,
+                                account,
+                                source,
+                                slot.state.snapshot().cloned(),
+                                retry_at_unix,
+                            );
+                        }
+                    }
                     (!matches!(transition, Transition::Ignored), alert)
                 });
                 if let Some((account, snapshot)) = accepted.1 {
@@ -720,5 +809,158 @@ mod tests {
             Transition::Ignored
         ));
         assert!(slot.effective(clock.read()).0.is_none());
+    }
+
+    #[test]
+    fn restart_restores_cached_age_but_fetches_without_a_live_deadline() {
+        let clock = FakeClock::new();
+        for deadline in [None, Some(1000), Some(999), Some(1901)] {
+            let mut slot = ProviderSlot::new(ProviderId::Claude);
+            let preparation = slot
+                .reserve(
+                    ProviderId::Claude,
+                    RefreshTrigger::Automatic,
+                    &clock,
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+            let ticket = slot
+                .prepared_with_cache(
+                    preparation,
+                    account(1),
+                    &clock,
+                    Duration::from_secs(60),
+                    |provider, identity, _| {
+                        Some(crate::runtime_state::CachedProvider {
+                            provider,
+                            account: identity.key.clone(),
+                            source: SourceProvenance::compatibility(provider),
+                            snapshot: Some(snapshot(1, 900)),
+                            retry_at_unix: deadline,
+                        })
+                    },
+                )
+                .unwrap();
+            assert!(slot.state.is_cached());
+            assert_eq!(slot.effective(clock.read()).0.unwrap().fetched_unix, 900);
+            assert_eq!(
+                slot.state.view(&clock, Duration::from_secs(60)).age_seconds,
+                Some(100)
+            );
+            assert!(matches!(slot.state.phase(), ProviderPhase::Fetching { .. }));
+            assert!(matches!(
+                slot.complete(
+                    completion(&ticket, FetchOutcome::Ok(snapshot(1, 1000))),
+                    &clock
+                ),
+                Transition::AcceptedSuccess { .. }
+            ));
+            assert!(!slot.state.is_cached());
+        }
+    }
+
+    #[test]
+    fn restart_inside_429_window_restores_data_and_blocks_first_http_ticket() {
+        let mut clock = FakeClock::new();
+        let mut slot = ProviderSlot::new(ProviderId::Claude);
+        let preparation = slot
+            .reserve(
+                ProviderId::Claude,
+                RefreshTrigger::Automatic,
+                &clock,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        let ticket = slot.prepared_with_cache(
+            preparation,
+            account(1),
+            &clock,
+            Duration::from_secs(60),
+            |provider, identity, _| {
+                Some(crate::runtime_state::CachedProvider {
+                    provider,
+                    account: identity.key.clone(),
+                    source: SourceProvenance::compatibility(provider),
+                    snapshot: Some(snapshot(1, 900)),
+                    retry_at_unix: Some(1100),
+                })
+            },
+        );
+        assert!(ticket.is_none());
+        assert!(slot.pending.is_none());
+        assert!(slot.state.is_cached());
+        assert_eq!(
+            slot.state
+                .view(&clock, Duration::from_secs(60))
+                .retry_at_unix,
+            Some(1100)
+        );
+        for trigger in [
+            RefreshTrigger::Automatic,
+            RefreshTrigger::Manual,
+            RefreshTrigger::Flyout,
+        ] {
+            assert!(slot
+                .reserve(ProviderId::Claude, trigger, &clock, Duration::from_secs(60))
+                .is_none());
+        }
+        clock.advance(100);
+        assert!(slot
+            .reserve(
+                ProviderId::Claude,
+                RefreshTrigger::Automatic,
+                &clock,
+                Duration::from_secs(60)
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn obsolete_preparation_never_reads_cache_and_live_data_is_not_replaced() {
+        let mut clock = FakeClock::new();
+        let mut slot = ProviderSlot::new(ProviderId::Claude);
+        let old = slot
+            .reserve(
+                ProviderId::Claude,
+                RefreshTrigger::Manual,
+                &clock,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        slot.invalidate(false, &clock);
+        assert!(slot
+            .prepared_with_cache(
+                old,
+                account(1),
+                &clock,
+                Duration::from_secs(60),
+                |_, _, _| panic!("obsolete cache read")
+            )
+            .is_none());
+        let ticket = request(&mut slot, &clock, 1);
+        slot.complete(
+            completion(&ticket, FetchOutcome::Ok(snapshot(1, 1000))),
+            &clock,
+        );
+        clock.advance(3);
+        let next = slot
+            .reserve(
+                ProviderId::Claude,
+                RefreshTrigger::Manual,
+                &clock,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert!(slot
+            .prepared_with_cache(
+                next,
+                account(1),
+                &clock,
+                Duration::from_secs(60),
+                |_, _, _| panic!("cache must not reload over live account")
+            )
+            .is_some());
+        assert!(!slot.state.is_cached());
+        assert_eq!(slot.state.snapshot().unwrap().fetched_unix, 1000);
     }
 }

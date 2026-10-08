@@ -188,6 +188,7 @@ pub enum ProviderEvent {
     CredentialsChanged(AccountContext),
     Unavailable(UnavailableReason),
     CacheLoaded(UsageSnapshot),
+    RetryDeadlineLoaded(i64),
     PreparationFailed {
         error: FetchError,
         invalidates_account: bool,
@@ -317,6 +318,25 @@ impl ProviderState {
                 self.cached = true;
                 Transition::Changed
             }
+            ProviderEvent::RetryDeadlineLoaded(deadline) => {
+                if !matches!(self.phase, ProviderPhase::Idle)
+                    || self.account.is_none()
+                    || deadline <= now.unix_seconds
+                    || deadline.saturating_sub(now.unix_seconds) > 900
+                {
+                    return Transition::Ignored;
+                }
+                self.phase = ProviderPhase::Backoff {
+                    until: now.monotonic
+                        + Duration::from_secs((deadline - now.unix_seconds) as u64),
+                    error: FetchError {
+                        kind: FailureKind::RateLimited,
+                        message: "Paused by provider".to_string(),
+                        retry_after: None,
+                    },
+                };
+                Transition::Changed
+            }
             ProviderEvent::PreparationFailed {
                 error,
                 invalidates_account,
@@ -428,6 +448,10 @@ impl ProviderState {
             matches!(self.phase, ProviderPhase::Fetching { .. }),
             interval,
         )
+    }
+
+    pub fn is_cached(&self) -> bool {
+        self.cached
     }
 
     fn clear_account(&mut self) {
@@ -1213,6 +1237,34 @@ mod tests {
                 "{event}"
             );
         }
+    }
+
+    #[test]
+    fn restored_backoff_uses_monotonic_time_and_never_creates_fresh_success() {
+        let mut clock = FakeClock::new(1000);
+        let mut state = ready_state(&clock);
+        assert!(matches!(
+            state.reduce(ProviderEvent::RetryDeadlineLoaded(1100), &clock),
+            Transition::Changed
+        ));
+        assert_eq!(
+            state.view(&clock, Duration::from_secs(60)).state,
+            ViewState::Cooldown
+        );
+        clock.advance(Duration::from_secs(100));
+        assert!(matches!(
+            state.reduce(ProviderEvent::CooldownExpired, &clock),
+            Transition::Changed
+        ));
+        assert_eq!(state.phase(), &ProviderPhase::Idle);
+        assert!(matches!(
+            refresh(&mut state, &clock),
+            Transition::StartFetch(_)
+        ));
+        assert!(matches!(
+            state.reduce(ProviderEvent::RetryDeadlineLoaded(1200), &clock),
+            Transition::Ignored
+        ));
     }
 
     #[test]

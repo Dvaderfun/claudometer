@@ -53,6 +53,7 @@ SIZE-01 selects release `opt-level = "z"`: current x64 **947,712 bytes unprovisi
 - Every user-visible action needs a keyboard path (Tab/Space/Enter/arrows) + focus ring. The committed UIA tree passes local Invoke/Toggle client checks; Narrator speech and the remaining A11Y-01 patterns/events are unverified or incomplete — don't claim screen-reader support.
 - Provider state lives in `app.rs`'s UI-thread-only `APP`; graphics state stays in `main.rs`'s `UI`. Workers publish only non-secret `AppEvent`s through `poller.rs`, wait for a generation/account-bound UI ticket, and retain credentials locally. Release APP/UI borrows before alert handling, rendering, or releasing a worker.
 - Errors: stale data beats error UI. Never wipe `LAST_GOOD` on a failed fetch.
+- Runtime snapshots restore only after worker preparation matches a persistent opaque account and selected source. Restored data stays cached until accepted success; it never alerts or suppresses the first poll except for a persisted 429 deadline. Keep cache fields additive inside state schema 1 so old receipt writers preserve them.
 
 ## Release process
 

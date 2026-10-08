@@ -28,6 +28,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | STATE-01 pure reducer, synthetic trust root provisioned | 1,061,376 | 0.00% vs MODEL-01 provisioned | not measured | — |
 | APP-01 UI-owned state, unprovisioned | 964,096 | +1.40% vs STATE-01 unprovisioned | not measured | — |
 | APP-01 UI-owned state, synthetic trust root provisioned | 1,074,688 | +1.25% vs STATE-01 provisioned | not measured | — |
+| CACHE-01 normalized runtime cache, unprovisioned | 998,912 | +3.61% vs APP-01 unprovisioned | not measured | — |
+| CACHE-01 normalized runtime cache, synthetic trust root provisioned | 1,109,504 | +3.24% vs APP-01 provisioned | not measured | — |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;
@@ -222,3 +224,24 @@ STATE-01 introduced the pure reducer without runtime integration, so LTO
 preserved the prior x64 sizes in both modes. APP-01 connects it to runtime;
 the new ledger delta includes the actual reducer, reply channel, event queue,
 and UI-owned compatibility presentation.
+
+## CACHE-01 (2026-10-09)
+
+Normalized snapshot serialization/validation and restart integration add
+34,816 bytes in each x64 mode. Unprovisioned: 998,912; synthetic public
+trust root provisioned: 1,109,504. No crate or profile/CI-budget change.
+Both modes pass architecture/version, regression, and the 1.25 MiB ceiling;
+provisioned headroom is 201,216 bytes. The cumulative v0.10 growth exceeds
+SIZE-01's provisional 32,768-byte milestone allowance by 18,432 bytes; this
+is planning pressure for the remaining diagnostics/Codex work, not a raised
+soft/hard budget. The per-slice growth remains below 10%.
+
+SHA-256: unprovisioned
+`597849684d0420ce29052f877041c46c668a208723e8269e9c66b952b39f61b9`;
+provisioned
+`c3daf04212e16baa5132eb71940dfb0ece3d039152e574df904924bcf8ff2c54`.
+Same synthetic RFC 8032 public key/sequence, Rust 1.97.1, locked dependencies,
+and `z` profile. Gates: 151 tests, fmt/clippy/release, demo safety, 22 UIA
+checks, screenshot review, privacy/dependency/workflow checks. No idle-CPU or
+ARM64-runtime claim is added. Rollback/compatibility:
+[`../verification/cache-01.md`](../verification/cache-01.md).
