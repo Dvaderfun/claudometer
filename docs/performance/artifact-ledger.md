@@ -26,6 +26,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | MODEL-01 typed domain model, synthetic trust root provisioned | 1,061,376 | +0.29% vs SIZE-01 provisioned | 942,592 | +0.22% vs SIZE-01 provisioned |
 | STATE-01 pure reducer, unprovisioned | 950,784 | 0.00% vs MODEL-01 unprovisioned | not measured | — |
 | STATE-01 pure reducer, synthetic trust root provisioned | 1,061,376 | 0.00% vs MODEL-01 provisioned | not measured | — |
+| APP-01 UI-owned state, unprovisioned | 964,096 | +1.40% vs STATE-01 unprovisioned | not measured | — |
+| APP-01 UI-owned state, synthetic trust root provisioned | 1,074,688 | +1.25% vs STATE-01 provisioned | not measured | — |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;
@@ -205,3 +207,18 @@ PE architecture/version, regression, and the unchanged 1.25 MiB ceiling;
 x64 headroom is 249,344 bytes. The unprovisioned x64 build is 950,784 bytes.
 Test-only changes after these builds do not enter release artifacts. Evidence
 and rollback: `docs/verification/model-01.md`.
+
+## APP-01 (2026-10-09)
+
+The UI-owned reducer and worker AppEvent/ticket handoff add 13,312 bytes to
+both x64 modes: 964,096 unprovisioned / 1,074,688 synthetic-trust-root
+provisioned. No crate added; profile/CI budgets remain unchanged. Both modes
+pass PE version/architecture, regression, and hard-ceiling checks. Provisioned
+headroom is 236,032 bytes. Test-only legacy parity code is stripped from the
+release. The full idle run passes all runtime budgets; evidence and limits:
+[`app-01.md`](app-01.md), [`../verification/app-01.md`](../verification/app-01.md).
+
+STATE-01 introduced the pure reducer without runtime integration, so LTO
+preserved the prior x64 sizes in both modes. APP-01 connects it to runtime;
+the new ledger delta includes the actual reducer, reply channel, event queue,
+and UI-owned compatibility presentation.

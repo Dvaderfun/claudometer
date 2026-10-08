@@ -159,7 +159,13 @@ records.
 | Hidden `powershell ... caps-led.ps1 end` | The user disables an installed Caps helper in Settings | Stops helper flashing and turns the LED off. The optional script can itself start a hidden PowerShell flasher when Claude Code invokes its hooks. |
 | Windows `ShellExecute` with the `open` verb | Link/help/update actions described in the network section | Delegates the URL to the user's registered handler, normally the default browser. |
 
-No shell or child process is used for normal provider polling.
+No shell or child process is used for normal provider polling. Short-lived
+in-process worker threads read credentials and keep the prepared bearer token
+local while the UI thread validates the opaque account/request identity.
+Only an accepted request ticket permits HTTP execution. The message queue
+contains opaque identities, sanitized outcomes, and reply handles, never
+bearer tokens or credential contents. Alerts consume accepted successful
+transitions on the UI thread; obsolete outcomes produce no side effects.
 
 ## Notifications
 
@@ -212,7 +218,8 @@ The principal implementation sources for this contract are:
 
 - Provider requests and Claude credentials: [`src/api.rs`](src/api.rs)
 - Codex requests and credentials: [`src/codex.rs`](src/codex.rs)
-- Refresh/update triggers: [`src/main.rs`](src/main.rs)
+- Refresh/update triggers: [`src/main.rs`](src/main.rs); provider state and
+  worker handoff: [`src/app.rs`](src/app.rs), [`src/poller.rs`](src/poller.rs)
 - Update requests, files, processes, and links:
   [`src/updater.rs`](src/updater.rs)
 - Settings, runtime state, and atomic retention:

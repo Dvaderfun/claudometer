@@ -7,15 +7,19 @@
 mod accessibility;
 mod alerts;
 mod api;
+mod app;
 mod auth;
 mod codex;
 mod config;
 mod demo;
 mod gfx;
 mod network;
+mod poller;
 pub mod provider;
 mod release_manifest;
 pub mod runtime_state;
+#[cfg(test)]
+mod state_reference;
 pub mod store;
 mod trayicon;
 mod updater;
@@ -23,9 +27,8 @@ mod util;
 mod vibecode;
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicU32, Ordering};
+use std::time::Duration;
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -45,13 +48,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use provider::model::{
-    AccountContext, AccountKey, CompletionEvent, FetchCompletion, FetchOutcome, Generation,
-    LimitKind, ProviderId, RequestId, UsageSnapshot,
-};
-use provider::state::{
-    self as provider_state, Clock, ClockReading, RefreshGate, RefreshTrigger, SystemClock,
-};
+use provider::model::{LimitKind, ProviderId, UsageSnapshot};
+use provider::state::{Clock, RefreshTrigger, SystemClock};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_DATA_READY: u32 = WM_APP + 2;
@@ -84,65 +82,9 @@ static TASKBAR_MSG: AtomicU32 = AtomicU32::new(0);
 static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
 static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
 static POLL_SECS: AtomicU32 = AtomicU32::new(60);
-static MANUAL_COOLDOWN_NOTICES: AtomicU32 = AtomicU32::new(0);
-
-/// Per-provider fetch state; both providers share the resilience rules
-/// (recent stale data beats errors, strict 429 backoff, 3 s debounce).
-struct Slot {
-    identity: Mutex<SlotIdentity>,
-    state: Mutex<Option<FetchCompletion<FetchOutcome>>>,
-    last_good: Mutex<Option<AccountSnapshot>>,
-    preparation_error: Mutex<Option<String>>,
-    last_fetch: Mutex<Option<Instant>>,
-    /// No requests before this instant (server Retry-After or exponential
-    /// backoff). Manual refresh respects it: retries can extend a 429 cooldown.
-    cooldown_until: Mutex<Option<Instant>>,
-    /// consecutive rate-limited fetches — drives the 429 backoff
-    rl_streak: AtomicU32,
-    fetching: AtomicBool,
-}
-
-struct SlotIdentity {
-    account: Option<AccountContext>,
-    generation: Generation,
-    next_request_id: u64,
-    pending_request_id: Option<RequestId>,
-}
-
-#[derive(Clone)]
-struct AccountSnapshot {
-    account: AccountKey,
-    snapshot: UsageSnapshot,
-}
-
-impl Slot {
-    const fn new() -> Self {
-        Self {
-            identity: Mutex::new(SlotIdentity {
-                account: None,
-                generation: Generation(0),
-                next_request_id: 1,
-                pending_request_id: None,
-            }),
-            state: Mutex::new(None),
-            last_good: Mutex::new(None),
-            preparation_error: Mutex::new(None),
-            last_fetch: Mutex::new(None),
-            cooldown_until: Mutex::new(None),
-            rl_streak: AtomicU32::new(0),
-            fetching: AtomicBool::new(false),
-        }
-    }
-}
-
-static SLOTS: [Slot; 2] = [Slot::new(), Slot::new()];
-
-fn slot(provider: ProviderId) -> &'static Slot {
-    &SLOTS[provider.index()]
-}
 
 fn any_fetching() -> bool {
-    SLOTS.iter().any(|s| s.fetching.load(Ordering::SeqCst))
+    app::any_fetching()
 }
 
 /// Codex section is live: toggle on AND a ChatGPT-login auth file on disk.
@@ -150,49 +92,9 @@ fn codex_active() -> bool {
     config::settings().codex_enabled && codex::available()
 }
 
-/// Snapshot to display for a provider (fresh, or stale on error) plus the
-/// current error message when the last fetch failed.
-fn effective(p: ProviderId) -> (Option<UsageSnapshot>, Option<String>) {
-    effective_at(slot(p), SystemClock.read())
+fn effective(provider: ProviderId) -> (Option<UsageSnapshot>, Option<String>) {
+    app::effective(provider)
 }
-
-fn effective_at(s: &Slot, now: ClockReading) -> (Option<UsageSnapshot>, Option<String>) {
-    let identity = s.identity.lock().unwrap();
-    let current_account = identity.account.as_ref().map(|account| &account.key);
-    let matching_last_good = || {
-        s.last_good
-            .lock()
-            .unwrap()
-            .as_ref()
-            .filter(|last| current_account.is_some_and(|account| account == &last.account))
-            .map(|last| last.snapshot.clone())
-    };
-    if let Some(error) = s.preparation_error.lock().unwrap().clone() {
-        let recent = matching_last_good()
-            .filter(|snapshot| provider_state::within_stale_window(now, snapshot.fetched_unix));
-        return (recent, Some(error));
-    }
-    let state = s.state.lock().unwrap();
-    match &*state {
-        Some(completion)
-            if current_account.is_some_and(|account| account == &completion.account)
-                && completion.generation == identity.generation =>
-        {
-            match &completion.payload {
-                FetchOutcome::Ok(snapshot) => (Some(snapshot.clone()), None),
-                FetchOutcome::Err { msg, .. } => {
-                    let recent = matching_last_good().filter(|snapshot| {
-                        provider_state::within_stale_window(now, snapshot.fetched_unix)
-                    });
-                    (recent, Some(msg.clone()))
-                }
-            }
-        }
-        Some(_) => (None, None),
-        None => (matching_last_good(), None),
-    }
-}
-
 struct Ui {
     fly: Option<gfx::Surface>,
     set: Option<gfx::Surface>,
@@ -443,10 +345,12 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 LRESULT(0)
             }
             WM_DATA_READY => {
-                update_tray(hwnd);
-                if let Some(event) = completion_event_from_message(wparam, lparam) {
-                    run_alert_check(event);
+                if !app::drain_events(Duration::from_secs(u64::from(
+                    POLL_SECS.load(Ordering::SeqCst),
+                ))) {
+                    return LRESULT(0);
                 }
+                update_tray(hwnd);
                 if IsWindowVisible(flyout_hwnd()).as_bool() {
                     show_flyout(
                         ANCHOR_X.load(Ordering::SeqCst),
@@ -463,7 +367,7 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 if wparam.0 == 1 {
                     // Interactive login may have replaced the account. Invalidate
                     // before any replacement fetch so an old worker cannot land.
-                    invalidate_account(slot(ProviderId::Claude), ProviderId::Claude);
+                    app::invalidate(ProviderId::Claude, false);
                 }
                 let sh = settings_hwnd();
                 if !sh.is_invalid() && IsWindowVisible(sh).as_bool() {
@@ -515,6 +419,13 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_POLL => {
+                // Also recover queued events if a worker's wakeup was dropped.
+                if app::drain_events(Duration::from_secs(u64::from(
+                    POLL_SECS.load(Ordering::SeqCst),
+                ))) {
+                    update_tray(hwnd);
+                    render_flyout_current();
+                }
                 vibecode::reconcile_active_scheme();
                 spawn_fetch_all(RefreshTrigger::Automatic);
                 updater::maybe_check(); // no-op unless 24h passed
@@ -1053,7 +964,7 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
                 if on {
                     spawn_fetch(ProviderId::Codex, RefreshTrigger::Manual);
                 } else {
-                    invalidate_account(slot(ProviderId::Codex), ProviderId::Codex);
+                    app::invalidate(ProviderId::Codex, true);
                 }
                 update_tray(HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _));
             }
@@ -1408,28 +1319,10 @@ fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
 }
 
 fn manual_cooldown_deadlines() -> Vec<(ProviderId, i64)> {
-    let requested = MANUAL_COOLDOWN_NOTICES.load(Ordering::SeqCst);
-    if requested == 0 {
-        return Vec::new();
-    }
-    let now = SystemClock.read();
-    let mut active = 0;
-    let mut deadlines = Vec::new();
-    for provider in [ProviderId::Claude, ProviderId::Codex] {
-        let bit = 1 << provider.index();
-        if requested & bit == 0 {
-            continue;
-        }
-        let cooldown_until = *slot(provider).cooldown_until.lock().unwrap();
-        if let Some(deadline) = provider_state::cooldown_deadline_unix(now, cooldown_until) {
-            active |= bit;
-            deadlines.push((provider, deadline));
-        }
-    }
-    MANUAL_COOLDOWN_NOTICES.store(active, Ordering::SeqCst);
-    deadlines
+    app::manual_cooldown_deadlines(Duration::from_secs(u64::from(
+        POLL_SECS.load(Ordering::SeqCst),
+    )))
 }
-
 fn manual_cooldown_note() -> Option<String> {
     let notices: Vec<_> = manual_cooldown_deadlines()
         .into_iter()
@@ -2213,79 +2106,9 @@ unsafe fn show_menu(owner: HWND, x: i32, y: i32) {
     }
 }
 
-// ---------- alerts ----------
-
-/// Hand only the successful completion named by this event to the alert engine.
-/// Stale/error-preserved data and unrelated stored successes remain ineligible.
-fn run_alert_check(event: CompletionEvent) {
-    if event.provider == ProviderId::Codex && !codex_active() {
-        return;
-    }
-    if let Some((account, snapshot)) = alert_candidate(slot(event.provider), event) {
-        alerts::check(event.provider, &account, &snapshot);
-    }
-}
-
-fn alert_candidate(s: &Slot, event: CompletionEvent) -> Option<(AccountContext, UsageSnapshot)> {
-    let identity = s.identity.lock().unwrap();
-    match &*s.state.lock().unwrap() {
-        Some(completion)
-            if completion.provider == event.provider
-                && completion.request_id == event.request_id
-                && completion.generation == identity.generation
-                && identity
-                    .account
-                    .as_ref()
-                    .is_some_and(|account| account.key == completion.account) =>
-        {
-            match &completion.payload {
-                FetchOutcome::Ok(snapshot) => {
-                    Some((identity.account.as_ref()?.clone(), snapshot.clone()))
-                }
-                FetchOutcome::Err { .. } => None,
-            }
-        }
-        Some(_) | None => None,
-    }
-}
-
 // ---------- fetch ----------
 
-enum PreparedFetch {
-    Claude(api::PreparedRequest),
-    Codex(codex::PreparedRequest),
-}
-
-impl PreparedFetch {
-    fn account(&self) -> &AccountContext {
-        match self {
-            Self::Claude(request) => request.account(),
-            Self::Codex(request) => request.account(),
-        }
-    }
-
-    fn execute(self) -> FetchOutcome {
-        // One prepared request executes one selected source. In particular,
-        // authentication and 429 failures return directly; they never trigger
-        // an immediate request to another source.
-        match self {
-            Self::Claude(request) => api::fetch(request),
-            Self::Codex(request) => codex::fetch(request),
-        }
-    }
-}
-
-fn prepare_fetch(
-    provider: ProviderId,
-) -> std::result::Result<PreparedFetch, api::PreparationFailure> {
-    match provider {
-        ProviderId::Claude => api::prepare().map(PreparedFetch::Claude),
-        ProviderId::Codex => codex::prepare().map(PreparedFetch::Codex),
-    }
-}
-
-/// Refresh every live provider (Claude always, Codex when active). Manual and
-/// periodic requests obey the same debounce and API-mandated cooldown.
+/// Refresh every enabled provider through the UI-owned state and poller.
 fn spawn_fetch_all(trigger: RefreshTrigger) {
     spawn_fetch(ProviderId::Claude, trigger);
     if config::settings().codex_enabled {
@@ -2293,666 +2116,10 @@ fn spawn_fetch_all(trigger: RefreshTrigger) {
     }
 }
 
-fn spawn_fetch(p: ProviderId, trigger: RefreshTrigger) {
-    if demo::is_active() {
-        return;
-    }
-    let s = slot(p);
-    let gate = provider_state::refresh_gate(
+fn spawn_fetch(provider: ProviderId, trigger: RefreshTrigger) {
+    app::refresh(
+        provider,
         trigger,
-        SystemClock.read(),
-        *s.cooldown_until.lock().unwrap(),
-        *s.last_fetch.lock().unwrap(),
-        s.fetching.load(Ordering::SeqCst),
         Duration::from_secs(u64::from(POLL_SECS.load(Ordering::SeqCst))),
     );
-    if trigger == RefreshTrigger::Manual {
-        let bit = 1 << p.index();
-        if matches!(gate, RefreshGate::Cooldown { .. }) {
-            MANUAL_COOLDOWN_NOTICES.fetch_or(bit, Ordering::SeqCst);
-        } else {
-            MANUAL_COOLDOWN_NOTICES.fetch_and(!bit, Ordering::SeqCst);
-        }
-    }
-    if gate != RefreshGate::Ready {
-        return;
-    }
-    if s.fetching.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let request_id = reserve_request(s);
-    std::thread::spawn(move || {
-        let prepared = match prepare_fetch(p) {
-            Ok(prepared) => prepared,
-            Err(failure) => {
-                let accepted =
-                    record_preparation_failure(slot(p), p, request_id, failure, SystemClock.read());
-                if accepted {
-                    post_data_ready(CompletionEvent {
-                        provider: p,
-                        request_id,
-                    });
-                }
-                return;
-            }
-        };
-        let account = prepared.account().clone();
-        let s = slot(p);
-        let Some(generation) = begin_request(s, p, request_id, account.clone()) else {
-            return;
-        };
-        let completion = FetchCompletion {
-            provider: p,
-            generation,
-            request_id,
-            account: account.key,
-            payload: prepared.execute(),
-        };
-        let event = CompletionEvent {
-            provider: completion.provider,
-            request_id: completion.request_id,
-        };
-        if record_fetch_completion(s, p, completion, SystemClock.read()) {
-            post_data_ready(event);
-        }
-    });
-}
-
-fn post_data_ready(event: CompletionEvent) {
-    let handle = MAIN_HWND.load(Ordering::SeqCst);
-    if handle != 0 {
-        unsafe {
-            let _ = PostMessageW(
-                HWND(handle as *mut _),
-                WM_DATA_READY,
-                WPARAM(event.provider.index()),
-                LPARAM(event.request_id.0 as isize),
-            );
-        }
-    }
-}
-
-fn completion_event_from_message(wparam: WPARAM, lparam: LPARAM) -> Option<CompletionEvent> {
-    let provider = match wparam.0 {
-        0 => ProviderId::Claude,
-        1 => ProviderId::Codex,
-        _ => return None,
-    };
-    Some(CompletionEvent {
-        provider,
-        request_id: RequestId(lparam.0 as u64),
-    })
-}
-
-fn reserve_request(s: &Slot) -> RequestId {
-    let mut identity = s.identity.lock().unwrap();
-    let request_id = RequestId(identity.next_request_id);
-    identity.next_request_id = identity.next_request_id.wrapping_add(1).max(1);
-    identity.pending_request_id = Some(request_id);
-    request_id
-}
-
-fn begin_request(
-    s: &Slot,
-    provider: ProviderId,
-    request_id: RequestId,
-    account: AccountContext,
-) -> Option<Generation> {
-    let mut identity = s.identity.lock().unwrap();
-    if identity.pending_request_id != Some(request_id) {
-        return None;
-    }
-    let changed = identity
-        .account
-        .as_ref()
-        .is_none_or(|current| current.key != account.key);
-    if changed {
-        identity.generation = Generation(identity.generation.0.wrapping_add(1));
-        clear_account_bound_state(s);
-    }
-    identity.account = Some(account.clone());
-    let generation = identity.generation;
-    drop(identity);
-    if changed {
-        alerts::account_changed(provider, Some(&account));
-    }
-    Some(generation)
-}
-
-fn invalidate_account(s: &Slot, provider: ProviderId) {
-    let mut identity = s.identity.lock().unwrap();
-    identity.generation = Generation(identity.generation.0.wrapping_add(1));
-    identity.account = None;
-    identity.pending_request_id = None;
-    clear_account_bound_state(s);
-    s.fetching.store(false, Ordering::SeqCst);
-    drop(identity);
-    alerts::account_changed(provider, None);
-}
-
-fn clear_account_bound_state(s: &Slot) {
-    *s.state.lock().unwrap() = None;
-    *s.last_good.lock().unwrap() = None;
-    *s.preparation_error.lock().unwrap() = None;
-    *s.last_fetch.lock().unwrap() = None;
-    *s.cooldown_until.lock().unwrap() = None;
-    s.rl_streak.store(0, Ordering::SeqCst);
-}
-
-fn record_preparation_failure(
-    s: &Slot,
-    provider: ProviderId,
-    request_id: RequestId,
-    failure: api::PreparationFailure,
-    completed_at: ClockReading,
-) -> bool {
-    let mut identity = s.identity.lock().unwrap();
-    if identity.pending_request_id != Some(request_id) {
-        return false;
-    }
-    let invalidated = failure.invalidates_account();
-    if invalidated {
-        identity.generation = Generation(identity.generation.0.wrapping_add(1));
-        identity.account = None;
-        clear_account_bound_state(s);
-    }
-    identity.pending_request_id = None;
-    *s.preparation_error.lock().unwrap() = Some(failure.message.to_string());
-    *s.last_fetch.lock().unwrap() = Some(completed_at.monotonic);
-    s.rl_streak.store(
-        provider_state::next_rate_limit_streak(
-            s.rl_streak.load(Ordering::SeqCst),
-            provider_state::CompletionKind::OtherFailure,
-        ),
-        Ordering::SeqCst,
-    );
-    s.fetching.store(false, Ordering::SeqCst);
-    drop(identity);
-    if invalidated {
-        alerts::account_changed(provider, None);
-    }
-    true
-}
-
-fn record_fetch_completion(
-    s: &Slot,
-    expected_provider: ProviderId,
-    completion: FetchCompletion<FetchOutcome>,
-    completed_at: ClockReading,
-) -> bool {
-    let mut identity = s.identity.lock().unwrap();
-    let matches = completion.provider == expected_provider
-        && match &completion.payload {
-            FetchOutcome::Ok(snapshot) => {
-                snapshot.provider == completion.provider && snapshot.account == completion.account
-            }
-            FetchOutcome::Err { .. } => true,
-        }
-        && identity.pending_request_id == Some(completion.request_id)
-        && identity.generation == completion.generation
-        && identity
-            .account
-            .as_ref()
-            .is_some_and(|account| account.key == completion.account);
-    if !matches {
-        return false;
-    }
-    identity.pending_request_id = None;
-
-    match &completion.payload {
-        FetchOutcome::Ok(snapshot) => {
-            *s.last_good.lock().unwrap() = Some(AccountSnapshot {
-                account: completion.account.clone(),
-                snapshot: snapshot.clone(),
-            });
-            *s.cooldown_until.lock().unwrap() = None;
-            let streak = provider_state::next_rate_limit_streak(
-                s.rl_streak.load(Ordering::SeqCst),
-                provider_state::CompletionKind::Success,
-            );
-            s.rl_streak.store(streak, Ordering::SeqCst);
-        }
-        FetchOutcome::Err {
-            rate_limited: true,
-            retry_after,
-            ..
-        } => {
-            let current = s.rl_streak.load(Ordering::SeqCst);
-            let consecutive = provider_state::next_rate_limit_streak(
-                current,
-                provider_state::CompletionKind::RateLimited,
-            );
-            s.rl_streak.store(consecutive, Ordering::SeqCst);
-            let delay = provider_state::rate_limit_delay(*retry_after, consecutive);
-            *s.cooldown_until.lock().unwrap() = Some(completed_at.monotonic + delay);
-        }
-        FetchOutcome::Err { .. } => {
-            let streak = provider_state::next_rate_limit_streak(
-                s.rl_streak.load(Ordering::SeqCst),
-                provider_state::CompletionKind::OtherFailure,
-            );
-            s.rl_streak.store(streak, Ordering::SeqCst);
-        }
-    }
-    *s.preparation_error.lock().unwrap() = None;
-    *s.state.lock().unwrap() = Some(completion);
-    *s.last_fetch.lock().unwrap() = Some(completed_at.monotonic);
-    s.fetching.store(false, Ordering::SeqCst);
-    true
-}
-
-#[cfg(test)]
-mod state_characterization_tests {
-    use super::*;
-    use crate::provider::model::{IdentityPersistence, SourceProvenance};
-
-    fn reading(monotonic: Instant, unix_seconds: i64) -> ClockReading {
-        ClockReading {
-            monotonic,
-            unix_seconds,
-        }
-    }
-
-    fn failure(rate_limited: bool, retry_after: Option<u64>) -> FetchOutcome {
-        FetchOutcome::Err {
-            msg: "sanitized failure".to_string(),
-            retry_after,
-            rate_limited,
-        }
-    }
-
-    fn account(byte: u8) -> AccountContext {
-        AccountContext {
-            key: AccountKey::from_digest([byte; 32]),
-            persistence: IdentityPersistence::Persistent,
-        }
-    }
-
-    fn start_request(
-        slot: &Slot,
-        account: AccountContext,
-    ) -> (RequestId, Generation, AccountContext) {
-        slot.fetching.store(true, Ordering::SeqCst);
-        let request_id = reserve_request(slot);
-        let generation =
-            begin_request(slot, ProviderId::Claude, request_id, account.clone()).unwrap();
-        (request_id, generation, account)
-    }
-
-    fn completion(
-        provider: ProviderId,
-        request_id: RequestId,
-        generation: Generation,
-        account: &AccountContext,
-        mut payload: FetchOutcome,
-    ) -> FetchCompletion<FetchOutcome> {
-        if let FetchOutcome::Ok(snapshot) = &mut payload {
-            snapshot.provider = provider;
-            snapshot.account = account.key.clone();
-            snapshot.source = SourceProvenance::compatibility(provider);
-        }
-        FetchCompletion {
-            provider,
-            generation,
-            request_id,
-            account: account.key.clone(),
-            payload,
-        }
-    }
-
-    fn snapshot(fetched_unix: i64) -> UsageSnapshot {
-        UsageSnapshot {
-            provider: ProviderId::Claude,
-            account: AccountKey::from_digest([1; 32]),
-            source: SourceProvenance::compatibility(ProviderId::Claude),
-            rows: Vec::new(),
-            plan: None,
-            fetched_unix,
-        }
-    }
-
-    #[test]
-    fn snapshot_identity_mismatch_cannot_be_accepted() {
-        let slot = Slot::new();
-        let now = Instant::now();
-        let (request_id, generation, account) = start_request(&slot, account(1));
-        let mut completion = completion(
-            ProviderId::Claude,
-            request_id,
-            generation,
-            &account,
-            FetchOutcome::Ok(snapshot(100)),
-        );
-        if let FetchOutcome::Ok(snapshot) = &mut completion.payload {
-            snapshot.account = AccountKey::from_digest([2; 32]);
-        }
-        assert!(!record_fetch_completion(
-            &slot,
-            ProviderId::Claude,
-            completion,
-            reading(now, 100)
-        ));
-        assert!(slot.last_good.lock().unwrap().is_none());
-        assert!(slot.fetching.load(Ordering::SeqCst));
-        assert_eq!(
-            slot.identity.lock().unwrap().pending_request_id,
-            Some(request_id)
-        );
-    }
-
-    #[test]
-    fn provider_completion_state_is_isolated() {
-        let slots = [Slot::new(), Slot::new()];
-        let now = Instant::now();
-        let (request_id, generation, current) = start_request(&slots[0], account(1));
-        assert!(record_fetch_completion(
-            &slots[0],
-            ProviderId::Claude,
-            completion(
-                ProviderId::Claude,
-                request_id,
-                generation,
-                &current,
-                failure(true, Some(120)),
-            ),
-            reading(now, 10_000),
-        ));
-
-        assert_eq!(slots[0].rl_streak.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            *slots[0].cooldown_until.lock().unwrap(),
-            Some(now + std::time::Duration::from_secs(120))
-        );
-        assert!(slots[0].state.lock().unwrap().is_some());
-
-        assert_eq!(slots[1].rl_streak.load(Ordering::SeqCst), 0);
-        assert_eq!(*slots[1].cooldown_until.lock().unwrap(), None);
-        assert!(slots[1].state.lock().unwrap().is_none());
-        assert!(slots[1].last_fetch.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn every_non_rate_limited_result_resets_the_429_streak() {
-        let slot = Slot::new();
-        let now = Instant::now();
-        let current = account(1);
-        let (request_id, generation, _) = start_request(&slot, current.clone());
-        assert!(record_fetch_completion(
-            &slot,
-            ProviderId::Claude,
-            completion(
-                ProviderId::Claude,
-                request_id,
-                generation,
-                &current,
-                failure(true, None),
-            ),
-            reading(now, 100),
-        ));
-        assert_eq!(slot.rl_streak.load(Ordering::SeqCst), 1);
-
-        let (request_id, generation, _) = start_request(&slot, current.clone());
-        assert!(record_fetch_completion(
-            &slot,
-            ProviderId::Claude,
-            completion(
-                ProviderId::Claude,
-                request_id,
-                generation,
-                &current,
-                failure(false, None),
-            ),
-            reading(now + Duration::from_secs(60), 160),
-        ));
-        assert_eq!(slot.rl_streak.load(Ordering::SeqCst), 0);
-
-        slot.rl_streak.store(2, Ordering::SeqCst);
-        slot.fetching.store(true, Ordering::SeqCst);
-        let request_id = reserve_request(&slot);
-        assert!(record_preparation_failure(
-            &slot,
-            ProviderId::Claude,
-            request_id,
-            api::PreparationFailure {
-                kind: api::PreparationFailureKind::TemporarilyUnreadable,
-                message: "temporary",
-            },
-            reading(now + Duration::from_secs(120), 220),
-        ));
-        assert_eq!(slot.rl_streak.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn stale_data_expires_at_the_characterized_boundary() {
-        let slot = Slot::new();
-        let (request_id, generation, current) = start_request(&slot, account(1));
-        *slot.last_good.lock().unwrap() = Some(AccountSnapshot {
-            account: current.key.clone(),
-            snapshot: snapshot(9_401),
-        });
-        *slot.state.lock().unwrap() = Some(completion(
-            ProviderId::Claude,
-            request_id,
-            generation,
-            &current,
-            failure(false, None),
-        ));
-        slot.identity.lock().unwrap().pending_request_id = None;
-        slot.fetching.store(false, Ordering::SeqCst);
-
-        let (still_visible, error) = effective_at(&slot, reading(Instant::now(), 10_000));
-        assert!(still_visible.is_some());
-        assert_eq!(error.as_deref(), Some("sanitized failure"));
-
-        let (expired, error) = effective_at(&slot, reading(Instant::now(), 10_001));
-        assert!(expired.is_none());
-        assert_eq!(error.as_deref(), Some("sanitized failure"));
-    }
-
-    #[test]
-    fn only_the_exact_success_completion_is_an_alert_candidate() {
-        let slot = Slot::new();
-        let (request_id, generation, current) = start_request(&slot, account(1));
-        assert!(record_fetch_completion(
-            &slot,
-            ProviderId::Claude,
-            completion(
-                ProviderId::Claude,
-                request_id,
-                generation,
-                &current,
-                FetchOutcome::Ok(snapshot(123)),
-            ),
-            reading(Instant::now(), 123),
-        ));
-
-        let accepted = CompletionEvent {
-            provider: ProviderId::Claude,
-            request_id,
-        };
-        assert_eq!(
-            alert_candidate(&slot, accepted).unwrap().1.fetched_unix,
-            123
-        );
-        assert!(alert_candidate(
-            &slot,
-            CompletionEvent {
-                provider: ProviderId::Codex,
-                request_id,
-            }
-        )
-        .is_none());
-        assert!(alert_candidate(
-            &slot,
-            CompletionEvent {
-                provider: ProviderId::Claude,
-                request_id: RequestId(request_id.0 + 1),
-            }
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn account_change_clears_all_bound_state_before_replacement_fetch() {
-        let slot = Slot::new();
-        let now = Instant::now();
-        let (request_a, generation_a, account_a) = start_request(&slot, account(1));
-        assert!(record_fetch_completion(
-            &slot,
-            ProviderId::Claude,
-            completion(
-                ProviderId::Claude,
-                request_a,
-                generation_a,
-                &account_a,
-                FetchOutcome::Ok(snapshot(100)),
-            ),
-            reading(now, 100),
-        ));
-        *slot.cooldown_until.lock().unwrap() = Some(now + std::time::Duration::from_secs(60));
-        slot.rl_streak.store(2, Ordering::SeqCst);
-
-        let (_, generation_b, account_b) = start_request(&slot, account(2));
-        assert_ne!(generation_b, generation_a);
-        assert!(account_b.key != account_a.key);
-        assert!(slot.state.lock().unwrap().is_none());
-        assert!(slot.last_good.lock().unwrap().is_none());
-        assert!(slot.cooldown_until.lock().unwrap().is_none());
-        assert!(slot.last_fetch.lock().unwrap().is_none());
-        assert_eq!(slot.rl_streak.load(Ordering::SeqCst), 0);
-        assert!(effective_at(&slot, reading(now, 101)).0.is_none());
-    }
-
-    #[test]
-    fn obsolete_completion_cannot_touch_new_account_state_or_fetch_flag() {
-        let slot = Slot::new();
-        let now = Instant::now();
-        let (old_request, old_generation, old_account) = start_request(&slot, account(1));
-        invalidate_account(&slot, ProviderId::Claude);
-        let (new_request, new_generation, new_account) = start_request(&slot, account(2));
-
-        assert!(!record_fetch_completion(
-            &slot,
-            ProviderId::Claude,
-            completion(
-                ProviderId::Claude,
-                old_request,
-                old_generation,
-                &old_account,
-                failure(true, Some(900)),
-            ),
-            reading(now, 100),
-        ));
-        assert!(slot.state.lock().unwrap().is_none());
-        assert!(slot.cooldown_until.lock().unwrap().is_none());
-        assert_eq!(slot.rl_streak.load(Ordering::SeqCst), 0);
-        assert!(slot.fetching.load(Ordering::SeqCst));
-        assert_eq!(
-            slot.identity.lock().unwrap().pending_request_id,
-            Some(new_request)
-        );
-        assert_eq!(slot.identity.lock().unwrap().generation, new_generation);
-        assert!(slot
-            .identity
-            .lock()
-            .unwrap()
-            .account
-            .as_ref()
-            .is_some_and(|current| current.key == new_account.key));
-    }
-
-    #[test]
-    fn failed_first_fetch_after_switch_cannot_restore_previous_snapshot_or_plan() {
-        let slot = Slot::new();
-        let now = Instant::now();
-        let (request_a, generation_a, account_a) = start_request(&slot, account(1));
-        let mut old = snapshot(100);
-        old.plan = Some("Old plan".to_string());
-        assert!(record_fetch_completion(
-            &slot,
-            ProviderId::Claude,
-            completion(
-                ProviderId::Claude,
-                request_a,
-                generation_a,
-                &account_a,
-                FetchOutcome::Ok(old),
-            ),
-            reading(now, 100),
-        ));
-
-        let (request_b, generation_b, account_b) = start_request(&slot, account(2));
-        assert!(record_fetch_completion(
-            &slot,
-            ProviderId::Claude,
-            completion(
-                ProviderId::Claude,
-                request_b,
-                generation_b,
-                &account_b,
-                failure(false, None),
-            ),
-            reading(now, 101),
-        ));
-        let (visible, error) = effective_at(&slot, reading(now, 101));
-        assert!(visible.is_none());
-        assert_eq!(error.as_deref(), Some("sanitized failure"));
-        assert!(alert_candidate(
-            &slot,
-            CompletionEvent {
-                provider: ProviderId::Claude,
-                request_id: request_b,
-            }
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn invalidating_preparation_failure_clears_account_but_transient_failure_does_not() {
-        let slot = Slot::new();
-        let now = Instant::now();
-        let (request, generation, current) = start_request(&slot, account(1));
-        assert!(record_fetch_completion(
-            &slot,
-            ProviderId::Claude,
-            completion(
-                ProviderId::Claude,
-                request,
-                generation,
-                &current,
-                FetchOutcome::Ok(snapshot(100)),
-            ),
-            reading(now, 100),
-        ));
-
-        slot.fetching.store(true, Ordering::SeqCst);
-        let transient_request = reserve_request(&slot);
-        assert!(record_preparation_failure(
-            &slot,
-            ProviderId::Claude,
-            transient_request,
-            api::PreparationFailure {
-                kind: api::PreparationFailureKind::TemporarilyUnreadable,
-                message: "temporary",
-            },
-            reading(now, 101),
-        ));
-        assert!(slot.identity.lock().unwrap().account.is_some());
-        assert!(effective_at(&slot, reading(now, 101)).0.is_some());
-
-        slot.fetching.store(true, Ordering::SeqCst);
-        let missing_request = reserve_request(&slot);
-        assert!(record_preparation_failure(
-            &slot,
-            ProviderId::Claude,
-            missing_request,
-            api::PreparationFailure {
-                kind: api::PreparationFailureKind::Missing,
-                message: "missing",
-            },
-            reading(now, 102),
-        ));
-        assert!(slot.identity.lock().unwrap().account.is_none());
-        assert!(effective_at(&slot, reading(now, 102)).0.is_none());
-    }
 }

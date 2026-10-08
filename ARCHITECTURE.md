@@ -8,7 +8,7 @@ Single-process, single-UI-thread Win32 app. Three windows, one worker thread per
 ▼        ▼
 Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 │  WM_TRAY (WM_APP+1)  → toggle flyout / context menu
-│  WM_DATA_READY (+2)  → update tray, alert check, re-render visible flyout
+│  WM_DATA_READY (+2)  → drain AppEvent queue on UI thread, accept results/alerts, re-render
 │  WM_TOAST_ACTIVATED (+3) → open flyout at tray icon (posted by toast click)
 │  WM_UPDATE (+4)       → wparam 0: repaint update state · wparam 1: quit for handover
 │  TIMER_POLL          → spawn_fetch()          (30s–5m, user setting)
@@ -27,7 +27,9 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 
 | File | Owns |
 |---|---|
-| `main.rs` | windows, wndprocs, tray, menu, timers, per-provider fetch orchestration (`SLOTS`), hit-testing, keyboard nav, all statics |
+| `main.rs` | windows, wndprocs, tray, menu, timers, hit-testing, keyboard nav, and Windows handle statics |
+| `app.rs` | UI-thread provider state, preparation identity, accepted-success alert dispatch, and compatibility presentation |
+| `poller.rs` | short-lived provider workers, worker-local credentials, bounded UI ticket wait, and AppEvent queue/wakeup |
 | `accessibility.rs` | `WM_GETOBJECT` UIA fragment roots, names and bounds from view/geometry, Invoke/Toggle dispatch to the UI thread, and focus events; Narrator verification pending |
 | `gfx.rs` | `Surface` (D3D/DXGI/DComp/D2D stack), all drawing, layout constants, Fluent palette, brush/format caches |
 | `auth.rs` | Claude account: identity from local files + explicit interactive browser sign-in (own console, cancellable) delegated to the resolved native `claude` executable |
@@ -35,7 +37,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `codex.rs` | Codex (OpenAI) credentials read + usage fetch → same `UsageSnapshot` |
 | `provider/model.rs` | provider/account/source/limit/request identities, normalized snapshots, typed kind/class/severity/Percent/window duration, and completion envelope |
 | `runtime_state.rs` | atomic optional `state.json` envelope, CNG install salt, and account-scoped receipt schema |
-| `provider/state.rs` | pure provider reducer, identity-checked fetch tickets, derived freshness/views, and injected-clock debounce/429 policy; runtime ownership moves in APP-01 |
+| `provider/state.rs` | pure provider reducer, identity-checked fetch tickets, derived freshness/views, and injected-clock debounce/429 policy |
 | `store.rs` | typed atomic JSON commit, verified `.bak` generation, corruption preservation, and failure injection |
 | `demo.rs` | deterministic provider/view scenarios and guarded no-side-effect launch mode |
 | `trayicon.rs` | CPU-rasterized ring/alert HICON (premultiplied DIB, no fonts) |
@@ -86,25 +88,27 @@ are interpreted only inside their adapters.
 
 Every provider HTTP body is read as at most 1 MiB plus one sentinel byte and rejected when oversized. Parsed output is bounded to 64 rows and 512 UTF-8 bytes per provider-controlled display string. Sanitized fixtures under `tests/fixtures/` cover normal, partial, unknown, malformed, missing-reset, weekly-primary, non-finite, and out-of-range shapes without live network access.
 
-Resilience rules (in `main.rs`, per provider via `SLOTS`, with time decisions isolated in `provider/state.rs`):
+Resilience rules (UI-owned providers in `app.rs`, with time decisions isolated in `provider/state.rs`):
 
 - Credential parsing and secret-bearing request preparation run only on short-lived provider workers. A stable provider account ID is salted with the CNG-generated install salt and SHA-256; when none exists, an access-token fingerprint uses a process-only salt and is never persisted. Secret strings have no `Debug`/serialization surface and overwrite their buffers on drop.
-- Every slot has a current opaque account, generation, reserved request ID, and account-bound completion/last-good state. Credential changes clear snapshot, plan, error, cooldown, debounce, and alerts before replacement work. A completion must match provider + generation + request + account before any side effect; obsolete work cannot clear a newer fetch flag.
+- Every provider has a current opaque account, generation, request ID, and account-bound last-good state. Worker preparation has a separate operation identity and cannot start a request after UI invalidation. Account changes clear snapshot, plan, error, cooldown, debounce, and alerts before replacement work. A completion must match provider + generation + request + account before any side effect; obsolete work cannot clear a newer request.
 - Claude's profile-plan cache is keyed by opaque account. Its local fallback plan and stable ID are captured from the same worker-local identity read, so a concurrent account switch cannot attach another account's plan.
 - `last_good` snapshot survives failed fetches for up to 10 minutes — UI shows stale data + footer note; a provider with no data degrades to a dim note line in its own section; the whole-flyout error view exists only for the nothing-ever-fetched case.
 - Every 429 starts a 60–900 s `cooldown_until` immediately (server `Retry-After` when useful, exponential fallback otherwise). Automatic and manual refreshes both honor it; there is no fast retry.
-- 3 s debounce on refresh; `fetching` flag dedupes concurrent spawns. Characterization uses an injected fake clock and never sleeps.
-- Fetch threads publish via mutexed statics + `PostMessageW(WM_DATA_READY)` — UI mutations stay on the UI thread.
+- 3 s debounce on refresh; UI-owned pending preparation/request state dedupes worker spawns. Characterization uses an injected fake clock and never sleeps.
+- Workers publish non-secret AppEvents through one mutexed queue and `PostMessageW(WM_DATA_READY)`; polling ticks also drain the queue if Windows drops a wakeup. The UI owns all state transitions; workers retain prepared credentials while waiting up to ten seconds for an accepted request ticket. Rejected preparation never makes a provider request. Alerts run directly from accepted successful transitions after releasing UI state borrows.
 - Codex enablement (`codex_active`) = settings toggle AND auth file present — checked per poll, so signing in/out of Codex shows/hides the section without restart.
 
-STATE-01 adds the pure `ProviderState` event reducer for APP-01 integration.
+STATE-01 adds the pure `ProviderState` event reducer; APP-01 connects it to the UI shell.
 It owns phase, account generation, request identity, snapshot origin/age,
 debounce, and consecutive-429 state. A successful accepted transition is the
 only alert/cache candidate; rejected completions produce no effects. Cache
 loads are account-checked and never fresh. Transient failures retain the
 same-account snapshot, with an Outdated view at the §5.2 age threshold. The
-existing shell retains its characterized ten-minute stale display until the
-UI-thread move; no persisted cache is introduced by STATE-01.
+compatibility presentation retains its characterized ten-minute stale display
+for APP-01 parity. FRESH-01 exposes richer freshness states later; CACHE-01
+adds persisted snapshots. `state_reference.rs` retains the old slot logic only
+under `cfg(test)` for direct behavior comparisons and original characterization.
 
 ## Alerts (`alerts.rs`)
 
