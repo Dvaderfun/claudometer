@@ -22,6 +22,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | WIP-00 UIA `0fdfd19`, synthetic trust root provisioned | 1,132,544 | +3.17% vs REL-02 provisioned | 1,029,120 | +3.34% vs REL-02 provisioned |
 | SIZE-01 `opt-level = "z"`, unprovisioned | 947,712 | -9.35% vs WIP-00 unprovisioned | 892,928 | -8.74% vs WIP-00 unprovisioned |
 | SIZE-01 `opt-level = "z"`, synthetic trust root provisioned | 1,058,304 | -6.56% vs WIP-00 provisioned | 940,544 | -8.61% vs WIP-00 provisioned |
+| MODEL-01 typed domain model, unprovisioned | 950,784 | +0.32% vs SIZE-01 unprovisioned | not measured | — |
+| MODEL-01 typed domain model, synthetic trust root provisioned | 1,061,376 | +0.29% vs SIZE-01 provisioned | 942,592 | +0.22% vs SIZE-01 provisioned |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;
@@ -190,3 +192,14 @@ only; Narrator remains deferred by the owner. Final sizes/hashes are in
 Rollback: restore `opt-level = "s"` and the previous comparison baselines
 together; no product state or data migration is involved. Never modify provider
 credentials or recovery journals for this rollback.
+
+## MODEL-01 (2026-10-08)
+
+Rust 1.97.1, locked dependencies, the selected `z` profile, and the same RFC
+8032 public test key/sequence as SIZE-01. The normalized model adds 3,072 x64
+bytes and 2,048 ARM64 bytes to the provisioned baseline. No crate was added,
+and CI comparison budgets remain at SIZE-01. Both provisioned artifacts pass
+PE architecture/version, regression, and the unchanged 1.25 MiB ceiling;
+x64 headroom is 249,344 bytes. The unprovisioned x64 build is 950,784 bytes.
+Test-only changes after these builds do not enter release artifacts. Evidence
+and rollback: `docs/verification/model-01.md`.

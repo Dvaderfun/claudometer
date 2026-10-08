@@ -13,6 +13,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 
 ### Changed
 - Optimize release builds for size with `opt-level = "z"`: the local provisioned x64 executable shrinks by 74,240 bytes and ARM64 by 88,576 bytes. The size audit records startup measurements and milestone allowances; dependency features and runtime behavior are preserved.
+- Shared usage snapshots carry provider/account/source identities and typed quota kinds, classes, percentages, severity hints, and window durations. Reset timestamps are formatted in the view layer; alerts and tray classification no longer depend on kind strings. Missing Codex duration remains unknown in the model while preserving its existing caption.
 - Automatic update checks default off for genuinely new installations; existing settings migrate to enabled. Settings provides an explicit toggle. Portable installs use authenticated journaled updates; managed or ambiguous installs offer a release-page action.
 
 ### Fixed

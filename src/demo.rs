@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-use crate::api::LimitRow;
+use crate::gfx::LimitRow;
 use crate::gfx::{CapsControl, FlyoutData, Section, SectionBody, SettingsView, View};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,12 +219,10 @@ fn build_state(request: Request, now_unix: i64) -> State {
             if let SectionBody::Rows(rows) = &mut section.body {
                 for index in 0..16 {
                     rows.push(LimitRow {
-                        kind: format!("model_{index}"),
                         label: format!("Weekly · model {}", index + 1),
                         percent: 20.0 + (index * 4) as f64,
-                        severity: String::new(),
+                        severity: None,
                         reset_text: "resets in 4d".to_string(),
-                        resets_unix: Some(now_unix + 4 * 24 * 60 * 60),
                     });
                 }
             }
@@ -288,27 +286,23 @@ fn provider_section(
     plan: &str,
     session: f64,
     weekly: f64,
-    now_unix: i64,
+    _now_unix: i64,
 ) -> Section {
     Section {
         title,
         plan: plan.to_string(),
         body: SectionBody::Rows(vec![
             LimitRow {
-                kind: "session".to_string(),
                 label: "Session (5h)".to_string(),
                 percent: session,
-                severity: String::new(),
+                severity: None,
                 reset_text: "resets in 2h 15m".to_string(),
-                resets_unix: Some(now_unix + 2 * 60 * 60 + 15 * 60),
             },
             LimitRow {
-                kind: "weekly_all".to_string(),
                 label: "Weekly · all models".to_string(),
                 percent: weekly,
-                severity: String::new(),
+                severity: None,
                 reset_text: "resets in 4d".to_string(),
-                resets_unix: Some(now_unix + 4 * 24 * 60 * 60),
             },
         ]),
     }

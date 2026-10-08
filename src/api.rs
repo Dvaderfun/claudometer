@@ -1,6 +1,4 @@
 //! Fetches usage limits from the same endpoint Claude Code's `/usage` uses.
-//! Also home of the provider-agnostic display model (`UsageSnapshot`,
-//! `LimitRow`, `FetchOutcome`) shared with `codex.rs`.
 //! Read-only: Claudometer never exchanges refresh tokens or writes credentials.
 //! Claude Code alone owns its rotating OAuth session; this module trusts the
 //! API response instead of treating the local `expiresAt` hint as authoritative.
@@ -17,7 +15,8 @@ use windows::Win32::System::Time::{
 };
 
 use crate::provider::model::{
-    derive_account_context, AccountContext, AccountKey, ProviderId, SecretString,
+    derive_account_context, AccountContext, AccountKey, FetchOutcome, LimitKind, ProviderId,
+    ProviderSeverity, SecretString, SourceProvenance, UsageLimit, UsageSnapshot,
 };
 
 /// Authoritative plan/identity. `.credentials.json`'s `subscriptionType` is
@@ -285,41 +284,6 @@ struct ExtraUsage {
     utilization: Option<f64>,
 }
 
-// ---------- display-ready model ----------
-
-#[derive(Clone)]
-pub struct LimitRow {
-    pub kind: String,
-    pub label: String,
-    pub percent: f64,
-    pub severity: String,
-    /// e.g. "resets 18:59" / "resets Sat 19:59", empty when unknown
-    pub reset_text: String,
-    /// raw reset stamp (unix seconds) — identifies the window *instance*,
-    /// which is what alert dedup keys on
-    pub resets_unix: Option<i64>,
-}
-
-#[derive(Clone)]
-pub struct UsageSnapshot {
-    pub rows: Vec<LimitRow>,
-    pub plan: String,
-    /// unix seconds of the fetch — rendered as a ticking relative label
-    pub fetched_unix: i64,
-}
-
-#[derive(Clone)]
-pub enum FetchOutcome {
-    Ok(UsageSnapshot),
-    Err {
-        msg: String,
-        /// server Retry-After (seconds) on 429
-        retry_after: Option<u64>,
-        /// true only for HTTP 429 — drives the jittered retry + backoff
-        rate_limited: bool,
-    },
-}
-
 pub fn prepare() -> Result<PreparedRequest, PreparationFailure> {
     let credentials = read_credentials()?;
     if credentials.oauth.access_token.is_empty() {
@@ -418,7 +382,12 @@ fn fetch_inner(request: PreparedRequest) -> Result<UsageSnapshot, FetchErr> {
         &request.account,
         request.local_plan,
     );
-    parse_usage_json(&body, plan, OffsetDateTime::now_utc().unix_timestamp())
+    parse_usage_json(
+        &body,
+        plan,
+        OffsetDateTime::now_utc().unix_timestamp(),
+        request.account.key,
+    )
 }
 
 /// Plan name for the flyout header. Hits `/oauth/profile` at most once an hour
@@ -547,18 +516,20 @@ fn parse_usage_json(
     body: &[u8],
     plan: String,
     observed_at_unix: i64,
+    account: AccountKey,
 ) -> Result<UsageSnapshot, FetchErr> {
     let parsed: UsageResp =
         serde_json::from_slice(body).map_err(|_| plain("Unexpected API response shape."))?;
-    parse_usage(parsed, plan, observed_at_unix)
+    parse_usage(parsed, plan, observed_at_unix, account)
 }
 
 fn parse_usage(
     parsed: UsageResp,
     plan: String,
     observed_at_unix: i64,
+    account: AccountKey,
 ) -> Result<UsageSnapshot, FetchErr> {
-    let mut rows: Vec<LimitRow> = Vec::new();
+    let mut rows: Vec<UsageLimit> = Vec::new();
 
     if let Some(limits) = &parsed.limits {
         for l in limits {
@@ -585,14 +556,24 @@ fn parse_usage(
                 .resets_at
                 .as_deref()
                 .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
-            rows.push(LimitRow {
+            let (typed_kind, duration) = match kind.as_str() {
+                "session" => (LimitKind::Session, Some(5 * 3600)),
+                "weekly_all" => (LimitKind::Weekly, Some(7 * 86400)),
+                "weekly_scoped" => (LimitKind::Model, Some(7 * 86400)),
+                "extra" => (LimitKind::ExtraUsage, None),
+                _ => (LimitKind::Other(kind.clone()), None),
+            };
+            if let Some(row) = UsageLimit::from_adapter(
                 kind,
+                typed_kind,
                 label,
-                percent: clamp_percent(pct),
-                severity: bounded_text(l.severity.clone().unwrap_or_default()),
-                reset_text: reset_dt.map(fmt_reset_dt).unwrap_or_default(),
-                resets_unix: reset_dt.map(|d| d.unix_timestamp()),
-            });
+                pct,
+                l.severity.as_deref().and_then(ProviderSeverity::from_hint),
+                reset_dt.map(|d| d.unix_timestamp()),
+                duration,
+            ) {
+                rows.push(row);
+            }
         }
     }
 
@@ -608,27 +589,38 @@ fn parse_usage(
                 .resets_at
                 .as_deref()
                 .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
-            rows.push(LimitRow {
-                kind: kind.into(),
-                label: label.into(),
-                percent: clamp_percent(u),
-                severity: String::new(),
-                reset_text: reset_dt.map(fmt_reset_dt).unwrap_or_default(),
-                resets_unix: reset_dt.map(|d| d.unix_timestamp()),
-            });
+            let (typed_kind, duration) = if kind == "session" {
+                (LimitKind::Session, 5 * 3600)
+            } else {
+                (LimitKind::Weekly, 7 * 86400)
+            };
+            if let Some(row) = UsageLimit::from_adapter(
+                kind.into(),
+                typed_kind,
+                label.into(),
+                u,
+                None,
+                reset_dt.map(|d| d.unix_timestamp()),
+                Some(duration),
+            ) {
+                rows.push(row);
+            }
         }
     }
 
     if rows.len() < MAX_LIMIT_ROWS {
         if let Some(x) = &parsed.extra_usage.filter(|x| x.is_enabled == Some(true)) {
-            rows.push(LimitRow {
-                kind: "extra".into(),
-                label: "Extra usage".into(),
-                percent: clamp_percent(x.utilization.unwrap_or(0.0)),
-                severity: String::new(),
-                reset_text: String::new(),
-                resets_unix: None,
-            });
+            if let Some(row) = UsageLimit::from_adapter(
+                "extra".into(),
+                LimitKind::ExtraUsage,
+                "Extra usage".into(),
+                x.utilization.unwrap_or(0.0),
+                None,
+                None,
+                None,
+            ) {
+                rows.push(row);
+            }
         }
     }
 
@@ -637,8 +629,11 @@ fn parse_usage(
     }
 
     Ok(UsageSnapshot {
+        provider: ProviderId::Claude,
+        account,
+        source: SourceProvenance::compatibility(ProviderId::Claude),
         rows,
-        plan: bounded_text(plan),
+        plan: (!plan.is_empty()).then(|| bounded_text(plan)),
         fetched_unix: observed_at_unix,
     })
 }
@@ -684,16 +679,6 @@ pub(crate) fn read_bounded(reader: impl Read) -> Result<Vec<u8>, FetchErr> {
         return Err(plain("API response exceeded the 1 MiB safety limit."));
     }
     Ok(body)
-}
-
-/// API percentages are untrusted floats. Keep NaN/infinity and out-of-range
-/// values out of text formatting, alert comparisons, and D2D geometry.
-pub(crate) fn clamp_percent(value: f64) -> f64 {
-    if value.is_finite() {
-        value.clamp(0.0, 100.0)
-    } else {
-        0.0
-    }
 }
 
 /// Same formatting for unix-seconds reset stamps (Codex API shape).
@@ -852,25 +837,33 @@ mod tests {
     }
 
     fn parse_fixture(name: &str) -> Result<UsageSnapshot, FetchErr> {
-        parse_usage_json(fixture(name), "Fixture plan".to_string(), OBSERVED_AT)
-    }
-
-    #[test]
-    fn sanitizes_untrusted_percentages() {
-        assert_eq!(clamp_percent(f64::NAN), 0.0);
-        assert_eq!(clamp_percent(f64::INFINITY), 0.0);
-        assert_eq!(clamp_percent(-3.0), 0.0);
-        assert_eq!(clamp_percent(42.5), 42.5);
-        assert_eq!(clamp_percent(104.0), 100.0);
+        parse_usage_json(
+            fixture(name),
+            "Fixture plan".to_string(),
+            OBSERVED_AT,
+            AccountKey::from_digest([1; 32]),
+        )
     }
 
     #[test]
     fn parses_sanitized_claude_fixture_matrix() {
         let normal = parse_fixture("normal").unwrap();
         assert_eq!(normal.rows.len(), 3);
-        assert_eq!(normal.rows[0].kind, "session");
-        assert_eq!(normal.rows[0].percent, 42.5);
+        assert_eq!(normal.rows[0].kind, LimitKind::Session);
+        assert_eq!(normal.rows[0].percent.get(), 42.5);
         assert_eq!(normal.fetched_unix, OBSERVED_AT);
+        assert_eq!(normal.provider, ProviderId::Claude);
+        assert!(normal.account == AccountKey::from_digest([1; 32]));
+        assert_eq!(
+            normal.source.support,
+            crate::provider::model::SourceSupport::Compatibility
+        );
+        assert_eq!(normal.rows[0].window_seconds, Some(18_000));
+        assert_eq!(normal.rows[1].window_seconds, Some(604_800));
+        assert_eq!(
+            normal.rows[2].class,
+            crate::provider::model::LimitClass::Spend
+        );
 
         let partial = parse_fixture("partial").unwrap();
         assert_eq!(partial.rows.len(), 1);
@@ -882,14 +875,16 @@ mod tests {
 
         let missing_reset = parse_fixture("missing-reset").unwrap();
         assert_eq!(missing_reset.rows[0].resets_unix, None);
-        assert!(missing_reset.rows[0].reset_text.is_empty());
+        assert!(crate::gfx::LimitRow::from(missing_reset.rows[0].clone())
+            .reset_text
+            .is_empty());
 
         let weekly = parse_fixture("weekly-primary").unwrap();
-        assert_eq!(weekly.rows[0].kind, "weekly_all");
+        assert_eq!(weekly.rows[0].kind, LimitKind::Weekly);
 
         let out_of_range = parse_fixture("out-of-range").unwrap();
-        assert_eq!(out_of_range.rows[0].percent, 0.0);
-        assert_eq!(out_of_range.rows[1].percent, 100.0);
+        assert_eq!(out_of_range.rows[0].percent.get(), 0.0);
+        assert_eq!(out_of_range.rows[1].percent.get(), 100.0);
     }
 
     #[test]
@@ -908,7 +903,13 @@ mod tests {
             .iter()
             .rposition(|byte| !byte.is_ascii_whitespace())
             .unwrap();
-        assert!(parse_usage_json(&normal[..closing_brace], String::new(), OBSERVED_AT).is_err());
+        assert!(parse_usage_json(
+            &normal[..closing_brace],
+            String::new(),
+            OBSERVED_AT,
+            AccountKey::from_digest([1; 32])
+        )
+        .is_err());
     }
 
     #[test]
@@ -923,10 +924,15 @@ mod tests {
             .collect();
         let body = serde_json::to_vec(&serde_json::json!({ "limits": limits })).unwrap();
         assert_eq!(
-            parse_usage_json(&body, String::new(), OBSERVED_AT)
-                .unwrap()
-                .rows
-                .len(),
+            parse_usage_json(
+                &body,
+                String::new(),
+                OBSERVED_AT,
+                AccountKey::from_digest([1; 32])
+            )
+            .unwrap()
+            .rows
+            .len(),
             MAX_LIMIT_ROWS
         );
 
