@@ -339,6 +339,50 @@ pub fn provider_diagnostics(interval: Duration) -> [crate::diagnostics::Provider
     })
 }
 
+pub fn load_local_diagnostics() {
+    for provider in [ProviderId::Claude, ProviderId::Codex] {
+        if provider == ProviderId::Codex && !crate::config::settings().codex_enabled {
+            continue;
+        }
+        // Support mode prepares local credentials only; execute is never called.
+        let identity = match provider {
+            ProviderId::Claude => crate::api::prepare().map(|request| request.account().clone()),
+            ProviderId::Codex => crate::codex::prepare().map(|request| request.account().clone()),
+        };
+        APP.with_borrow_mut(|app| {
+            let slot = &mut app.providers[provider.index()];
+            match identity {
+                Ok(account) => {
+                    slot.detected = Some(true);
+                    let cache = crate::runtime_state::cached_provider(
+                        provider,
+                        &account,
+                        SourceProvenance::compatibility(provider),
+                        SystemClock.read().unix_seconds,
+                    );
+                    slot.state
+                        .reduce(ProviderEvent::CredentialsChanged(account), &SystemClock);
+                    if let Some(cache) = cache {
+                        if let Some(snapshot) = cache.snapshot {
+                            slot.state
+                                .reduce(ProviderEvent::CacheLoaded(snapshot), &SystemClock);
+                        }
+                        if let Some(deadline) = cache.retry_at_unix {
+                            slot.state
+                                .reduce(ProviderEvent::RetryDeadlineLoaded(deadline), &SystemClock);
+                        }
+                    }
+                }
+                Err(failure) => {
+                    slot.detected =
+                        Some(failure.kind != crate::api::PreparationFailureKind::Missing);
+                    slot.error = Some(failure.error());
+                }
+            }
+        });
+    }
+}
+
 pub struct AppState {
     providers: [ProviderSlot; 2],
 }
@@ -524,6 +568,7 @@ pub fn drain_events(interval: Duration) -> bool {
                     )
                 });
                 if accepted {
+                    crate::diagnostics::record("provider_failed");
                     if invalidates_account {
                         crate::alerts::account_changed(preparation.provider, None);
                         let _ = crate::runtime_state::clear_provider_cache(preparation.provider);
@@ -567,6 +612,13 @@ pub fn drain_events(interval: Duration) -> bool {
                 if accepted.2 {
                     let _ = crate::runtime_state::clear_provider_cache(provider);
                     crate::alerts::account_changed(provider, None);
+                }
+                if accepted.0 {
+                    crate::diagnostics::record(if accepted.1.is_some() {
+                        "provider_success"
+                    } else {
+                        "provider_failed"
+                    });
                 }
                 if let Some((account, snapshot)) = accepted.1 {
                     if provider != ProviderId::Codex || crate::codex_active() {

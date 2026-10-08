@@ -143,6 +143,33 @@ pub fn initialize() -> ConfigStatus {
     initialize_with_migrations(true)
 }
 
+pub fn initialize_read_only() -> ConfigStatus {
+    let runtime = RUNTIME.get_or_init(|| {
+        let (raw, status, existing) = match config_path().map(std::fs::read) {
+            Some(Ok(bytes)) => match serde_json::from_slice(&bytes) {
+                Ok(raw) => (raw, ConfigStatus::Ready, true),
+                Err(_) => (Map::new(), ConfigStatus::CorruptDefaults, true),
+            },
+            Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                (Map::new(), ConfigStatus::Ready, false)
+            }
+            _ => (Map::new(), ConfigStatus::PathUnavailable, false),
+        };
+        let decoded = decode(raw, existing);
+        Mutex::new(Runtime {
+            backend: Backend::Unavailable,
+            state: ConfigState {
+                settings: decoded.settings,
+                raw: decoded.raw,
+                access: decoded.access,
+                status: status_for_access(decoded.access, status),
+                pending_migration_status: None,
+            },
+        })
+    });
+    runtime.lock().unwrap().state.status
+}
+
 /// Loads settings without persisting schema normalization. Update candidates
 /// use this until the watchdog has durably committed their executable.
 pub fn initialize_compatibility() -> ConfigStatus {
@@ -195,11 +222,9 @@ pub fn diagnostic() -> Option<String> {
         }
         ConfigStatus::InvalidSchema => Some("Settings schema invalid · read-only".to_string()),
         ConfigStatus::PathUnavailable => Some("Settings path unavailable · read-only".to_string()),
-        ConfigStatus::ReadFailed(error) => {
-            Some(format!("Settings read failed · {:?}", error.stage))
-        }
-        ConfigStatus::WriteFailed(error) => {
-            Some(format!("Settings write failed · {:?}", error.stage))
+        ConfigStatus::ReadFailed(_) => Some("Settings read failed · Copy diagnostics".to_string()),
+        ConfigStatus::WriteFailed(_) => {
+            Some("Settings write failed · Copy diagnostics".to_string())
         }
     }
 }
@@ -393,6 +418,7 @@ impl<F: FaultInjector> Runtime<F> {
             return Err(ConfigError::PathUnavailable);
         };
         if let Err(error) = store.save(raw) {
+            crate::diagnostics::record("config_failed");
             self.state.status = ConfigStatus::WriteFailed(error);
             return Err(ConfigError::Store(error));
         }

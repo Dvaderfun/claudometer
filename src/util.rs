@@ -75,6 +75,9 @@ pub fn is_dark_theme() -> bool {
             Some(&mut val as *mut u32 as *mut _),
             Some(&mut size),
         );
+        if ok != ERROR_SUCCESS && ok != ERROR_FILE_NOT_FOUND {
+            crate::diagnostics::record("registry_failed");
+        }
         ok == ERROR_SUCCESS && val == 0
     }
 }
@@ -106,7 +109,7 @@ pub fn severity_rgb(
 
 pub fn autostart_enabled() -> bool {
     unsafe {
-        RegGetValueW(
+        let status = RegGetValueW(
             HKEY_CURRENT_USER,
             RUN_KEY,
             RUN_VALUE,
@@ -114,7 +117,11 @@ pub fn autostart_enabled() -> bool {
             None,
             None,
             None,
-        ) == ERROR_SUCCESS
+        );
+        if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
+            crate::diagnostics::record("registry_failed");
+        }
+        status == ERROR_SUCCESS
     }
 }
 
@@ -126,7 +133,7 @@ pub fn set_autostart(on: bool) {
             };
             let cmd = format!("\"{}\"", exe.display());
             let wide: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
-            let _ = RegSetKeyValueW(
+            let result = RegSetKeyValueW(
                 HKEY_CURRENT_USER,
                 RUN_KEY,
                 RUN_VALUE,
@@ -134,8 +141,14 @@ pub fn set_autostart(on: bool) {
                 Some(wide.as_ptr() as *const _),
                 (wide.len() * 2) as u32,
             );
+            if result != ERROR_SUCCESS {
+                crate::diagnostics::record("registry_failed");
+            }
         } else {
-            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+            let result = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+            if result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND {
+                crate::diagnostics::record("registry_failed");
+            }
         }
     }
 }
@@ -409,7 +422,9 @@ pub fn apply_acrylic(hwnd: HWND, dark: bool, high_contrast: bool) {
             pv: &mut policy as *mut _ as *mut _,
             size: std::mem::size_of::<AccentPolicy>(),
         };
-        let _ = set_wca(hwnd, &mut data);
+        if !set_wca(hwnd, &mut data).as_bool() {
+            crate::diagnostics::record("render_failed");
+        }
     }
 }
 

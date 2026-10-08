@@ -152,7 +152,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | `v0.8` | Trustworthy state and system safety | **Done on `main`, unreleased** |
 | `v0.9` | Authenticated, crash-safe updates | **Done on `main`, unreleased** |
 | R0 | Ship the trust-root release | **Notes prepared (REL-03)**; publication blocked on human signing/provisioning (§7) |
-| `v0.10` | State core, diagnostics, Codex documented source | **In progress** (MODEL-01 merged; state/cache/errors/DIAG-01 complete locally; DIAG-02 next) |
+| `v0.10` | State core, diagnostics, Codex documented source | **In progress** (MODEL-01 merged; state/cache/errors/diagnostics complete locally; CODEX-01 next) |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
 | `v0.12` | Glanceable status, tray, and alerts | Not started |
 | `v1.0` | Signed distribution | Not started |
@@ -180,8 +180,8 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 3. **REL-03** — **done (notes only)**: proposed `docs/release-notes/0.9.0.md`, expanded Unreleased changelog, local release-input check, and live protection audit (§7). Human publishes.
 4. **MODEL-01 done** → **STATE-01 done** → **APP-01 done** → **CACHE-01 done** (§8.1).
 5. **ERR-01 done** — actionable error states (§8.2).
-6. **DIAG-01 done** → **DIAG-02 next** (§8.3).
-7. **CODEX-01** → **CODEX-02** (§8.4).
+6. **DIAG-01 done** → **DIAG-02 done** (§8.3).
+7. **CODEX-01 next** → **CODEX-02** (§8.4).
 8. **PACE-01** → **ROW-01** → **FRESH-01** (§10.1). If the v0.10 tail is blocked, PACE-01 and ROW-01 may start once MODEL-01 is done, and FRESH-01 once APP-01 is done.
 9. **A11Y-02**, **LAYOUT-01**, **LAYOUT-02**, **RENDER-01** (§9).
 10. **ONBOARD-01**, **ONBOARD-02**, **KEY-01**, **UI-TEST-01** (§9).
@@ -519,12 +519,14 @@ Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authentic
   - Show it in Settings (Diagnostics section) with a `Copy diagnostics` action.
   - Completed 2026-10-09: fixed-field local snapshot and scrollable Settings Diagnostics card with Copy/Invoke/Tab/Enter/Space. Includes Windows build, install/source/support/fallback, detection/auth state, timestamps/freshness/retry/error, settings/update/power/store states. No credentials/account keys/paths/provider labels; no log or network probe. 165 tests and §0.3 gates pass; deterministic UIA copy/keyboard/privacy/demo-clipboard checks and screenshots verified. Rollback: prior binary/revert; no durable schema change. See `docs/verification/diag-01.md`; DIAG-02 adds the log/CLI commands separately.
 
-- [ ] **DIAG-02 — Bounded redacted log and support commands.**
+- [x] **DIAG-02 — Bounded redacted log and support commands.**
   - `diagnostics.log`, rotating at 3 × 256 KiB.
   - `--diagnose` prints the snapshot to stdout; `--version` prints the version.
   - Redact bearer/refresh tokens, raw account IDs, email, username, home path, account hash, and response bodies.
   - Rendering, config, and registry failures become visible diagnostics instead of silent no-ops.
   - Acceptance: a redaction corpus test proves no token, identifier, PII, home path, or body reaches the log or snapshot.
+  - Completed 2026-10-09: local timestamp/fixed-code log with three 256 KiB generations and repeated-failure suppression; unknown fields replaced wholesale, no raw messages. Support commands exit before tray/startup and use read-only settings/state and dedicated process-local identity preparation without execute/UI. Rendering/config/registry/provider/update/clipboard failures report locally. 168 tests pass including rotation/write failure and redaction corpus for tokens, IDs, email/user/path/hash/body; support-command stdout and corrupt-file unchanged tests pass. Demo safety/diagnostics UI/22 UIA and required gates pass. First size gate failure resolved through smaller formatting/IO without changing budgets. Rollback: prior binary/revert; optional log deletion loses support history only. See `docs/verification/diag-02.md`.
+  - Size: x64 1,053,184 unprovisioned / 1,163,776 provisioned (+0.44/+0.40% vs DIAG-01). Original cumulative CI margin is 358 bytes; CODEX-01 must first recover size headroom. Hard ceiling/profile/baselines remain unchanged.
 
 ### 8.4 Codex documented source
 

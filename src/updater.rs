@@ -138,6 +138,9 @@ pub fn diagnostic_recovery() -> &'static str {
 }
 
 fn set_status(s: Status) {
+    if matches!(s, Status::Failed(_, _)) {
+        crate::diagnostics::record("update_failed");
+    }
     *STATUS.lock().unwrap() = s;
     let h = crate::MAIN_HWND.load(Ordering::SeqCst);
     if h != 0 {
@@ -174,7 +177,9 @@ pub fn maybe_check() {
                     set_status(Status::UpToDate);
                 }
             }
-            Err(_) => {}
+            Err(_) => {
+                crate::diagnostics::record("update_failed");
+            }
         }
     });
 }

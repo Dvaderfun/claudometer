@@ -144,6 +144,9 @@ thread_local! {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(result) = diagnostics::support_command(&args) {
+        return result;
+    }
     if let Some(result) = updater::run_watchdog_if_requested(&args) {
         return result.map_err(|message| Error::new(E_FAIL, message));
     }
@@ -210,6 +213,7 @@ fn main() -> Result<()> {
                 config::initialize();
             }
             runtime_state::initialize();
+            diagnostics::initialize_log();
             util::enable_dark_context_menus();
             alerts::init();
         }
@@ -1528,28 +1532,31 @@ unsafe fn render_demo_flyout(fh: HWND, state: &demo::State, width: u32, height: 
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
         if ui.fly.is_none() {
-            ui.fly = gfx::Surface::new(fh).ok();
+            ui.fly = diagnostics::observe(gfx::Surface::new(fh), "render_init_failed").ok();
         }
         ui.fly_vibe_top = gfx::vibe_row(&state.view).top;
         let hover = ui.fly_hover;
         let focus = ui.fly_focus;
         let scroll = ui.fly_scroll;
         if let Some(surface) = ui.fly.as_mut() {
-            let _ = surface.render_flyout(
-                width,
-                height,
-                dpi,
-                &state.view,
-                !state.light,
-                (96, 159, 255),
-                ui_contrast(),
-                scroll,
-                hover,
-                focus,
-                state.fetching,
-                false,
-                false,
-                "Off · demo mode makes no system changes",
+            let _ = diagnostics::observe(
+                surface.render_flyout(
+                    width,
+                    height,
+                    dpi,
+                    &state.view,
+                    !state.light,
+                    (96, 159, 255),
+                    ui_contrast(),
+                    scroll,
+                    hover,
+                    focus,
+                    state.fetching,
+                    false,
+                    false,
+                    "Off · demo mode makes no system changes",
+                ),
+                "render_failed",
             );
         }
     });
@@ -1565,28 +1572,31 @@ unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
         if ui.fly.is_none() {
-            ui.fly = gfx::Surface::new(fh).ok();
+            ui.fly = diagnostics::observe(gfx::Surface::new(fh), "render_init_failed").ok();
         }
         ui.fly_vibe_top = gfx::vibe_row(view).top; // hit-test cache
         let hover = ui.fly_hover;
         let focus = ui.fly_focus;
         let scroll = ui.fly_scroll;
         if let Some(fx) = ui.fly.as_mut() {
-            let _ = fx.render_flyout(
-                w_px,
-                h_px,
-                dpi,
-                view,
-                dark,
-                accent,
-                contrast,
-                scroll,
-                hover,
-                focus,
-                fetching,
-                updater::has_update(),
-                vibe_on,
-                vibecode::flyout_caption(),
+            let _ = diagnostics::observe(
+                fx.render_flyout(
+                    w_px,
+                    h_px,
+                    dpi,
+                    view,
+                    dark,
+                    accent,
+                    contrast,
+                    scroll,
+                    hover,
+                    focus,
+                    fetching,
+                    updater::has_update(),
+                    vibe_on,
+                    vibecode::flyout_caption(),
+                ),
+                "render_failed",
             );
         }
     });
@@ -1803,21 +1813,24 @@ unsafe fn render_settings(hwnd: HWND) {
         UI.with(|ui| {
             let mut ui = ui.borrow_mut();
             if ui.set.is_none() {
-                ui.set = gfx::Surface::new(hwnd).ok();
+                ui.set = diagnostics::observe(gfx::Surface::new(hwnd), "render_init_failed").ok();
             }
             let mut st = demo::settings_view(ui.set_hover, ui.set_focus);
             st.diagnostics_copy = ui.diagnostics_copy;
             let scroll = ui.set_scroll;
             if let Some(surface) = ui.set.as_mut() {
-                let _ = surface.render_settings(
-                    (rc.right - rc.left) as u32,
-                    (rc.bottom - rc.top) as u32,
-                    dpi,
-                    &st,
-                    !demo::active().is_some_and(|state| state.light),
-                    (96, 159, 255),
-                    ui_contrast(),
-                    scroll,
+                let _ = diagnostics::observe(
+                    surface.render_settings(
+                        (rc.right - rc.left) as u32,
+                        (rc.bottom - rc.top) as u32,
+                        dpi,
+                        &st,
+                        !demo::active().is_some_and(|state| state.light),
+                        (96, 159, 255),
+                        ui_contrast(),
+                        scroll,
+                    ),
+                    "render_failed",
                 );
             }
         });
@@ -1829,7 +1842,7 @@ unsafe fn render_settings(hwnd: HWND) {
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
         if ui.set.is_none() {
-            ui.set = gfx::Surface::new(hwnd).ok();
+            ui.set = diagnostics::observe(gfx::Surface::new(hwnd), "render_init_failed").ok();
         }
         let (mut about, about_btn) = match updater::status() {
             updater::Status::UpToDate => (
@@ -1950,15 +1963,18 @@ unsafe fn render_settings(hwnd: HWND) {
         };
         let scroll = ui.set_scroll;
         if let Some(sx) = ui.set.as_mut() {
-            let _ = sx.render_settings(
-                (rc.right - rc.left) as u32,
-                (rc.bottom - rc.top) as u32,
-                dpi,
-                &st,
-                dark,
-                accent,
-                contrast,
-                scroll,
+            let _ = diagnostics::observe(
+                sx.render_settings(
+                    (rc.right - rc.left) as u32,
+                    (rc.bottom - rc.top) as u32,
+                    dpi,
+                    &st,
+                    dark,
+                    accent,
+                    contrast,
+                    scroll,
+                ),
+                "render_failed",
             );
         }
     });
