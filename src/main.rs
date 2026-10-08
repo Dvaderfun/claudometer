@@ -1239,7 +1239,7 @@ unsafe fn apply_flyout_theme(h: HWND) {
 fn current_view() -> gfx::View {
     let (c_snap, c_err) = effective(ProviderId::Claude);
     let codex_on = codex_active();
-    let refresh_note = manual_cooldown_note();
+    let refresh_note = join_notes(app::cached_notes(), manual_cooldown_note());
 
     // Claude-only path — identical to the single-provider behavior
     if !codex_on {

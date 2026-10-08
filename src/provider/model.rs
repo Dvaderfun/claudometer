@@ -32,26 +32,26 @@ impl ProviderId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum SourceId {
     ClaudeOAuthCompatibility,
     CodexWhamCompatibility,
     CodexAppServer,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum SourceSupport {
     Compatibility,
     Documented,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SourceProvenance {
     pub id: SourceId,
     pub support: SourceSupport,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum LimitKind {
     Session,
     Weekly,
@@ -60,13 +60,13 @@ pub enum LimitKind {
     Other(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum LimitClass {
     Quota,
     Spend,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum ProviderSeverity {
     Critical,
     Warning,
@@ -91,8 +91,19 @@ impl ProviderSeverity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, PartialOrd)]
+#[serde(transparent)]
 pub struct Percent(f64);
+
+impl<'de> Deserialize<'de> for Percent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = f64::deserialize(deserializer)?;
+        if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+            return Err(D::Error::custom("invalid cached percentage"));
+        }
+        Ok(Self(value))
+    }
+}
 
 impl Percent {
     pub fn new(value: f64) -> Option<Self> {
@@ -104,7 +115,7 @@ impl Percent {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct UsageLimit {
     pub id: LimitId,
     pub kind: LimitKind,
@@ -116,7 +127,7 @@ pub struct UsageLimit {
     pub window_seconds: Option<u32>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct UsageSnapshot {
     pub provider: ProviderId,
     pub account: AccountKey,

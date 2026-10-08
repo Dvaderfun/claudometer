@@ -12,10 +12,11 @@ Claudometer reads existing Claude Code and Codex credentials to request usage
 limits. It does not collect telemetry or analytics. It does not log provider
 responses, upload crash reports, or send data to a Claudometer-operated server.
 
-Usage responses and update metadata are kept in memory only. Claudometer stores
-preferences, a random installation salt, salted account digests, and alert
-deduplication receipts locally. It never stores provider access tokens in its
-own files.
+Raw usage responses and update metadata are kept in memory only. Claudometer
+stores preferences, a random installation salt, salted account digests, alert
+deduplication receipts, and bounded normalized usage snapshots locally.
+Snapshots include selected source, optional plan, observation time, and a
+provider retry deadline. It never stores provider access tokens in its files.
 
 Windows, the selected provider, GitHub, the default browser, or the Claude Code
 CLI may independently keep their own network, notification, process, or crash
@@ -87,7 +88,7 @@ delete-data command or remove all application data on exit.
 | Path | Reads and writes | Retention and deletion behavior |
 | --- | --- | --- |
 | `%APPDATA%\Claudometer\settings.json` | Reads preferences and legacy migration data. Writes the refresh interval; Codex, alert, automatic update-check, wake-lock, and lid-override settings; and legacy alert receipts. Unknown JSON fields are preserved. | Retained until manually deleted. A new installation may have no settings file until a setting or legacy receipt is first saved. |
-| `%APPDATA%\Claudometer\state.json` | Created on first normal startup. Stores a random 32-byte installation salt, salted SHA-256 account digests, provider/limit identifiers, the 75% alert threshold, reset timestamps, re-arm flags, and migration markers. It stores no access token or raw provider account ID. | Retained until manually deleted. Deleting it causes a new salt and empty receipt state to be created on the next startup. |
+| `%APPDATA%\Claudometer\state.json` | Created on first normal startup. Stores a random 32-byte installation salt, salted SHA-256 account digests, alert receipts/migration markers, and a versioned `provider_cache`: at most two providers with selected source, optional plan, observation time, up to 64 normalized quota rows each (stable ID/kind/class, label, percentage, severity, reset/duration), and the accepted 429 retry deadline. Cache writes follow accepted fetches; authentication/preparation invalidation clears the provider's cache. It stores no access token, raw provider account ID, or response body. | Retained until manually deleted. Snapshots older than eight days, future observations, and reset-expired limit values are ignored on restore. Provider/source/account identity must match a locally prepared credential identity; token-fingerprint accounts never persist. Cached values are never fresh and do not trigger alerts. A valid future retry deadline blocks requests after restart. Deleting primary and backup resets cache/salt/receipts; a surviving verified backup may be recovered. |
 | `settings.json.bak`, `state.json.bak` | Verified previous versions maintained by the atomic JSON writer. | At most one normal backup per primary file; replaced by later successful writes. Retained until manually deleted. |
 | `settings.json.corrupt.*`, `state.json.corrupt.*` | A malformed primary file is renamed to a timestamped preservation copy before backup recovery or safe defaults are used. | Preserved indefinitely for manual inspection or deletion. There is no automatic retention limit. |
 | Sibling `*.tmp.*` and `*.restore.*` files | Temporary files used for write-through atomic commits and backup restoration. | Removed after normal success or handled failure. A process or machine crash can leave debris; there is no startup sweep in this version. |
@@ -111,9 +112,12 @@ them.
 | `%CLAUDE_CONFIG_DIR%\hooks\caps-led.disabled`, or its default-directory equivalent | Marker presence | Settings rendering; disabling the helper writes the marker, and enabling it deletes the marker |
 | `%TEMP%\claude-caps-working.flag` | Optional helper heartbeat/working flag | Managed by `extras/caps-led.ps1`, not by the Claudometer executable; removed on done/end and recreated while flashing |
 
-Provider response bodies, displayed usage snapshots, plan-cache entries, update
-metadata, and bearer tokens are not written to disk by Claudometer. They live in
-process memory and disappear when the process exits or the value is replaced.
+Provider response bodies, profile-plan cache entries, update metadata, and
+bearer tokens remain memory-only. Only normalized snapshot fields listed above
+are persisted; labels/kinds/plan strings are bounded to 512 UTF-8 bytes,
+IDs to 128 bytes, and timestamps/durations are validated. Account/source
+mismatch or invalid optional cache data disables restoration, preserving the
+existing installation salt and alert-receipt envelope.
 Windows notification history may retain the visible text of shown alerts under
 the user's Windows notification settings.
 

@@ -10,13 +10,244 @@ use windows::Win32::Security::Cryptography::{
 };
 
 use crate::provider::model::{
-    encode_hex, AccountContext, AccountKey, IdentityPersistence, LimitId, ProviderId,
-    ACCOUNT_KEY_BYTES,
+    encode_hex, AccountContext, AccountKey, IdentityPersistence, LimitClass, LimitId, LimitKind,
+    ProviderId, SourceId, SourceProvenance, SourceSupport, UsageSnapshot, ACCOUNT_KEY_BYTES,
 };
 use crate::store::{AtomicJsonStore, FaultInjector, LoadOutcome, StoreError};
 
 const SCHEMA_VERSION: u64 = 1;
 const MAX_ALERT_RECEIPTS: usize = 4096;
+const CACHE_VERSION: u64 = 1;
+const MAX_CACHE_AGE_SECONDS: i64 = 8 * 24 * 60 * 60;
+const MAX_TIMESTAMP: i64 = 253_402_300_799;
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct CachedProvider {
+    pub provider: ProviderId,
+    pub account: AccountKey,
+    pub source: SourceProvenance,
+    pub snapshot: Option<UsageSnapshot>,
+    pub retry_at_unix: Option<i64>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ProviderCache {
+    version: u64,
+    entries: Vec<CachedProvider>,
+}
+
+fn valid_timestamp(value: i64) -> bool {
+    (0..=MAX_TIMESTAMP).contains(&value)
+}
+
+fn valid_cache(entry: &CachedProvider) -> bool {
+    let source_valid = match entry.source.id {
+        SourceId::ClaudeOAuthCompatibility => {
+            entry.provider == ProviderId::Claude
+                && entry.source.support == SourceSupport::Compatibility
+        }
+        SourceId::CodexWhamCompatibility => {
+            entry.provider == ProviderId::Codex
+                && entry.source.support == SourceSupport::Compatibility
+        }
+        SourceId::CodexAppServer => {
+            entry.provider == ProviderId::Codex && entry.source.support == SourceSupport::Documented
+        }
+    };
+    source_valid
+        && entry.retry_at_unix.is_none_or(valid_timestamp)
+        && entry.snapshot.as_ref().is_none_or(|snapshot| {
+            snapshot.provider == entry.provider
+                && snapshot.account == entry.account
+                && snapshot.source == entry.source
+                && valid_timestamp(snapshot.fetched_unix)
+                && snapshot.plan.as_ref().is_none_or(|plan| plan.len() <= 512)
+                && snapshot.rows.len() <= 64
+                && snapshot.rows.iter().enumerate().all(|(index, row)| {
+                    row.label.len() <= 512
+                        && !snapshot.rows[..index]
+                            .iter()
+                            .any(|previous| previous.id == row.id)
+                        && !matches!(&row.kind, LimitKind::Other(kind) if kind.len() > 512)
+                        && (row.class == LimitClass::Spend) == (row.kind == LimitKind::ExtraUsage)
+                        && row.resets_unix.is_none_or(valid_timestamp)
+                        && row
+                            .window_seconds
+                            .is_none_or(|seconds| (1..=366 * 24 * 60 * 60).contains(&seconds))
+                })
+        })
+}
+
+fn decode_cache(raw: &Map<String, Value>) -> Vec<CachedProvider> {
+    let Some(value) = raw.get("provider_cache") else {
+        return Vec::new();
+    };
+    // Bound provider and row arrays before typed cache decoding.
+    if value.get("version").and_then(Value::as_u64) != Some(CACHE_VERSION)
+        || value
+            .get("entries")
+            .and_then(Value::as_array)
+            .is_none_or(|entries| entries.len() > 2)
+    {
+        return Vec::new();
+    }
+    if value["entries"].as_array().unwrap().iter().any(|entry| {
+        entry
+            .get("snapshot")
+            .filter(|snapshot| !snapshot.is_null())
+            .is_some_and(|snapshot| {
+                snapshot
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .is_none_or(|rows| rows.len() > 64)
+            })
+    }) {
+        return Vec::new();
+    }
+    let Ok(cache) = serde_json::from_value::<ProviderCache>(value.clone()) else {
+        return Vec::new();
+    };
+    if cache.entries.iter().enumerate().any(|(index, entry)| {
+        !valid_cache(entry)
+            || cache.entries[..index]
+                .iter()
+                .any(|previous| previous.provider == entry.provider)
+    }) {
+        return Vec::new();
+    }
+    cache.entries
+}
+
+fn matching_cache(
+    raw: &Map<String, Value>,
+    provider: ProviderId,
+    account: &AccountContext,
+    source: SourceProvenance,
+    now: i64,
+) -> Option<CachedProvider> {
+    if account.persistence != IdentityPersistence::Persistent || !valid_timestamp(now) {
+        return None;
+    }
+    let mut entry = decode_cache(raw).into_iter().find(|entry| {
+        entry.provider == provider && entry.account == account.key && entry.source == source
+    })?;
+    entry.snapshot = entry
+        .snapshot
+        .filter(|snapshot| {
+            snapshot.fetched_unix <= now && now - snapshot.fetched_unix <= MAX_CACHE_AGE_SECONDS
+        })
+        .map(|mut snapshot| {
+            snapshot
+                .rows
+                .retain(|row| row.resets_unix.is_none_or(|reset| reset > now));
+            snapshot
+        });
+    // Provider backoff is capped at 900 seconds. Implausible future deadlines
+    // (including a large wall-clock rollback) must not freeze polling.
+    entry.retry_at_unix = entry
+        .retry_at_unix
+        .filter(|deadline| *deadline > now && *deadline - now <= 900);
+    (entry.snapshot.is_some() || entry.retry_at_unix.is_some()).then_some(entry)
+}
+
+pub fn cached_provider(
+    provider: ProviderId,
+    account: &AccountContext,
+    source: SourceProvenance,
+    now: i64,
+) -> Option<CachedProvider> {
+    let runtime = RUNTIME.get()?.lock().unwrap();
+    runtime.install_salt.as_ref()?;
+    matching_cache(&runtime.raw, provider, account, source, now)
+}
+
+fn cache_update(
+    raw: &Map<String, Value>,
+    provider: ProviderId,
+    entry: Option<CachedProvider>,
+) -> Result<Map<String, Value>, RuntimeStateStatus> {
+    if raw
+        .get("provider_cache")
+        .and_then(|cache| cache.get("version"))
+        .and_then(Value::as_u64)
+        .is_some_and(|version| version > CACHE_VERSION)
+    {
+        return Err(RuntimeStateStatus::Invalid);
+    }
+    if entry
+        .as_ref()
+        .is_some_and(|entry| entry.provider != provider || !valid_cache(entry))
+    {
+        return Err(RuntimeStateStatus::Invalid);
+    }
+    let mut entries = decode_cache(raw);
+    entries.retain(|entry| entry.provider != provider);
+    entries.extend(entry);
+    let mut encoded = raw.clone();
+    encoded.insert(
+        "provider_cache".to_string(),
+        serde_json::to_value(ProviderCache {
+            version: CACHE_VERSION,
+            entries,
+        })
+        .map_err(|_| RuntimeStateStatus::Invalid)?,
+    );
+    Ok(encoded)
+}
+
+fn save_cache<F: FaultInjector>(
+    runtime: &mut RuntimeState,
+    store: &AtomicJsonStore<F>,
+    provider: ProviderId,
+    entry: Option<CachedProvider>,
+) -> Result<(), RuntimeStateStatus> {
+    runtime.install_salt.as_ref().ok_or(runtime.status)?;
+    let encoded = cache_update(&runtime.raw, provider, entry)
+        .inspect_err(|status| runtime.status = *status)?;
+    if encoded == runtime.raw {
+        return Ok(());
+    }
+    if let Err(error) = store.save(&encoded) {
+        runtime.status = RuntimeStateStatus::WriteFailed(error);
+        return Err(runtime.status);
+    }
+    runtime.raw = encoded;
+    runtime.status = RuntimeStateStatus::Ready;
+    Ok(())
+}
+
+pub fn persist_provider_cache(
+    provider: ProviderId,
+    account: &AccountContext,
+    source: SourceProvenance,
+    snapshot: Option<UsageSnapshot>,
+    retry_at_unix: Option<i64>,
+) -> Result<(), RuntimeStateStatus> {
+    let entry = (account.persistence == IdentityPersistence::Persistent).then(|| CachedProvider {
+        provider,
+        account: account.key.clone(),
+        source,
+        snapshot,
+        retry_at_unix,
+    });
+    let mut runtime = RUNTIME
+        .get()
+        .ok_or(RuntimeStateStatus::PathUnavailable)?
+        .lock()
+        .unwrap();
+    let path = state_path().ok_or(RuntimeStateStatus::PathUnavailable)?;
+    save_cache(&mut runtime, &AtomicJsonStore::new(path), provider, entry)
+}
+
+pub fn clear_provider_cache(provider: ProviderId) -> Result<(), RuntimeStateStatus> {
+    let mut runtime = RUNTIME
+        .get()
+        .ok_or(RuntimeStateStatus::PathUnavailable)?
+        .lock()
+        .unwrap();
+    let path = state_path().ok_or(RuntimeStateStatus::PathUnavailable)?;
+    save_cache(&mut runtime, &AtomicJsonStore::new(path), provider, None)
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct InstallSalt([u8; ACCOUNT_KEY_BYTES]);
@@ -498,6 +729,284 @@ mod tests {
                 .starts_with("claudometer-state-test-")));
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn cache_account(byte: u8) -> AccountContext {
+        AccountContext {
+            key: AccountKey::from_digest([byte; 32]),
+            persistence: IdentityPersistence::Persistent,
+        }
+    }
+
+    fn cache_entry() -> CachedProvider {
+        let source = SourceProvenance::compatibility(ProviderId::Claude);
+        CachedProvider {
+            provider: ProviderId::Claude,
+            account: cache_account(1).key.clone(),
+            source,
+            snapshot: Some(UsageSnapshot {
+                provider: ProviderId::Claude,
+                account: cache_account(1).key,
+                source,
+                rows: vec![crate::provider::model::UsageLimit::from_adapter(
+                    "session".to_string(),
+                    LimitKind::Session,
+                    "Session".to_string(),
+                    80.0,
+                    None,
+                    Some(2000),
+                    Some(18000),
+                )
+                .unwrap()],
+                plan: Some("Synthetic".to_string()),
+                fetched_unix: 1000,
+            }),
+            retry_at_unix: Some(1200),
+        }
+    }
+
+    #[test]
+    fn cache_round_trip_matches_provider_account_and_selected_source() {
+        let raw = cache_update(&Map::new(), ProviderId::Claude, Some(cache_entry())).unwrap();
+        let encoded = serde_json::to_vec(&raw).unwrap();
+        let raw = serde_json::from_slice(&encoded).unwrap();
+        let source = SourceProvenance::compatibility(ProviderId::Claude);
+        let restored =
+            matching_cache(&raw, ProviderId::Claude, &cache_account(1), source, 1100).unwrap();
+        assert_eq!(restored.snapshot.unwrap().fetched_unix, 1000);
+        assert_eq!(restored.retry_at_unix, Some(1200));
+        assert!(
+            matching_cache(&raw, ProviderId::Claude, &cache_account(2), source, 1100).is_none()
+        );
+        assert!(matching_cache(&raw, ProviderId::Codex, &cache_account(1), source, 1100).is_none());
+        assert!(matching_cache(
+            &raw,
+            ProviderId::Claude,
+            &cache_account(1),
+            SourceProvenance {
+                id: SourceId::CodexAppServer,
+                support: SourceSupport::Documented
+            },
+            1100
+        )
+        .is_none());
+        let mut ephemeral = cache_account(1);
+        ephemeral.persistence = IdentityPersistence::MemoryOnly;
+        assert!(matching_cache(&raw, ProviderId::Claude, &ephemeral, source, 1100).is_none());
+        assert!(
+            cache_update(&raw, ProviderId::Claude, None).unwrap()["provider_cache"]["entries"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cache_age_reset_and_retry_boundaries_drop_invalid_values() {
+        let mut entry = cache_entry();
+        entry.snapshot.as_mut().unwrap().rows.push(
+            crate::provider::model::UsageLimit::from_adapter(
+                "weekly".to_string(),
+                LimitKind::Weekly,
+                "Weekly".to_string(),
+                60.0,
+                None,
+                None,
+                Some(604800),
+            )
+            .unwrap(),
+        );
+        let raw = cache_update(&Map::new(), ProviderId::Claude, Some(entry)).unwrap();
+        let load = |now| {
+            matching_cache(
+                &raw,
+                ProviderId::Claude,
+                &cache_account(1),
+                SourceProvenance::compatibility(ProviderId::Claude),
+                now,
+            )
+        };
+        assert_eq!(load(1999).unwrap().snapshot.unwrap().rows.len(), 2);
+        assert_eq!(load(2000).unwrap().snapshot.unwrap().rows.len(), 1);
+        assert!(load(999).unwrap().snapshot.is_none());
+        assert!(load(1000 + MAX_CACHE_AGE_SECONDS).is_some());
+        assert!(load(1001 + MAX_CACHE_AGE_SECONDS).is_none());
+        assert_eq!(load(1100).unwrap().retry_at_unix, Some(1200));
+        assert_eq!(load(1200).unwrap().retry_at_unix, None);
+        let mut far_future = cache_entry();
+        far_future.retry_at_unix = Some(10000);
+        let raw = cache_update(&Map::new(), ProviderId::Claude, Some(far_future)).unwrap();
+        assert!(matching_cache(
+            &raw,
+            ProviderId::Claude,
+            &cache_account(1),
+            SourceProvenance::compatibility(ProviderId::Claude),
+            1100
+        )
+        .unwrap()
+        .retry_at_unix
+        .is_none());
+    }
+
+    #[test]
+    fn malformed_cache_is_optional_and_does_not_poison_existing_state() {
+        let raw = cache_update(
+            &encode(&Map::new(), &InstallSalt([7; 32]), &[], &[]),
+            ProviderId::Claude,
+            Some(cache_entry()),
+        )
+        .unwrap();
+        let entry = raw["provider_cache"]["entries"][0].clone();
+        for mutation in 0..12 {
+            let mut broken = raw.clone();
+            match mutation {
+                0 => {
+                    broken["provider_cache"]["entries"] =
+                        serde_json::json!([entry.clone(), entry.clone(), entry.clone()])
+                }
+                1 => {
+                    broken["provider_cache"]["entries"] =
+                        serde_json::json!([entry.clone(), entry.clone()])
+                }
+                2 => {
+                    broken["provider_cache"]["entries"][0]["snapshot"]["rows"] =
+                        Value::Array(vec![entry["snapshot"]["rows"][0].clone(); 65])
+                }
+                3 => {
+                    broken["provider_cache"]["entries"][0]["snapshot"]["plan"] =
+                        Value::from("x".repeat(513))
+                }
+                4 => {
+                    broken["provider_cache"]["entries"][0]["snapshot"]["rows"][0]["percent"] =
+                        Value::from(101)
+                }
+                5 => {
+                    broken["provider_cache"]["entries"][0]["snapshot"]["rows"][0]["label"] =
+                        Value::from("x".repeat(513))
+                }
+                6 => {
+                    broken["provider_cache"]["entries"][0]["snapshot"]["fetched_unix"] =
+                        Value::from(-1)
+                }
+                7 => {
+                    broken["provider_cache"]["entries"][0]["snapshot"]["account"] =
+                        Value::from("bad")
+                }
+                8 => {
+                    broken["provider_cache"]["entries"][0]["source"]["support"] =
+                        Value::from("Documented")
+                }
+                9 => {
+                    broken["provider_cache"]["entries"][0]["snapshot"]["rows"][0]["class"] =
+                        Value::from("Spend")
+                }
+                10 => {
+                    broken["provider_cache"]["entries"][0]["snapshot"]["rows"][0]["resets_unix"] =
+                        Value::from(i64::MAX)
+                }
+                _ => {
+                    broken["provider_cache"]["entries"][0]["snapshot"]["rows"][0]
+                        ["window_seconds"] = Value::from(0)
+                }
+            }
+            assert!(decode_cache(&broken).is_empty(), "case {mutation}");
+            assert_eq!(
+                decode(broken, RuntimeStateStatus::Ready).status,
+                RuntimeStateStatus::Ready
+            );
+        }
+    }
+
+    #[test]
+    fn cache_is_additive_and_survives_old_reader_and_receipt_writes() {
+        let mut raw = encode(&Map::new(), &InstallSalt([7; 32]), &[], &[]);
+        raw.insert(
+            "future_setting".to_string(),
+            serde_json::json!({"keep":true}),
+        );
+        let encoded = cache_update(&raw, ProviderId::Claude, Some(cache_entry())).unwrap();
+        assert_eq!(encoded["schema_version"], Value::from(1));
+        let old_reader = decode(encoded.clone(), RuntimeStateStatus::Ready);
+        let old_write = encode(&old_reader.raw, &old_reader.install_salt.unwrap(), &[], &[]);
+        assert_eq!(old_write["provider_cache"], encoded["provider_cache"]);
+        assert_eq!(old_write["future_setting"], raw["future_setting"]);
+        let mut future = encoded;
+        future["provider_cache"]["version"] = Value::from(9);
+        assert!(cache_update(&future, ProviderId::Claude, None).is_err());
+    }
+
+    #[test]
+    fn cache_written_fields_exclude_unrecognized_payload_material() {
+        let mut raw = cache_update(&Map::new(), ProviderId::Claude, Some(cache_entry())).unwrap();
+        raw["provider_cache"]["entries"][0]["raw_body"] = Value::from("synthetic-private-response");
+        raw["provider_cache"]["entries"][0]["access_token"] =
+            Value::from("synthetic-private-token");
+        let entries = decode_cache(&raw);
+        let rewritten = cache_update(&raw, ProviderId::Claude, Some(entries[0].clone())).unwrap();
+        let text = serde_json::to_string(&rewritten["provider_cache"]).unwrap();
+        for private in [
+            "raw_body",
+            "access_token",
+            "synthetic-private-token",
+            "synthetic-private-response",
+        ] {
+            assert!(!text.contains(private));
+        }
+    }
+
+    #[test]
+    fn failed_cache_write_preserves_previous_disk_and_memory_generation() {
+        let directory = TestDirectory::new();
+        let path = directory.path();
+        let mut state = load_or_create(&AtomicJsonStore::new(&path), &FixedEntropy(1));
+        save_cache(
+            &mut state,
+            &AtomicJsonStore::new(&path),
+            ProviderId::Claude,
+            Some(cache_entry()),
+        )
+        .unwrap();
+        let previous = std::fs::read(&path).unwrap();
+        let raw = state.raw.clone();
+        let store = AtomicJsonStore::with_fault_injector(
+            &path,
+            OneFault(Mutex::new(Some((
+                FailurePoint::WriteTemporary,
+                io::ErrorKind::StorageFull,
+            )))),
+        );
+        assert!(save_cache(&mut state, &store, ProviderId::Claude, None).is_err());
+        assert_eq!(state.raw, raw);
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+    }
+
+    #[test]
+    fn missing_or_corrupt_cache_state_never_restores_values() {
+        let directory = TestDirectory::new();
+        let path = directory.path();
+        let mut state = load_or_create(&AtomicJsonStore::new(&path), &FixedEntropy(1));
+        save_cache(
+            &mut state,
+            &AtomicJsonStore::new(&path),
+            ProviderId::Claude,
+            Some(cache_entry()),
+        )
+        .unwrap();
+        let restarted = load_or_create(&AtomicJsonStore::new(&path), &FixedEntropy(2));
+        assert_eq!(decode_cache(&restarted.raw).len(), 1);
+        // Removing the optional store and its verified backup represents a
+        // complete cache reset; removing only primary correctly recovers backup.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(path.with_file_name("state.json.bak")).unwrap();
+        let missing = load_or_create(&AtomicJsonStore::new(&path), &FixedEntropy(2));
+        assert!(decode_cache(&missing.raw).is_empty());
+        std::fs::write(&path, b"{broken").unwrap();
+        let corrupt = load_or_create(&AtomicJsonStore::new(&path), &FixedEntropy(3));
+        assert!(decode_cache(&corrupt.raw).is_empty());
+        assert!(matches!(
+            corrupt.status,
+            RuntimeStateStatus::CorruptRecreated
+        ));
     }
 
     #[test]
