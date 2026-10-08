@@ -2,13 +2,65 @@
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Gdi::{
+    GetSysColor, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT,
+    SYS_COLOR_INDEX,
+};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::*;
+use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    SystemParametersInfoW, SPI_GETHIGHCONTRAST, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+};
 use windows::UI::ViewManagement::{UIColorType, UISettings};
 
 const PERSONALIZE: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("Claudometer");
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ContrastColors {
+    pub background: (u8, u8, u8),
+    pub text: (u8, u8, u8),
+    pub accent: (u8, u8, u8),
+    pub accent_text: (u8, u8, u8),
+}
+
+pub fn contrast_colors() -> Option<ContrastColors> {
+    unsafe {
+        let mut settings = HIGHCONTRASTW {
+            cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+            ..Default::default()
+        };
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            settings.cbSize,
+            Some(&mut settings as *mut _ as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .ok()?;
+        if settings.dwFlags.0 & HCF_HIGHCONTRASTON.0 == 0 {
+            return None;
+        }
+        let rgb = |index: SYS_COLOR_INDEX| {
+            let value = GetSysColor(index);
+            (value as u8, (value >> 8) as u8, (value >> 16) as u8)
+        };
+        Some(ContrastColors {
+            background: rgb(COLOR_WINDOW),
+            text: rgb(COLOR_WINDOWTEXT),
+            accent: rgb(COLOR_HIGHLIGHT),
+            accent_text: rgb(COLOR_HIGHLIGHTTEXT),
+        })
+    }
+}
+
+pub const DEMO_CONTRAST_COLORS: ContrastColors = ContrastColors {
+    background: (0, 0, 0),
+    text: (255, 255, 255),
+    accent: (255, 255, 0),
+    accent_text: (0, 0, 0),
+};
 
 pub fn is_dark_theme() -> bool {
     unsafe {
@@ -319,7 +371,7 @@ fn run_caps_script(dir: &std::path::Path, mode: &str) -> std::io::Result<()> {
 /// tints it. Works on borderless popups where DWMWA_SYSTEMBACKDROP_TYPE only
 /// renders its opaque fallback. ACCENT_ENABLE_ACRYLICBLURBEHIND = 4,
 /// WCA_ACCENT_POLICY = 19, tint is AABBGGRR.
-pub fn apply_acrylic(hwnd: HWND, dark: bool) {
+pub fn apply_acrylic(hwnd: HWND, dark: bool, high_contrast: bool) {
     #[repr(C)]
     struct AccentPolicy {
         state: i32,
@@ -343,7 +395,7 @@ pub fn apply_acrylic(hwnd: HWND, dark: bool) {
         let set_wca: extern "system" fn(HWND, *mut CompAttrData) -> BOOL = std::mem::transmute(f);
         let tint: u32 = if dark { 0xCC_20_20_20 } else { 0xCC_F3_F3_F3 };
         let mut policy = AccentPolicy {
-            state: 4, // ACCENT_ENABLE_ACRYLICBLURBEHIND
+            state: if high_contrast { 0 } else { 4 }, // disabled or acrylic blur
             flags: 2,
             gradient: tint,
             anim: 0,

@@ -5,12 +5,13 @@
 //! and the settings window. DWM/accent-policy draws the material behind it.
 //!
 //! Resources are cached: one RT cast, text formats built once, solid brushes
-//! rebuilt only when (theme, accent) changes. Surfaces themselves are dropped
+//! rebuilt only when theme, accent, or contrast colors change. Surfaces themselves are dropped
 //! by main.rs when their window hides — the GPU stack is the RAM cost.
 //!
 //! Visuals follow the Fluent type ramp and 4px spacing grid.
 
 use windows::core::*;
+use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
@@ -113,6 +114,7 @@ pub const INTERVALS: [(u32, &str); 4] = [(30, "30s"), (60, "1m"), (120, "2m"), (
 // ---------- flyout layout (DIP, 4px grid) ----------
 
 pub const FLYOUT_W: f32 = 328.0;
+pub const FLYOUT_MAX_H: f32 = 720.0;
 const PAD: f32 = 16.0;
 const TITLE_H: f32 = 20.0;
 const SECTION_GAP: f32 = 16.0;
@@ -133,7 +135,7 @@ const SIZE_CAPTION: f32 = 12.0;
 const BTN: f32 = 28.0; // header icon button
 
 /// Vibecode row: label + caption + toggle, on the settings-card grid.
-const VIBE_H: f32 = 44.0;
+const VIBE_H: f32 = 60.0;
 const VIBE_GAP: f32 = 12.0;
 /// Bottom of the loading/error message block (head + wrapped body).
 const MSG_H: f32 = 108.0;
@@ -169,7 +171,10 @@ pub fn vibe_row_at(top: f32) -> D2D_RECT_F {
 pub fn flyout_height(view: &View) -> f32 {
     let bottom = vibe_row(view).bottom;
     match view {
-        View::Data(_) => bottom + FOOTER_GAP_ABOVE + 1.0 + FOOTER_GAP_BELOW + CAPTION_H + PAD,
+        View::Data(data) => {
+            let footer_lines = if data.note.is_some() { 2.0 } else { 1.0 };
+            bottom + FOOTER_GAP_ABOVE + 1.0 + FOOTER_GAP_BELOW + CAPTION_H * footer_lines + PAD
+        }
         _ => bottom + PAD,
     }
 }
@@ -182,6 +187,65 @@ fn section_body_h(body: &SectionBody) -> f32 {
         }
         SectionBody::Note(_) => CAPTION_H,
     }
+}
+
+/// Text bounds and spoken labels share the flyout's layout math, so assistive
+/// clients read each displayed limit and its reset time in the right order.
+pub fn accessible_rows(view: &View) -> Vec<(D2D_RECT_F, String)> {
+    let mut rows = Vec::new();
+    let View::Data(data) = view else {
+        let label = match view {
+            View::Loading => "Loading usage".to_string(),
+            View::Error(message) => message.replace('\n', ". "),
+            View::Data(_) => unreachable!(),
+        };
+        rows.push((rect(PAD, PAD, FLYOUT_W - PAD, MSG_H), label));
+        return rows;
+    };
+    let mut y = PAD;
+    for (section_index, section) in data.sections.iter().enumerate() {
+        if section_index > 0 {
+            y += SEC_GAP + 1.0 + SEC_GAP;
+        }
+        y += TITLE_H + SECTION_GAP;
+        match &section.body {
+            SectionBody::Rows(limits) => {
+                for (index, limit) in limits.iter().enumerate() {
+                    if index > 0 {
+                        y += ROW_GAP;
+                    }
+                    let reset = if limit.reset_text.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {}", limit.reset_text)
+                    };
+                    rows.push((
+                        rect(PAD, y, FLYOUT_W - PAD, y + ROW_BLOCK),
+                        format!(
+                            "{}, {}, {:.0}% used{}",
+                            section.title, limit.label, limit.percent, reset
+                        ),
+                    ));
+                    y += ROW_BLOCK;
+                }
+            }
+            SectionBody::Note(message) => {
+                rows.push((
+                    rect(PAD, y, FLYOUT_W - PAD, y + CAPTION_H),
+                    format!("{}, {message}", section.title),
+                ));
+                y += CAPTION_H;
+            }
+        }
+    }
+    if let Some(note) = &data.note {
+        let top = vibe_row(view).bottom + FOOTER_GAP_ABOVE + 1.0 + FOOTER_GAP_BELOW;
+        rows.push((
+            rect(PAD, top, FLYOUT_W - PAD, top + 2.0 * CAPTION_H),
+            format!("Status, {note}"),
+        ));
+    }
+    rows
 }
 
 /// Header icon buttons (refresh, gear) in flyout DIP coords.
@@ -215,12 +279,12 @@ pub const CARD_QUIT: usize = 10;
 
 pub fn settings_height() -> f32 {
     let cards = N_CARDS as f32 * CARD_H + (N_CARDS as f32 - 1.0) * CARD_GAP;
-    SET_PAD + cards + 12.0 + CAPTION_H + SET_PAD
+    SET_PAD + cards + SET_PAD
 }
 
-pub fn settings_rects() -> [D2D_RECT_F; N_CARDS] {
+pub fn settings_rects(scroll: f32) -> [D2D_RECT_F; N_CARDS] {
     let mut out = [rect(0.0, 0.0, 0.0, 0.0); N_CARDS];
-    let mut y = SET_PAD;
+    let mut y = SET_PAD - scroll;
     for r in out.iter_mut() {
         *r = rect(SET_PAD, y, SET_W - SET_PAD, y + CARD_H);
         y += CARD_H + CARD_GAP;
@@ -246,7 +310,7 @@ pub fn interval_pills(card: &D2D_RECT_F) -> [D2D_RECT_F; 4] {
 // ---------- cached brushes ----------
 
 struct BrushCache {
-    key: (bool, (u8, u8, u8)),
+    key: (bool, (u8, u8, u8), Option<util::ContrastColors>),
     text: ID2D1SolidColorBrush,
     dim: ID2D1SolidColorBrush,
     track: ID2D1SolidColorBrush,
@@ -280,11 +344,13 @@ pub struct Surface {
     target_bmp: Option<ID2D1Bitmap1>,
     fmt_body: IDWriteTextFormat,
     fmt_body_sb: IDWriteTextFormat,
+    fmt_body_1: IDWriteTextFormat,
     fmt_caption: IDWriteTextFormat,
     /// Caption that must stay on one line — ellipsized instead of wrapping out
     /// of its card. `fmt_caption` wraps on purpose (footer notes rely on it).
     fmt_caption_1: IDWriteTextFormat,
     _ellipsis: IDWriteInlineObject,
+    _body_ellipsis: IDWriteInlineObject,
     fmt_glyph: IDWriteTextFormat,
     fmt_glyph_lg: IDWriteTextFormat,
     brushes: Option<BrushCache>,
@@ -370,6 +436,21 @@ impl Surface {
                 SIZE_BODY,
                 DWRITE_FONT_WEIGHT_SEMI_BOLD,
             )?;
+            let fmt_body_1 = mk(
+                w!("Segoe UI Variable Text"),
+                SIZE_BODY,
+                DWRITE_FONT_WEIGHT_NORMAL,
+            )?;
+            fmt_body_1.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            let body_ellipsis = dwrite.CreateEllipsisTrimmingSign(&fmt_body_1)?;
+            fmt_body_1.SetTrimming(
+                &DWRITE_TRIMMING {
+                    granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                    delimiter: 0,
+                    delimiterCount: 0,
+                },
+                &body_ellipsis,
+            )?;
             let fmt_caption = mk(
                 w!("Segoe UI Variable Small"),
                 SIZE_CAPTION,
@@ -390,6 +471,14 @@ impl Surface {
                 },
                 &ellipsis,
             )?;
+            fmt_caption.SetTrimming(
+                &DWRITE_TRIMMING {
+                    granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                    delimiter: 0,
+                    delimiterCount: 0,
+                },
+                &ellipsis,
+            )?;
             let fmt_glyph = mk(w!("Segoe Fluent Icons"), 13.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             let fmt_glyph_lg = mk(w!("Segoe Fluent Icons"), 16.0, DWRITE_FONT_WEIGHT_NORMAL)?;
 
@@ -403,9 +492,11 @@ impl Surface {
                 target_bmp: None,
                 fmt_body,
                 fmt_body_sb,
+                fmt_body_1,
                 fmt_caption,
                 fmt_caption_1,
                 _ellipsis: ellipsis,
+                _body_ellipsis: body_ellipsis,
                 fmt_glyph,
                 fmt_glyph_lg,
                 brushes: None,
@@ -453,12 +544,19 @@ impl Surface {
         }
     }
 
-    fn ensure_brushes(&mut self, dark: bool, accent: (u8, u8, u8)) -> Result<()> {
-        let key = (dark, accent);
+    fn ensure_brushes(
+        &mut self,
+        dark: bool,
+        accent: (u8, u8, u8),
+        contrast: Option<util::ContrastColors>,
+    ) -> Result<()> {
+        let key = (dark, accent, contrast);
         if self.brushes.as_ref().map(|b| b.key) == Some(key) {
             return Ok(());
         }
-        let p = Palette::new(dark, accent);
+        let p = Palette::new(dark, contrast);
+        let accent_rgb = contrast.map_or(accent, |colors| colors.accent);
+        let accent_text = contrast.map_or((255, 255, 255), |colors| colors.accent_text);
         let mk = |c: D2D1_COLOR_F| -> Result<ID2D1SolidColorBrush> {
             unsafe { self.rt.CreateSolidColorBrush(&c, None) }
         };
@@ -476,10 +574,10 @@ impl Surface {
             control_hover: mk(p.control_hover)?,
             control_stroke: mk(p.control_stroke)?,
             strong_stroke: mk(p.strong_stroke)?,
-            accent: mk(col_rgb(accent, 1.0))?,
+            accent: mk(col_rgb(accent_rgb, 1.0))?,
             amber: mk(col_rgb(AMBER, 1.0))?,
             red: mk(col_rgb(RED, 1.0))?,
-            white: mk(col(1.0, 1.0, 1.0, 1.0))?,
+            white: mk(col_rgb(accent_text, 1.0))?,
         });
         Ok(())
     }
@@ -491,6 +589,9 @@ impl Surface {
     /// severity → cached fill brush (accent / amber / red)
     fn sev_brush<'a>(&'a self, severity: &str, percent: f64) -> &'a ID2D1SolidColorBrush {
         let b = self.cache();
+        if b.key.2.is_some() {
+            return &b.accent;
+        }
         match util::severity_rgb(severity, percent, b.key.1) {
             AMBER => &b.amber,
             RED => &b.red,
@@ -509,6 +610,8 @@ impl Surface {
         view: &View,
         dark: bool,
         accent: (u8, u8, u8),
+        contrast: Option<util::ContrastColors>,
+        scroll: f32,
         hover: FlyHover,
         focus: i32,
         fetching: bool,
@@ -517,13 +620,22 @@ impl Surface {
         vibe_caption: &str,
     ) -> Result<()> {
         self.ensure_size(w_px.max(8), h_px.max(8), dpi)?;
-        self.ensure_brushes(dark, accent)?;
+        self.ensure_brushes(dark, accent, contrast)?;
         unsafe {
+            let background = contrast.map(|colors| col_rgb(colors.background, 1.0));
             self.dc.BeginDraw();
-            self.dc.Clear(None);
+            self.dc
+                .Clear(background.as_ref().map(|color| color as *const _));
 
             let w_dip = FLYOUT_W;
             let h_dip = h_px as f32 / (dpi / 96.0);
+            let translated = Matrix3x2 {
+                M11: 1.0,
+                M22: 1.0,
+                M32: -scroll,
+                ..Default::default()
+            };
+            self.dc.SetTransform(&translated);
             match view {
                 View::Loading => self.draw_message(w_dip, "Loading usage…", None)?,
                 View::Error(msg) => {
@@ -548,6 +660,25 @@ impl Surface {
             }
 
             self.draw_header_buttons(hover, focus, fetching, update_dot)?;
+
+            let identity = Matrix3x2 {
+                M11: 1.0,
+                M22: 1.0,
+                ..Default::default()
+            };
+            self.dc.SetTransform(&identity);
+            let content_h = flyout_height(view);
+            if content_h > h_dip {
+                let b = self.cache();
+                let track_h = h_dip - 2.0 * PAD;
+                let thumb_h = (track_h * h_dip / content_h).max(28.0);
+                let thumb_y = PAD + (track_h - thumb_h) * (scroll / (content_h - h_dip));
+                self.rounded(
+                    rect(w_dip - 5.0, thumb_y, w_dip - 2.0, thumb_y + thumb_h),
+                    1.5,
+                    &b.dim,
+                )?;
+            }
 
             // 1px flyout surface stroke inside the DWM rounded corners
             let rr = D2D1_ROUNDED_RECT {
@@ -630,7 +761,7 @@ impl Surface {
             if !sec.plan.is_empty() {
                 self.text(
                     &sec.plan,
-                    &self.fmt_caption,
+                    &self.fmt_caption_1,
                     rect(PAD, y + 2.0, plan_right, y + 2.0 + CAPTION_H),
                     &b.dim,
                     true,
@@ -648,7 +779,7 @@ impl Surface {
 
                         self.text(
                             &row.label,
-                            &self.fmt_body,
+                            &self.fmt_body_1,
                             rect(PAD, y, w - PAD - 56.0, y + LABEL_H),
                             &b.text,
                             false,
@@ -683,7 +814,7 @@ impl Surface {
                             let cap_y = bar_y + BAR_H + GAP;
                             self.text(
                                 &row.reset_text,
-                                &self.fmt_caption,
+                                &self.fmt_caption_1,
                                 rect(PAD, cap_y, w - PAD, cap_y + CAPTION_H),
                                 &b.dim,
                                 false,
@@ -695,7 +826,7 @@ impl Surface {
                 SectionBody::Note(msg) => {
                     self.text(
                         msg,
-                        &self.fmt_caption,
+                        &self.fmt_caption_1,
                         rect(PAD, y, w - PAD, y + CAPTION_H),
                         &b.dim,
                         false,
@@ -726,7 +857,12 @@ impl Surface {
         self.text(
             &footer,
             &self.fmt_caption,
-            rect(PAD, foot_y, w - PAD, foot_y + CAPTION_H),
+            rect(
+                PAD,
+                foot_y,
+                w - PAD,
+                foot_y + CAPTION_H * if d.note.is_some() { 2.0 } else { 1.0 },
+            ),
             &b.dim,
             false,
         )?;
@@ -750,7 +886,12 @@ impl Surface {
             radiusX: 3.5,
             radiusY: 3.5,
         };
-        unsafe { self.dc.DrawRoundedRectangle(&rr, &b.card_stroke, 1.0, None) };
+        let border = if hover && b.key.2.is_some() {
+            &b.accent
+        } else {
+            &b.card_stroke
+        };
+        unsafe { self.dc.DrawRoundedRectangle(&rr, border, 1.0, None) };
 
         let cy = (r.top + r.bottom) / 2.0;
         let icon_brush = if on { &b.accent } else { &b.text };
@@ -763,8 +904,8 @@ impl Surface {
         let text_left = r.left + 40.0;
         let text_right = r.right - 56.0; // clear of the 40px toggle + margin
         self.text(
-            "Vibecode wake lock",
-            &self.fmt_body,
+            "Keep computer awake",
+            &self.fmt_body_1,
             rect(text_left, r.top + 4.0, text_right, r.top + 4.0 + LABEL_H),
             &b.text,
             false,
@@ -776,7 +917,7 @@ impl Surface {
                 text_left,
                 r.top + 24.0,
                 text_right,
-                r.top + 24.0 + CAPTION_H,
+                r.top + 24.0 + 2.0 * CAPTION_H,
             ),
             &b.dim,
             false,
@@ -812,6 +953,7 @@ impl Surface {
 
     // ---------- settings ----------
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render_settings(
         &mut self,
         w_px: u32,
@@ -820,16 +962,20 @@ impl Surface {
         st: &SettingsView,
         dark: bool,
         accent: (u8, u8, u8),
+        contrast: Option<util::ContrastColors>,
+        scroll: f32,
     ) -> Result<()> {
         self.ensure_size(w_px.max(8), h_px.max(8), dpi)?;
-        self.ensure_brushes(dark, accent)?;
+        self.ensure_brushes(dark, accent, contrast)?;
         unsafe {
+            let background = contrast.map(|colors| col_rgb(colors.background, 1.0));
             self.dc.BeginDraw();
-            self.dc.Clear(None); // Mica shows through
+            self.dc
+                .Clear(background.as_ref().map(|color| color as *const _));
 
             let labels: [&str; N_CARDS] = [
                 "Claude account",
-                "Caps Lock light shows Claude status",
+                "Caps Lock status light",
                 "Start with Windows",
                 "Show Codex usage",
                 "Alert at 75% usage",
@@ -847,7 +993,7 @@ impl Surface {
                 "\u{E77B}", "\u{E765}", "\u{E7E8}", "\u{E756}", "\u{EA8F}", "\u{E895}", "\u{E7BA}",
                 "\u{E823}", "\u{E72C}", "\u{E946}", "\u{E711}",
             ];
-            let cards = settings_rects();
+            let cards = settings_rects(scroll);
             for (i, card) in cards.iter().enumerate() {
                 let b = self.cache();
                 let bg = if st.hover == i as i32 {
@@ -866,7 +1012,12 @@ impl Surface {
                     radiusX: 3.5,
                     radiusY: 3.5,
                 };
-                self.dc.DrawRoundedRectangle(&rr, &b.card_stroke, 1.0, None);
+                let border = if contrast.is_some() && st.hover == i as i32 {
+                    &b.accent
+                } else {
+                    &b.card_stroke
+                };
+                self.dc.DrawRoundedRectangle(&rr, border, 1.0, None);
 
                 let cy0 = (card.top + card.bottom) / 2.0;
                 let icon_brush = if (i == CARD_ACCOUNT && st.account_connected)
@@ -955,18 +1106,19 @@ impl Surface {
                 }
             }
 
-            let b = self.cache();
-            let foot_y = cards[N_CARDS - 1].bottom + 12.0;
-            self.text(
-                &format!(
-                    "Claudometer {} · api.anthropic.com · chatgpt.com",
-                    env!("CARGO_PKG_VERSION")
-                ),
-                &self.fmt_caption,
-                rect(SET_PAD, foot_y, SET_W - SET_PAD, foot_y + CAPTION_H),
-                &b.dim,
-                false,
-            )?;
+            let viewport_h = h_px as f32 / (dpi / 96.0);
+            if settings_height() > viewport_h {
+                let b = self.cache();
+                let track_h = viewport_h - 2.0 * SET_PAD;
+                let thumb_h = (track_h * viewport_h / settings_height()).max(32.0);
+                let max_scroll = settings_height() - viewport_h;
+                let thumb_y = SET_PAD + (track_h - thumb_h) * (scroll / max_scroll);
+                self.rounded(
+                    rect(SET_W - 7.0, thumb_y, SET_W - 4.0, thumb_y + thumb_h),
+                    1.5,
+                    &b.dim,
+                )?;
+            }
 
             self.dc.EndDraw(None, None)?;
             self.swap.Present(1, DXGI_PRESENT(0)).ok()?;
@@ -1223,7 +1375,25 @@ struct Palette {
 }
 
 impl Palette {
-    fn new(dark: bool, _accent: (u8, u8, u8)) -> Self {
+    fn new(dark: bool, contrast: Option<util::ContrastColors>) -> Self {
+        if let Some(colors) = contrast {
+            let background = col_rgb(colors.background, 1.0);
+            let text = col_rgb(colors.text, 1.0);
+            return Self {
+                text,
+                dim: text,
+                track: text,
+                divider: text,
+                stroke: text,
+                card_bg: background,
+                card_hover: background,
+                card_stroke: text,
+                control_fill: background,
+                control_hover: background,
+                control_stroke: text,
+                strong_stroke: text,
+            };
+        }
         if dark {
             Self {
                 text: col(1.0, 1.0, 1.0, 1.0),

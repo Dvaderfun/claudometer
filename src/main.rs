@@ -4,6 +4,7 @@
 #![windows_subsystem = "windows"]
 #![allow(clippy::missing_safety_doc)]
 
+mod accessibility;
 mod alerts;
 mod api;
 mod auth;
@@ -39,8 +40,8 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_LEFT, VK_RETURN,
-    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB,
+    GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_END, VK_ESCAPE, VK_HOME,
+    VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB,
 };
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -196,7 +197,9 @@ struct Ui {
     fly_hover: gfx::FlyHover,
     set_hover: i32,
     fly_focus: i32, // keyboard focus: -1 none, 0 refresh, 1 gear, 2 vibecode
+    fly_scroll: f32,
     set_focus: i32, // keyboard focus card index, -1 none
+    set_scroll: f32,
     fly_tracking: bool,
     set_tracking: bool,
     /// top of the Vibecode row in flyout DIP coords — cached at render time so
@@ -215,7 +218,9 @@ thread_local! {
             fly_hover: gfx::FlyHover::None,
             set_hover: -1,
             fly_focus: -1,
+            fly_scroll: 0.0,
             set_focus: -1,
+            set_scroll: 0.0,
             fly_tracking: false,
             set_tracking: false,
             fly_vibe_top: 0.0,
@@ -377,7 +382,11 @@ fn main() -> Result<()> {
         if let Some(state) = demo::active() {
             signal_demo_ready(state);
             if !state.hidden {
-                show_demo_flyout(flyout, state);
+                if state.scenario == demo::Scenario::Settings {
+                    open_settings();
+                } else {
+                    show_demo_flyout(flyout, state);
+                }
             }
         } else {
             updater::complete_startup(update_startup.expect("non-demo startup guard"))
@@ -517,21 +526,13 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 // React only to theme/accent broadcasts — wallpaper changes and
                 // random SPI updates also land here and are noise.
                 if !demo::is_active() && setting_change_is_theme(lparam) {
-                    update_tray(hwnd);
-                    apply_flyout_theme(flyout_hwnd());
-                    if IsWindowVisible(flyout_hwnd()).as_bool() {
-                        show_flyout(
-                            ANCHOR_X.load(Ordering::SeqCst),
-                            ANCHOR_Y.load(Ordering::SeqCst),
-                        );
-                    }
-                    let sh = settings_hwnd();
-                    if !sh.is_invalid() {
-                        apply_settings_theme(sh);
-                        if IsWindowVisible(sh).as_bool() {
-                            render_settings(sh);
-                        }
-                    }
+                    refresh_theme(hwnd);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_SYSCOLORCHANGE => {
+                if !demo::is_active() {
+                    refresh_theme(hwnd);
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
@@ -583,6 +584,33 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_GETOBJECT => {
+                accessibility::get_object(hwnd, wparam, lparam, accessibility::WindowKind::Flyout)
+            }
+            accessibility::WM_UIA_QUERY => match wparam.0 {
+                accessibility::QUERY_FOCUS => LRESULT(UI.with(|ui| ui.borrow().fly_focus) as isize),
+                accessibility::QUERY_SCROLL => {
+                    LRESULT(UI.with(|ui| ui.borrow().fly_scroll.to_bits()) as isize)
+                }
+                _ => LRESULT(0),
+            },
+            accessibility::WM_UIA_FOCUS => {
+                if wparam.0 < FLY_FOCUS_N as usize {
+                    UI.with(|ui| ui.borrow_mut().fly_focus = wparam.0 as i32);
+                    scroll_flyout_focus_into_view(hwnd);
+                    let _ = SetForegroundWindow(hwnd);
+                    let _ = SetFocus(hwnd);
+                    render_flyout_current();
+                    accessibility::focus_changed(hwnd, accessibility::WindowKind::Flyout, wparam.0);
+                }
+                LRESULT(0)
+            }
+            accessibility::WM_UIA_INVOKE => {
+                if wparam.0 < FLY_FOCUS_N as usize {
+                    activate_flyout_control(wparam.0 as i32);
+                }
+                LRESULT(0)
+            }
             WM_ACTIVATE => {
                 if !demo::is_active() && (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
                     hide_flyout();
@@ -614,23 +642,28 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             (ui.fly_focus + 1) % FLY_FOCUS_N
                         };
                     });
+                    scroll_flyout_focus_into_view(hwnd);
+                    let _ = SetFocus(hwnd);
                     render_flyout_current();
-                } else if vk == VK_RETURN.0 || vk == VK_SPACE.0 {
-                    match UI.with(|ui| ui.borrow().fly_focus) {
-                        0 => {
-                            spawn_fetch_all(RefreshTrigger::Manual);
-                            render_flyout_current();
-                        }
-                        1 => {
-                            hide_flyout();
-                            open_settings();
-                        }
-                        2 => {
-                            vibecode::set(!vibecode::is_on());
-                            render_flyout_current();
-                        }
-                        _ => {}
+                    let focus = UI.with(|ui| ui.borrow().fly_focus);
+                    if focus >= 0 {
+                        accessibility::focus_changed(
+                            hwnd,
+                            accessibility::WindowKind::Flyout,
+                            focus as usize,
+                        );
                     }
+                } else if vk == VK_RETURN.0 || vk == VK_SPACE.0 {
+                    activate_flyout_control(UI.with(|ui| ui.borrow().fly_focus));
+                } else if vk == VK_PRIOR.0 || vk == VK_NEXT.0 {
+                    let direction = if vk == VK_PRIOR.0 { -1.0 } else { 1.0 };
+                    scroll_flyout_by(hwnd, direction * flyout_viewport_height(hwnd) * 0.8);
+                } else if vk == VK_HOME.0 || vk == VK_END.0 {
+                    let limit = flyout_scroll_limit(hwnd);
+                    UI.with(|ui| {
+                        ui.borrow_mut().fly_scroll = if vk == VK_HOME.0 { 0.0 } else { limit }
+                    });
+                    render_flyout_current();
                 }
                 LRESULT(0)
             }
@@ -667,21 +700,18 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_LBUTTONUP => {
                 let (x, y) = mouse_dip(hwnd, lparam);
-                match fly_hit(x, y) {
-                    gfx::FlyHover::Refresh => {
-                        spawn_fetch_all(RefreshTrigger::Manual);
-                        render_flyout_current(); // spinner starts immediately
-                    }
-                    gfx::FlyHover::Gear => {
-                        hide_flyout();
-                        open_settings();
-                    }
-                    gfx::FlyHover::Vibe => {
-                        vibecode::set(!vibecode::is_on());
-                        render_flyout_current();
-                    }
-                    gfx::FlyHover::None => {}
-                }
+                let control = match fly_hit(x, y) {
+                    gfx::FlyHover::Refresh => 0,
+                    gfx::FlyHover::Gear => 1,
+                    gfx::FlyHover::Vibe => 2,
+                    gfx::FlyHover::None => -1,
+                };
+                activate_flyout_control(control);
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((wparam.0 >> 16) as u16 as i16) as f32 / 120.0;
+                scroll_flyout_by(hwnd, -delta * 48.0);
                 LRESULT(0)
             }
             WM_PAINT => {
@@ -701,6 +731,37 @@ extern "system" fn settings_wndproc(
 ) -> LRESULT {
     unsafe {
         match msg {
+            WM_GETOBJECT => {
+                accessibility::get_object(hwnd, wparam, lparam, accessibility::WindowKind::Settings)
+            }
+            accessibility::WM_UIA_QUERY => match wparam.0 {
+                accessibility::QUERY_FOCUS => LRESULT(UI.with(|ui| ui.borrow().set_focus) as isize),
+                accessibility::QUERY_SCROLL => {
+                    LRESULT(UI.with(|ui| ui.borrow().set_scroll.to_bits()) as isize)
+                }
+                _ => LRESULT(0),
+            },
+            accessibility::WM_UIA_FOCUS => {
+                if wparam.0 < gfx::N_CARDS {
+                    UI.with(|ui| ui.borrow_mut().set_focus = wparam.0 as i32);
+                    scroll_settings_focus_into_view(hwnd);
+                    let _ = SetForegroundWindow(hwnd);
+                    let _ = SetFocus(hwnd);
+                    render_settings(hwnd);
+                    accessibility::focus_changed(
+                        hwnd,
+                        accessibility::WindowKind::Settings,
+                        wparam.0,
+                    );
+                }
+                LRESULT(0)
+            }
+            accessibility::WM_UIA_INVOKE => {
+                if wparam.0 < gfx::N_CARDS {
+                    activate_settings_card(hwnd, wparam.0);
+                }
+                LRESULT(0)
+            }
             WM_MOUSEMOVE => {
                 let (x, y) = mouse_dip(hwnd, lparam);
                 let hover = settings_hit(x, y);
@@ -737,10 +798,20 @@ extern "system" fn settings_wndproc(
                 let hit = settings_hit(x, y);
                 if hit >= 0 {
                     UI.with(|ui| ui.borrow_mut().set_focus = hit); // focus follows click
+                    accessibility::focus_changed(
+                        hwnd,
+                        accessibility::WindowKind::Settings,
+                        hit as usize,
+                    );
+                }
+                if demo::is_active() {
+                    render_settings(hwnd);
+                    return LRESULT(0);
                 }
                 if hit == gfx::CARD_INTERVAL as i32 {
                     // pill click selects the interval directly
-                    let cards = gfx::settings_rects();
+                    let scroll = UI.with(|ui| ui.borrow().set_scroll);
+                    let cards = gfx::settings_rects(scroll);
                     let pills = gfx::interval_pills(&cards[gfx::CARD_INTERVAL]);
                     if let Some(i) = pills.iter().position(|r| contains(r, x, y)) {
                         apply_interval(gfx::INTERVALS[i].0);
@@ -751,10 +822,20 @@ extern "system" fn settings_wndproc(
                 }
                 LRESULT(0)
             }
+            WM_MOUSEWHEEL => {
+                let delta = ((wparam.0 >> 16) as u16 as i16) as f32 / 120.0;
+                scroll_settings_by(hwnd, -delta * 48.0);
+                LRESULT(0)
+            }
             WM_KEYDOWN => {
                 let vk = wparam.0 as u16;
                 if vk == VK_ESCAPE.0 {
-                    hide_settings(hwnd);
+                    if demo::is_active() {
+                        let owner = HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _);
+                        let _ = DestroyWindow(owner);
+                    } else {
+                        hide_settings(hwnd);
+                    }
                 } else if vk == VK_TAB.0 {
                     let back = GetKeyState(VK_SHIFT.0 as i32) < 0;
                     UI.with(|ui| {
@@ -772,9 +853,32 @@ extern "system" fn settings_wndproc(
                             (ui.set_focus + 1) % n
                         };
                     });
+                    let _ = SetFocus(hwnd);
+                    scroll_settings_focus_into_view(hwnd);
+                    render_settings(hwnd);
+                    let focus = UI.with(|ui| ui.borrow().set_focus);
+                    if focus >= 0 {
+                        accessibility::focus_changed(
+                            hwnd,
+                            accessibility::WindowKind::Settings,
+                            focus as usize,
+                        );
+                    }
+                } else if vk == VK_PRIOR.0 || vk == VK_NEXT.0 {
+                    let direction = if vk == VK_PRIOR.0 { -1.0 } else { 1.0 };
+                    scroll_settings_by(hwnd, direction * settings_viewport_height(hwnd) * 0.8);
+                } else if vk == VK_HOME.0 || vk == VK_END.0 {
+                    let limit = settings_scroll_limit(hwnd);
+                    UI.with(|ui| {
+                        let mut ui = ui.borrow_mut();
+                        ui.set_scroll = if vk == VK_HOME.0 { 0.0 } else { limit };
+                        ui.set_hover = -1;
+                    });
                     render_settings(hwnd);
                 } else if vk == VK_LEFT.0 || vk == VK_RIGHT.0 {
-                    if UI.with(|ui| ui.borrow().set_focus) == gfx::CARD_INTERVAL as i32 {
+                    if !demo::is_active()
+                        && UI.with(|ui| ui.borrow().set_focus) == gfx::CARD_INTERVAL as i32
+                    {
                         let dir = if vk == VK_LEFT.0 { -1 } else { 1 };
                         step_interval(dir);
                         render_settings(hwnd);
@@ -788,7 +892,12 @@ extern "system" fn settings_wndproc(
                 LRESULT(0)
             }
             WM_CLOSE => {
-                hide_settings(hwnd);
+                if demo::is_active() {
+                    let owner = HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _);
+                    let _ = DestroyWindow(owner);
+                } else {
+                    hide_settings(hwnd);
+                }
                 LRESULT(0)
             }
             WM_DPICHANGED => {
@@ -802,7 +911,15 @@ extern "system" fn settings_wndproc(
                     rc.bottom - rc.top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
+                clamp_settings_scroll(hwnd);
                 render_settings(hwnd);
+                LRESULT(0)
+            }
+            WM_SIZE => {
+                if settings_hwnd() == hwnd {
+                    clamp_settings_scroll(hwnd);
+                    render_settings(hwnd);
+                }
                 LRESULT(0)
             }
             WM_PAINT => {
@@ -811,6 +928,24 @@ extern "system" fn settings_wndproc(
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+unsafe fn activate_flyout_control(index: i32) {
+    match index {
+        0 => {
+            spawn_fetch_all(RefreshTrigger::Manual);
+            render_flyout_current();
+        }
+        1 => {
+            hide_flyout();
+            open_settings();
+        }
+        2 => {
+            vibecode::set(!vibecode::is_on());
+            render_flyout_current();
+        }
+        _ => {}
     }
 }
 
@@ -826,7 +961,32 @@ unsafe fn setting_change_is_theme(lparam: LPARAM) -> bool {
         len += 1;
     }
     let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
-    s == "ImmersiveColorSet"
+    s == "ImmersiveColorSet" || s == "HighContrast"
+}
+
+fn ui_contrast() -> Option<util::ContrastColors> {
+    match demo::active() {
+        Some(state) => state.contrast.then_some(util::DEMO_CONTRAST_COLORS),
+        None => util::contrast_colors(),
+    }
+}
+
+unsafe fn refresh_theme(owner: HWND) {
+    update_tray(owner);
+    apply_flyout_theme(flyout_hwnd());
+    if IsWindowVisible(flyout_hwnd()).as_bool() {
+        show_flyout(
+            ANCHOR_X.load(Ordering::SeqCst),
+            ANCHOR_Y.load(Ordering::SeqCst),
+        );
+    }
+    let settings = settings_hwnd();
+    if !settings.is_invalid() {
+        apply_settings_theme(settings);
+        if IsWindowVisible(settings).as_bool() {
+            render_settings(settings);
+        }
+    }
 }
 
 /// Hide the flyout AND drop its whole D3D/D2D/DComp stack — the GPU runtime
@@ -867,6 +1027,9 @@ unsafe fn step_interval(dir: i32) {
 }
 
 unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
+    if demo::is_active() {
+        return;
+    }
     match i {
         gfx::CARD_ACCOUNT => activate_claude_account(),
         gfx::CARD_CAPS => match util::caps_led_state() {
@@ -984,6 +1147,8 @@ fn contains(r: &windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F, x: f32, 
 }
 
 fn fly_hit(x: f32, y: f32) -> gfx::FlyHover {
+    let scroll = UI.with(|ui| ui.borrow().fly_scroll);
+    let y = y + scroll;
     let (refresh, gear) = gfx::fly_btns();
     if contains(&refresh, x, y) {
         gfx::FlyHover::Refresh
@@ -1000,13 +1165,109 @@ fn fly_hit(x: f32, y: f32) -> gfx::FlyHover {
     }
 }
 
+unsafe fn flyout_viewport_height(hwnd: HWND) -> f32 {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let dpi = GetDpiForWindow(hwnd).max(96) as f32;
+    (rc.bottom - rc.top) as f32 / (dpi / 96.0)
+}
+
+unsafe fn flyout_scroll_limit(hwnd: HWND) -> f32 {
+    let view = demo::active()
+        .map(|state| state.view.clone())
+        .unwrap_or_else(current_view);
+    (gfx::flyout_height(&view) - flyout_viewport_height(hwnd)).max(0.0)
+}
+
+unsafe fn scroll_flyout_by(hwnd: HWND, delta: f32) {
+    let limit = flyout_scroll_limit(hwnd);
+    UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        ui.fly_scroll = (ui.fly_scroll + delta).clamp(0.0, limit);
+        ui.fly_hover = gfx::FlyHover::None;
+    });
+    render_flyout_current();
+}
+
+unsafe fn scroll_flyout_focus_into_view(hwnd: HWND) {
+    let viewport = flyout_viewport_height(hwnd);
+    let limit = flyout_scroll_limit(hwnd);
+    let (refresh, settings) = gfx::fly_btns();
+    let view = demo::active()
+        .map(|state| state.view.clone())
+        .unwrap_or_else(current_view);
+    UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        let rect = match ui.fly_focus {
+            0 => refresh,
+            1 => settings,
+            2 => gfx::vibe_row(&view),
+            _ => return,
+        };
+        if rect.top < ui.fly_scroll + 8.0 {
+            ui.fly_scroll = rect.top - 8.0;
+        } else if rect.bottom > ui.fly_scroll + viewport - 8.0 {
+            ui.fly_scroll = rect.bottom - viewport + 8.0;
+        }
+        ui.fly_scroll = ui.fly_scroll.clamp(0.0, limit);
+    });
+}
+
 fn settings_hit(x: f32, y: f32) -> i32 {
-    for (i, card) in gfx::settings_rects().iter().enumerate() {
+    let scroll = UI.with(|ui| ui.borrow().set_scroll);
+    for (i, card) in gfx::settings_rects(scroll).iter().enumerate() {
         if contains(card, x, y) {
             return i as i32;
         }
     }
     -1
+}
+
+unsafe fn settings_viewport_height(hwnd: HWND) -> f32 {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let dpi = GetDpiForWindow(hwnd).max(96) as f32;
+    (rc.bottom - rc.top) as f32 / (dpi / 96.0)
+}
+
+unsafe fn settings_scroll_limit(hwnd: HWND) -> f32 {
+    (gfx::settings_height() - settings_viewport_height(hwnd)).max(0.0)
+}
+
+unsafe fn clamp_settings_scroll(hwnd: HWND) {
+    let limit = settings_scroll_limit(hwnd);
+    UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        ui.set_scroll = ui.set_scroll.clamp(0.0, limit);
+    });
+}
+
+unsafe fn scroll_settings_by(hwnd: HWND, delta: f32) {
+    let limit = settings_scroll_limit(hwnd);
+    UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        ui.set_scroll = (ui.set_scroll + delta).clamp(0.0, limit);
+        ui.set_hover = -1;
+    });
+    render_settings(hwnd);
+}
+
+unsafe fn scroll_settings_focus_into_view(hwnd: HWND) {
+    let viewport = settings_viewport_height(hwnd);
+    let limit = settings_scroll_limit(hwnd);
+    UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        if ui.set_focus < 0 {
+            return;
+        }
+        let card = gfx::settings_rects(0.0)[ui.set_focus as usize];
+        if card.top < ui.set_scroll + 8.0 {
+            ui.set_scroll = card.top - 8.0;
+        } else if card.bottom > ui.set_scroll + viewport - 8.0 {
+            ui.set_scroll = card.bottom - viewport + 8.0;
+        }
+        ui.set_scroll = ui.set_scroll.clamp(0.0, limit);
+    });
 }
 
 unsafe fn track_leave(hwnd: HWND) {
@@ -1031,15 +1292,16 @@ unsafe fn style_flyout(h: HWND) {
     );
     // DWMSBT_TRANSIENTWINDOW only renders its opaque fallback on this
     // borderless DComp popup — accent-policy acrylic instead (util).
-    if demo::is_active() {
-        let dark_bool = BOOL(1);
+    if let Some(state) = demo::active() {
+        let dark = !state.light;
+        let dark_bool = BOOL(if dark { 1 } else { 0 });
         let _ = DwmSetWindowAttribute(
             h,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
             &dark_bool as *const _ as *const _,
             std::mem::size_of::<BOOL>() as u32,
         );
-        util::apply_acrylic(h, true);
+        util::apply_acrylic(h, dark, state.contrast);
     } else {
         apply_flyout_theme(h);
     }
@@ -1054,7 +1316,7 @@ unsafe fn apply_flyout_theme(h: HWND) {
         &dark_bool as *const _ as *const _,
         std::mem::size_of::<BOOL>() as u32,
     );
-    util::apply_acrylic(h, dark);
+    util::apply_acrylic(h, dark, ui_contrast().is_some());
 }
 
 /// Last good snapshot survives transient errors (429, network blips):
@@ -1225,10 +1487,15 @@ unsafe fn show_flyout(cx: i32, cy: i32) {
     }
     ANCHOR_X.store(cx, Ordering::SeqCst);
     ANCHOR_Y.store(cy, Ordering::SeqCst);
+    let fh = flyout_hwnd();
+    let was_visible = IsWindowVisible(fh).as_bool();
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
         ui.fly_hover = gfx::FlyHover::None;
-        ui.fly_focus = -1;
+        if !was_visible {
+            ui.fly_focus = -1;
+            ui.fly_scroll = 0.0;
+        }
     });
 
     spawn_fetch(ProviderId::Claude, RefreshTrigger::Flyout);
@@ -1236,7 +1503,6 @@ unsafe fn show_flyout(cx: i32, cy: i32) {
         spawn_fetch(ProviderId::Codex, RefreshTrigger::Flyout);
     }
 
-    let fh = flyout_hwnd();
     let view = current_view();
 
     let pt = POINT { x: cx, y: cy };
@@ -1255,9 +1521,16 @@ unsafe fn show_flyout(cx: i32, cy: i32) {
     let work = mi.rcWork;
 
     let w_px = (gfx::FLYOUT_W * scale).round() as i32;
-    let h_px = (gfx::flyout_height(&view) * scale).round() as i32;
-
     let margin = (12.0 * scale).round() as i32;
+    let h_px = (gfx::flyout_height(&view) * scale)
+        .round()
+        .min((gfx::FLYOUT_MAX_H * scale).round())
+        .min((work.bottom - work.top - 2 * margin).max(1) as f32) as i32;
+    let max_scroll = (gfx::flyout_height(&view) - h_px as f32 / scale).max(0.0);
+    UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        ui.fly_scroll = ui.fly_scroll.clamp(0.0, max_scroll);
+    });
     let x = (cx - w_px / 2)
         .max(work.left + margin)
         .min(work.right - w_px - margin);
@@ -1285,6 +1558,7 @@ unsafe fn show_demo_flyout(fh: HWND, state: &demo::State) {
         let mut ui = ui.borrow_mut();
         ui.fly_hover = gfx::FlyHover::None;
         ui.fly_focus = -1;
+        ui.fly_scroll = 0.0;
     });
 
     let monitor = MonitorFromWindow(fh, MONITOR_DEFAULTTONEAREST);
@@ -1299,7 +1573,11 @@ unsafe fn show_demo_flyout(fh: HWND, state: &demo::State) {
     };
     let _ = GetMonitorInfoW(monitor, &mut info);
     let width = (gfx::FLYOUT_W * scale).round() as i32;
-    let height = (gfx::flyout_height(&state.view) * scale).round() as i32;
+    let height = (gfx::flyout_height(&state.view) * scale)
+        .round()
+        .min((gfx::FLYOUT_MAX_H * scale).round())
+        .min((info.rcWork.bottom - info.rcWork.top - (24.0 * scale).round() as i32).max(1) as f32)
+        as i32;
     let x = info.rcWork.left + (info.rcWork.right - info.rcWork.left - width) / 2;
     let y = info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - height) / 2;
 
@@ -1329,14 +1607,17 @@ unsafe fn render_demo_flyout(fh: HWND, state: &demo::State, width: u32, height: 
         ui.fly_vibe_top = gfx::vibe_row(&state.view).top;
         let hover = ui.fly_hover;
         let focus = ui.fly_focus;
+        let scroll = ui.fly_scroll;
         if let Some(surface) = ui.fly.as_mut() {
             let _ = surface.render_flyout(
                 width,
                 height,
                 dpi,
                 &state.view,
-                true,
+                !state.light,
                 (96, 159, 255),
+                ui_contrast(),
+                scroll,
                 hover,
                 focus,
                 state.fetching,
@@ -1351,6 +1632,7 @@ unsafe fn render_demo_flyout(fh: HWND, state: &demo::State, width: u32, height: 
 unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f32) {
     let dark = util::is_dark_theme();
     let accent = util::accent_rgb();
+    let contrast = ui_contrast();
     let fetching = any_fetching();
     let vibe_on = vibecode::is_on();
     UI.with(|ui| {
@@ -1361,6 +1643,7 @@ unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f
         ui.fly_vibe_top = gfx::vibe_row(view).top; // hit-test cache
         let hover = ui.fly_hover;
         let focus = ui.fly_focus;
+        let scroll = ui.fly_scroll;
         if let Some(fx) = ui.fly.as_mut() {
             let _ = fx.render_flyout(
                 w_px,
@@ -1369,6 +1652,8 @@ unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f
                 view,
                 dark,
                 accent,
+                contrast,
+                scroll,
                 hover,
                 focus,
                 fetching,
@@ -1412,11 +1697,15 @@ unsafe fn render_flyout_current() {
 // ---------- settings window ----------
 
 unsafe fn open_settings() {
-    if demo::is_active() {
+    if demo::active().is_some_and(|state| state.scenario != demo::Scenario::Settings) {
         return;
     }
-    UI.with(|ui| ui.borrow_mut().set_focus = -1);
-    if auth::snapshot().connection.is_none() {
+    UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        ui.set_focus = -1;
+        ui.set_scroll = 0.0;
+    });
+    if !demo::is_active() && auth::snapshot().connection.is_none() {
         spawn_claude_account(false);
     }
     let existing = settings_hwnd();
@@ -1456,6 +1745,8 @@ unsafe fn open_settings() {
         ..Default::default()
     };
     let _ = GetMonitorInfoW(hmon, &mut mi);
+    let margin = (16.0 * scale).round() as i32;
+    let h = h.min((mi.rcWork.bottom - mi.rcWork.top - 2 * margin).max(1));
     let x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2;
     let y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - h) / 2;
 
@@ -1484,22 +1775,33 @@ unsafe fn open_settings() {
 }
 
 unsafe fn apply_settings_theme(h: HWND) {
+    let contrast = ui_contrast().is_some();
     // Mica over the whole window ("sheet of glass" + main-window backdrop)
     let margins = MARGINS {
-        cxLeftWidth: -1,
-        cxRightWidth: -1,
-        cyTopHeight: -1,
-        cyBottomHeight: -1,
+        cxLeftWidth: if contrast { 0 } else { -1 },
+        cxRightWidth: if contrast { 0 } else { -1 },
+        cyTopHeight: if contrast { 0 } else { -1 },
+        cyBottomHeight: if contrast { 0 } else { -1 },
     };
     let _ = DwmExtendFrameIntoClientArea(h, &margins);
-    let backdrop = DWMSBT_MAINWINDOW;
+    let backdrop = if contrast {
+        DWMSBT_NONE
+    } else {
+        DWMSBT_MAINWINDOW
+    };
     let _ = DwmSetWindowAttribute(
         h,
         DWMWA_SYSTEMBACKDROP_TYPE,
         &backdrop as *const _ as *const _,
         std::mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
     );
-    let dark = BOOL(if util::is_dark_theme() { 1 } else { 0 });
+    let dark = BOOL(
+        if demo::active().map_or_else(util::is_dark_theme, |state| !state.light) {
+            1
+        } else {
+            0
+        },
+    );
     let _ = DwmSetWindowAttribute(
         h,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -1515,8 +1817,32 @@ unsafe fn render_settings(hwnd: HWND) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
     let dpi = GetDpiForWindow(hwnd) as f32;
+    if demo::is_active() {
+        UI.with(|ui| {
+            let mut ui = ui.borrow_mut();
+            if ui.set.is_none() {
+                ui.set = gfx::Surface::new(hwnd).ok();
+            }
+            let st = demo::settings_view(ui.set_hover, ui.set_focus);
+            let scroll = ui.set_scroll;
+            if let Some(surface) = ui.set.as_mut() {
+                let _ = surface.render_settings(
+                    (rc.right - rc.left) as u32,
+                    (rc.bottom - rc.top) as u32,
+                    dpi,
+                    &st,
+                    !demo::active().is_some_and(|state| state.light),
+                    (96, 159, 255),
+                    ui_contrast(),
+                    scroll,
+                );
+            }
+        });
+        return;
+    }
     let dark = util::is_dark_theme();
     let accent = util::accent_rgb();
+    let contrast = ui_contrast();
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
         if ui.set.is_none() {
@@ -1546,17 +1872,17 @@ unsafe fn render_settings(hwnd: HWND) {
         let (lid_label, lid_caption, lid_action) = match vibecode::persistent_status() {
             vibecode::PersistentStatus::LegacyRecoveryPending => (
                 "Advanced · restore legacy lid values",
-                "Applies saved AC/DC values to this scheme",
+                "Saved values ready to restore",
                 Some("Restore"),
             ),
             vibecode::PersistentStatus::RecoveryRequired => (
                 "Advanced · lid recovery required",
-                "New overrides blocked until recovery succeeds",
+                "Restore previous settings to continue",
                 Some("Recover"),
             ),
             vibecode::PersistentStatus::Error => (
                 "Advanced · lid override unavailable",
-                "No persistent change is reported active",
+                "No lid override is active",
                 Some(if vibecode::persistent_preference_enabled() {
                     "Disable"
                 } else {
@@ -1565,12 +1891,12 @@ unsafe fn render_settings(hwnd: HWND) {
             ),
             vibecode::PersistentStatus::Applied => (
                 "Advanced · ignore lid close",
-                "Applied and verified · restores on exit",
+                "Active · restores on exit",
                 None,
             ),
             vibecode::PersistentStatus::Disabled => (
                 "Advanced · ignore lid close",
-                "Changes active power scheme · journaled",
+                "Restores on exit when enabled",
                 None,
             ),
         };
@@ -1637,6 +1963,7 @@ unsafe fn render_settings(hwnd: HWND) {
             hover: ui.set_hover,
             focus: ui.set_focus,
         };
+        let scroll = ui.set_scroll;
         if let Some(sx) = ui.set.as_mut() {
             let _ = sx.render_settings(
                 (rc.right - rc.left) as u32,
@@ -1645,6 +1972,8 @@ unsafe fn render_settings(hwnd: HWND) {
                 &st,
                 dark,
                 accent,
+                contrast,
+                scroll,
             );
         }
     });
