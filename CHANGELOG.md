@@ -12,6 +12,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 - Vibecode keeps its wake lock separate from the Advanced lid-close override. Power changes use a durable recovery journal, checked writes/read-back, and conservative restoration of the recorded scheme. Legacy lid values require an explicit Restore action.
 
 ### Changed
+- Provider state and result acceptance move onto the UI thread. Short-lived polling workers wait for an identity-bound request ticket; obsolete preparation/results cannot trigger requests, alerts, or redraws. The ten demo scenarios preserve identical rendering.
 - Introduce a pure provider state reducer with clock-driven transitions, account/generation/request checks, cached and outdated view states, and explicit accepted-fetch/cooldown outcomes. Runtime ownership moves in the next APP-01 slice; current display behavior and provider requests are preserved.
 - Optimize release builds for size with `opt-level = "z"`: the local provisioned x64 executable shrinks by 74,240 bytes and ARM64 by 88,576 bytes. The size audit records startup measurements and milestone allowances; dependency features and runtime behavior are preserved.
 - Shared usage snapshots carry provider/account/source identities and typed quota kinds, classes, percentages, severity hints, and window durations. Reset timestamps are formatted in the view layer; alerts and tray classification no longer depend on kind strings. Missing Codex duration remains unknown in the model while preserving its existing caption.

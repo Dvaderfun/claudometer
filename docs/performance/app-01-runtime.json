@@ -1,0 +1,65 @@
+{
+  "measured_at_utc": "2026-10-08T21:39:37.1923722Z",
+  "executable": "claudometer-final-provisioned.exe",
+  "executable_bytes": 1074688,
+  "reference_machine": {
+    "os_caption": "Microsoft Windows 11 Pro Insider Preview",
+    "os_version": "10.0.28020",
+    "os_build": "28020",
+    "os_architecture": "64-bit",
+    "manufacturer": "Microsoft Corporation",
+    "model": "Surface Laptop Studio",
+    "logical_processors": 8,
+    "physical_memory_bytes": 34163216384,
+    "processor": "11th Gen Intel(R) Core(TM) i7-11370H @ 3.30GHz"
+  },
+  "method": {
+    "mode": "--demo=both (isolated empty profile; no refresh workers)",
+    "cold_start_runs": 10,
+    "readiness": "nonce-bound kernel event signaled immediately after Shell_NotifyIcon(NIM_ADD) returns",
+    "warmup_seconds": 60,
+    "sample_seconds": 600,
+    "sample_interval_seconds": 5,
+    "percentile": "nearest-rank"
+  },
+  "startup_ms": {
+    "samples": [
+      80.4543,
+      40.4233,
+      38.9734,
+      33.3888,
+      36.7329,
+      36.0387,
+      44.456,
+      32.0643,
+      38.0617,
+      38.8966
+    ],
+    "median": 38.062,
+    "p95": 80.454
+  },
+  "hidden": {
+    "sample_count": 104,
+    "private_working_set_bytes_median": 1634304,
+    "private_working_set_bytes_p95": 1687552,
+    "private_working_set_bytes_max": 1687552,
+    "gdi_handles_p95": 10,
+    "gdi_handles_max": 10,
+    "user_handles_p95": 7,
+    "user_handles_max": 7,
+    "idle_cpu_percent": 0.0,
+    "active_tcp_connections_max": 0
+  },
+  "visible_two_provider": {
+    "sample_count": 104,
+    "private_working_set_bytes_median": 4595712,
+    "private_working_set_bytes_p95": 4976640,
+    "private_working_set_bytes_max": 5099520,
+    "gdi_handles_p95": 13,
+    "gdi_handles_max": 13,
+    "user_handles_p95": 18,
+    "user_handles_max": 21,
+    "idle_cpu_percent": 0.0045,
+    "active_tcp_connections_max": 0
+  }
+}

@@ -51,7 +51,7 @@ SIZE-01 selects release `opt-level = "z"`: current x64 **947,712 bytes unprovisi
 - `fmt_caption` word-wraps on purpose (footer notes rely on it). Single-line captions inside fixed-height cards must use `fmt_caption_1` (NO_WRAP + ellipsis trimming) or they overflow their card.
 - Fluent tokens hand-translated in `gfx.rs::Palette` — 4px spacing grid, Body 14 / Caption 12, colors documented next to values. New UI goes through `BrushCache`/cached formats, no per-draw allocations.
 - Every user-visible action needs a keyboard path (Tab/Space/Enter/arrows) + focus ring. The committed UIA tree passes local Invoke/Toggle client checks; Narrator speech and the remaining A11Y-01 patterns/events are unverified or incomplete — don't claim screen-reader support.
-- All fetch-state statics live in `main.rs` top; UI-thread-only state in the `UI` thread_local.
+- Provider state lives in `app.rs`'s UI-thread-only `APP`; graphics state stays in `main.rs`'s `UI`. Workers publish only non-secret `AppEvent`s through `poller.rs`, wait for a generation/account-bound UI ticket, and retain credentials locally. Release APP/UI borrows before alert handling, rendering, or releasing a worker.
 - Errors: stale data beats error UI. Never wipe `LAST_GOOD` on a failed fetch.
 
 ## Release process

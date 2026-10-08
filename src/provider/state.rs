@@ -188,6 +188,10 @@ pub enum ProviderEvent {
     CredentialsChanged(AccountContext),
     Unavailable(UnavailableReason),
     CacheLoaded(UsageSnapshot),
+    PreparationFailed {
+        error: FetchError,
+        invalidates_account: bool,
+    },
     RefreshRequested {
         trigger: RefreshTrigger,
         interval: Duration,
@@ -313,6 +317,28 @@ impl ProviderState {
                 self.cached = true;
                 Transition::Changed
             }
+            ProviderEvent::PreparationFailed {
+                error,
+                invalidates_account,
+            } => {
+                if matches!(
+                    self.phase,
+                    ProviderPhase::Disabled | ProviderPhase::Fetching { .. }
+                ) {
+                    return Transition::Ignored;
+                }
+                if invalidates_account {
+                    self.clear_account();
+                    self.phase = ProviderPhase::Unavailable(UnavailableReason::MissingCredentials);
+                } else {
+                    self.rate_limit_streak = 0;
+                    self.phase = ProviderPhase::Failed(error);
+                }
+                self.last_attempt = Some(now.monotonic);
+                Transition::AcceptedFailure {
+                    retry_at_unix: None,
+                }
+            }
             ProviderEvent::RefreshRequested { trigger, interval } => {
                 if self.account.is_none()
                     || matches!(
@@ -322,14 +348,7 @@ impl ProviderState {
                 {
                     return Transition::Ignored;
                 }
-                let gate = refresh_gate(
-                    trigger,
-                    now,
-                    self.cooldown(),
-                    self.last_attempt,
-                    matches!(self.phase, ProviderPhase::Fetching { .. }),
-                    interval,
-                );
+                let gate = self.refresh_gate(trigger, clock, interval);
                 if gate != RefreshGate::Ready {
                     return Transition::RefreshBlocked(gate);
                 }
@@ -393,6 +412,22 @@ impl ProviderState {
             age_seconds,
             retry_at_unix: cooldown_deadline_unix(now, self.cooldown()),
         }
+    }
+
+    pub fn refresh_gate(
+        &self,
+        trigger: RefreshTrigger,
+        clock: &impl Clock,
+        interval: Duration,
+    ) -> RefreshGate {
+        refresh_gate(
+            trigger,
+            clock.read(),
+            self.cooldown(),
+            self.last_attempt,
+            matches!(self.phase, ProviderPhase::Fetching { .. }),
+            interval,
+        )
     }
 
     fn clear_account(&mut self) {
