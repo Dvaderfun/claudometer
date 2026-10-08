@@ -22,7 +22,7 @@ Drive the flyout programmatically: find the hidden window by class `Claudometer.
 
 Toast alerts: `.\target\release\claudometer.exe --test-alert` fires the whole pipeline with fake data; read `%APPDATA%\Claudometer\alert-test.txt` ("ok" or the error). Delivered toasts are queryable from Windows PowerShell 5.1 (not pwsh): `[Windows.UI.Notifications.ToastNotificationManager]::History.GetHistory('Claudometer')` after loading the WinRT type.
 
-Foundation runtime baseline on the reference x64 machine: **1.53 MiB hidden and 4.45 MiB with the two-provider flyout visible (p95 private working set), below 0.002% idle CPU, 10/13 GDI handles, and 50.387 ms median / 76.551 ms p95 tray readiness in the slower 50-start run**. The current x64 artifact is 1,010,688 bytes unprovisioned and 1,097,728 bytes with the release trust root provisioned (hard ceiling 1,310,720); per-slice sizes are in `docs/performance/artifact-ledger.md`. The controlled runtime mode excludes provider refresh/TLS work; methodology and both ten-minute runs are in `docs/performance/foundation-baseline.md`. Investigate a greater-than-10% per-slice regression.
+Foundation runtime baseline on the reference x64 machine: **1.53 MiB hidden and 4.45 MiB with the two-provider flyout visible (p95 private working set), below 0.002% idle CPU, 10/13 GDI handles, and 50.387 ms median / 76.551 ms p95 tray readiness in the slower 50-start run**. The REL-02 x64 baseline is 1,010,688 bytes unprovisioned and 1,097,728 bytes with the release trust root provisioned. WIP-00 UIA measures 1,045,504 / 1,132,544 bytes, using a synthetic public trust root for the latter (hard ceiling 1,310,720); per-slice sizes are in `docs/performance/artifact-ledger.md`. The controlled runtime mode excludes provider refresh/TLS work; methodology and both ten-minute runs are in `docs/performance/foundation-baseline.md`. Investigate a greater-than-10% per-slice regression.
 
 ## Hard-won gotchas (do not re-learn these)
 
@@ -48,7 +48,7 @@ Foundation runtime baseline on the reference x64 machine: **1.53 MiB hidden and 
 
 - `fmt_caption` word-wraps on purpose (footer notes rely on it). Single-line captions inside fixed-height cards must use `fmt_caption_1` (NO_WRAP + ellipsis trimming) or they overflow their card.
 - Fluent tokens hand-translated in `gfx.rs::Palette` — 4px spacing grid, Body 14 / Caption 12, colors documented next to values. New UI goes through `BrushCache`/cached formats, no per-draw allocations.
-- Every user-visible action needs a keyboard path (Tab/Space/Enter/arrows) + focus ring. UIA is a known gap — don't claim screen-reader support.
+- Every user-visible action needs a keyboard path (Tab/Space/Enter/arrows) + focus ring. The committed UIA tree passes local Invoke/Toggle client checks; Narrator speech and the remaining A11Y-01 patterns/events are unverified or incomplete — don't claim screen-reader support.
 - All fetch-state statics live in `main.rs` top; UI-thread-only state in the `UI` thread_local.
 - Errors: stale data beats error UI. Never wipe `LAST_GOOD` on a failed fetch.
 

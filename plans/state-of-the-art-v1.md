@@ -153,7 +153,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | `v0.9` | Authenticated, crash-safe updates | **Done on `main`, unreleased** |
 | R0 | Ship the trust-root release | **Blocked on human provisioning** (§7) |
 | `v0.10` | State core, diagnostics, Codex documented source | Not started |
-| `v0.11` | Accessible, adaptive first run | **In progress** (A11Y-01 uncommitted) |
+| `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; WIP-00 awaits Narrator verification) |
 | `v0.12` | Glanceable status, tray, and alerts | Not started |
 | `v1.0` | Signed distribution | Not started |
 | `v1.1` | History-refined pacing | **Gated** on field evidence |
@@ -163,8 +163,8 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 
 ### 2.2 Facts an executor needs now
 
-- The authenticated updater pushed x64 to **1,097,728 bytes**, above the 1.0 MiB soft target. Headroom to the hard ceiling is **212,992 bytes** for everything below. Measure every task (§3.1).
-- `src/accessibility.rs` and edits to `src/main.rs`, `src/gfx.rs`, `src/util.rs`, `src/demo.rs`, `Cargo.toml` are an **uncommitted** A11Y-01 implementation (UIA fragment tree via `WM_GETOBJECT`, new `windows` features `implement`, `Win32_UI_Accessibility`, `Win32_System_Ole`, `Win32_System_Variant`, plus a `windows-core` dependency).
+- WIP-00 measures x64 at **1,132,544 bytes** with a synthetic public trust root, above the 1.0 MiB soft target and **178,176 bytes** below the hard ceiling. ARM64 is **1,029,120 bytes**. Growth versus the matching REL-02 rows is +3.17% / +3.34%; the CI baseline has not advanced. Measure every task (§3.1).
+- Commit `0ed4ea9` on `feat/a11y-uia-and-plan-v2` contains the A11Y-01 implementation in `src/accessibility.rs`, `src/main.rs`, `src/gfx.rs`, `src/util.rs`, `src/demo.rs`, `Cargo.toml`, and `Cargo.lock` (UIA fragment tree via `WM_GETOBJECT`, new `windows` features `implement`, `Win32_UI_Accessibility`, `Win32_System_Ole`, `Win32_System_Variant`, plus a direct `windows-core` dependency). WIP-00 passed all §0.3 gates, both architecture builds, demo safety, and 22 UIA client checks on 2026-10-08; Narrator speech remains unverified. See `docs/verification/wip-00.md`.
 - HTTP requests already use a 10-second `ureq` timeout (`api.rs`, `codex.rs`).
 - Existing modules: `accessibility`, `alerts`, `api`, `auth`, `codex`, `config`, `demo`, `gfx`, `main`, `network`, `provider/{mod,model}`, `release_manifest`, `runtime_state`, `state_policy`, `store`, `trayicon`, `updater`, `util`, `vibecode`.
 - Demo scenarios: `claude-only`, `codex-only`, `both`, `loading`, `stale`, `cooldown`, `error`, `neither`, `settings`, `many`.
@@ -174,7 +174,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 
 Work strictly top to bottom, skipping only tasks whose dependencies are not done.
 
-1. **WIP-00** — land or park the uncommitted accessibility work (§9.1).
+1. **WIP-00** — verify the committed accessibility work (§9.1); **blocked on the human Narrator listening check**. SIZE-01 and REL-03 remain pending.
 2. **SIZE-01** — size audit and headroom plan (§3.2).
 3. **REL-03** — prepare the trust-root release for the human (§7).
 4. **MODEL-01** → **STATE-01** → **APP-01** → **CACHE-01** (§8.1).
@@ -548,15 +548,17 @@ Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authentic
 
 ### 9.1 Accessibility
 
-- [ ] **WIP-00 — Land or park the uncommitted A11Y-01 work.**
+- [ ] **WIP-00 — Verify the committed A11Y-01 work.**
   - Run all §0.3 gates on the working tree. Record x64/ARM64 size with and without the change.
   - Verify with Accessibility Insights or `inspect.exe`: the flyout and Settings expose a tree; every button Invokes; every switch Toggles; Narrator reads each control.
-  - If gates pass and the size delta is acceptable under SIZE-01, commit as `feat(a11y): expose UI Automation tree` and continue A11Y-01 from what is missing. Otherwise `git stash push -m "a11y-wip"` and report.
+  - The implementation is already committed as `0ed4ea9`; do not stash or rewrite it. Record verification on its existing branch. Mark done only after the gates, size review, and Narrator check pass, then continue A11Y-01 from what is missing.
+  - 2026-10-08: fmt, clippy, 115 tests, x64/ARM64 builds, both trust-root build modes, artifact checks, demo safety, and all 22 UIA client checks pass. `inspect.exe` confirms focused controls on both windows. **Blocked:** Narrator announcements require a human listening check (§0.6); checkbox stays open. Rollback: use the pre-UIA binary from `89241c1`, with no data migration or journal edits. Evidence: `docs/verification/wip-00.md` and the artifact ledger.
 
 - [ ] **A11Y-01 — Complete the UI Automation fragment tree.**
   - Buttons: Invoke. Switches: Toggle. Interval and metric choices: Selection. Quota bars: read-only RangeValue.
   - Accessible names include provider, window, used/left value, reset, pace verdict, and freshness.
   - Dynamic changes raise targeted property events; the ticking `Updated …` and `Next update in …` captions must not cause repeated announcements.
+  - Remaining after WIP-00 inspection: Selection for interval/metric choices, read-only RangeValue for quota bars (currently Text), richer names with freshness/pace, targeted property events (currently focus events only), and Narrator verification. Demo actions are intentionally guarded; successful Invoke/Toggle calls do not prove live setting mutations or state-change announcements.
 
 - [ ] **A11Y-02 — Non-color semantics.**
   - Warning, critical, stale, unavailable, and pace states are available as text and through UIA.
