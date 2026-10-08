@@ -89,11 +89,15 @@ pub fn accent_rgb() -> (u8, u8, u8) {
 }
 
 /// Ring / bar fill color by severity, with percent fallback thresholds.
-pub fn severity_rgb(severity: &str, percent: f64, accent: (u8, u8, u8)) -> (u8, u8, u8) {
-    let s = severity.to_ascii_lowercase();
-    if s.contains("exceed") || s.contains("critical") || s.contains("error") || percent >= 100.0 {
+pub fn severity_rgb(
+    severity: &Option<crate::provider::model::ProviderSeverity>,
+    percent: f64,
+    accent: (u8, u8, u8),
+) -> (u8, u8, u8) {
+    use crate::provider::model::ProviderSeverity;
+    if *severity == Some(ProviderSeverity::Critical) || percent >= 100.0 {
         (232, 17, 35) // Fluent red
-    } else if s.contains("warn") || s.contains("elevated") || percent >= 85.0 {
+    } else if *severity == Some(ProviderSeverity::Warning) || percent >= 85.0 {
         (255, 185, 0) // Fluent amber
     } else {
         accent

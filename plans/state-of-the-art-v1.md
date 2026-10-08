@@ -152,7 +152,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | `v0.8` | Trustworthy state and system safety | **Done on `main`, unreleased** |
 | `v0.9` | Authenticated, crash-safe updates | **Done on `main`, unreleased** |
 | R0 | Ship the trust-root release | **Notes prepared (REL-03)**; publication blocked on human signing/provisioning (§7) |
-| `v0.10` | State core, diagnostics, Codex documented source | Not started |
+| `v0.10` | State core, diagnostics, Codex documented source | **In progress** (MODEL-01 complete on its feature branch; STATE-01 next) |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
 | `v0.12` | Glanceable status, tray, and alerts | Not started |
 | `v1.0` | Signed distribution | Not started |
@@ -178,7 +178,7 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 1. **WIP-00** — verify the committed accessibility work (§9.1); **Narrator verification deferred by the owner on 2026-10-08**. WIP-00 and A11Y-01 remain unchecked; the owner explicitly authorized proceeding to SIZE-01 and release-note preparation without this check.
 2. **SIZE-01** — **done**: size audit, measured `z` profile, and headroom plan (§3.2) on `chore/size-audit`, branched from PR #2.
 3. **REL-03** — **done (notes only)**: proposed `docs/release-notes/0.9.0.md`, expanded Unreleased changelog, local release-input check, and live protection audit (§7). Human publishes.
-4. **MODEL-01** → **STATE-01** → **APP-01** → **CACHE-01** (§8.1).
+4. **MODEL-01 done** → **STATE-01 next** → **APP-01** → **CACHE-01** (§8.1).
 5. **ERR-01** — actionable error states (§8.2).
 6. **DIAG-01** → **DIAG-02** (§8.3).
 7. **CODEX-01** → **CODEX-02** (§8.4).
@@ -476,11 +476,12 @@ Everything in `v0.8` and `v0.9` is on `main` but unreleased. The first authentic
 
 ### 8.1 State core
 
-- [ ] **MODEL-01 — Complete the normalized domain model.**
+- [x] **MODEL-01 — Complete the normalized domain model.**
   - Expand `provider/model.rs` to §4.3, including `window_seconds`. Move shared types out of `api.rs`/`codex.rs`.
   - Convert parsers, alerts, tray, renderer, and UIA to typed IDs and classes.
   - No rendering or network behavior change in this commit; existing fixtures must pass unchanged.
   - Acceptance: no string comparison decides limit class or kind; fixtures cover weekly-as-primary, weekly-only (no invented Session row), missing reset, non-finite, and out-of-range values.
+  - Completed 2026-10-08 on `feat/model-01-normalized-model`: shared snapshots/outcomes/limits moved to provider model with account/provider/source, typed kind/class/severity, validated Percent, stable LimitId, and window duration. Formatted resets stay in the rendering view, not snapshots. Both compatibility sources retain their requests; Codex missing-duration captions remain unchanged but typed kind is Unknown/Other instead of inferred from position. Fixture files are unchanged; 118 tests, all §0.3 gates, demo safety, 22 UIA checks, screenshot review, and provisioned x64/ARM64 artifact checks pass. Error category expansion remains ERR-01; raw strings are parsed only at adapter boundaries. Rollback: revert the binary/code; no store migration. See `docs/verification/model-01.md` and the artifact ledger.
 
 - [ ] **STATE-01 — Pure provider reducer.**
   - Implement §4.4 in `provider/state.rs` with an injected clock; absorb `state_policy.rs`.

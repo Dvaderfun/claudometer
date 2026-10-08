@@ -8,11 +8,13 @@ use std::fs::File;
 use serde::Deserialize;
 
 use crate::api::{
-    bounded_text, clamp_percent, fmt_reset_unix, plain, prettify, read_bounded,
-    read_json_with_retry, CredentialReadError, FetchErr, FetchOutcome, LimitRow,
-    PreparationFailure, PreparationFailureKind, UsageSnapshot, MAX_LIMIT_ROWS,
+    bounded_text, plain, prettify, read_bounded, read_json_with_retry, CredentialReadError,
+    FetchErr, PreparationFailure, PreparationFailureKind, MAX_LIMIT_ROWS,
 };
-use crate::provider::model::{derive_account_context, AccountContext, ProviderId, SecretString};
+use crate::provider::model::{
+    derive_account_context, AccountContext, AccountKey, FetchOutcome, LimitKind, ProviderId,
+    SecretString, SourceProvenance, UsageLimit, UsageSnapshot,
+};
 
 // ---------- credentials (~/.codex/auth.json) ----------
 
@@ -190,14 +192,22 @@ fn fetch_inner(request: PreparedRequest) -> Result<UsageSnapshot, FetchErr> {
         })?;
 
     let body = read_bounded(resp.into_reader())?;
-    parse_usage_json(&body, time::OffsetDateTime::now_utc().unix_timestamp())
+    parse_usage_json(
+        &body,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+        request.account.key,
+    )
 }
 
-fn parse_usage_json(body: &[u8], observed_at_unix: i64) -> Result<UsageSnapshot, FetchErr> {
+fn parse_usage_json(
+    body: &[u8],
+    observed_at_unix: i64,
+    account: AccountKey,
+) -> Result<UsageSnapshot, FetchErr> {
     let parsed: UsageResp =
         serde_json::from_slice(body).map_err(|_| plain("Unexpected API response shape."))?;
 
-    let mut rows: Vec<LimitRow> = Vec::new();
+    let mut rows: Vec<UsageLimit> = Vec::new();
     if let Some(rl) = &parsed.rate_limit {
         // kind/label come from the window duration — which window arrives as
         // primary vs secondary varies by plan (observed: weekly-only accounts
@@ -220,13 +230,16 @@ fn parse_usage_json(body: &[u8], observed_at_unix: i64) -> Result<UsageSnapshot,
         .unwrap_or_default();
 
     Ok(UsageSnapshot {
+        provider: ProviderId::Codex,
+        account,
+        source: SourceProvenance::compatibility(ProviderId::Codex),
         rows,
-        plan: bounded_text(plan),
+        plan: (!plan.is_empty()).then(|| bounded_text(plan)),
         fetched_unix: observed_at_unix,
     })
 }
 
-fn push_row(rows: &mut Vec<LimitRow>, w: &Window, fallback_kind: &str) {
+fn push_row(rows: &mut Vec<UsageLimit>, w: &Window, fallback_kind: &str) {
     if rows.len() == MAX_LIMIT_ROWS {
         return;
     }
@@ -259,14 +272,26 @@ fn push_row(rows: &mut Vec<LimitRow>, w: &Window, fallback_kind: &str) {
             .to_string(),
         ),
     };
-    rows.push(LimitRow {
-        kind: kind.into(),
-        label: bounded_text(label),
-        percent: clamp_percent(pct),
-        severity: String::new(), // no severity field — percent thresholds apply
-        reset_text: w.reset_at.map(fmt_reset_unix).unwrap_or_default(),
-        resets_unix: w.reset_at,
-    });
+    let typed_kind = match w.limit_window_seconds {
+        Some(s) if s > 0 && s <= 24 * 3600 => LimitKind::Session,
+        Some(s) if s > 24 * 3600 => LimitKind::Weekly,
+        _ => LimitKind::Other("unknown_window".into()),
+    };
+    let duration = w
+        .limit_window_seconds
+        .and_then(|s| u32::try_from(s).ok())
+        .filter(|s| *s > 0);
+    if let Some(row) = UsageLimit::from_adapter(
+        kind.into(),
+        typed_kind,
+        bounded_text(label),
+        pct,
+        None,
+        w.reset_at,
+        duration,
+    ) {
+        rows.push(row);
+    }
 }
 
 // ---------- JWT expiry (no verification, just the claim) ----------
@@ -325,20 +350,45 @@ mod tests {
     }
 
     fn parse_fixture(name: &str) -> Result<UsageSnapshot, FetchErr> {
-        parse_usage_json(fixture(name), OBSERVED_AT)
+        parse_usage_json(fixture(name), OBSERVED_AT, AccountKey::from_digest([2; 32]))
+    }
+
+    #[test]
+    fn weekly_only_and_missing_duration_display_are_characterized() {
+        let weekly = parse_fixture("weekly-primary").unwrap();
+        assert_eq!(weekly.rows.len(), 1);
+        assert_eq!(weekly.rows[0].label, "Weekly");
+        let unknown = parse_usage_json(
+            br#"{"rate_limit":{"primary_window":{"used_percent":12}}}"#,
+            OBSERVED_AT,
+            AccountKey::from_digest([2; 32]),
+        )
+        .unwrap();
+        assert_eq!(unknown.rows[0].label, "Session");
+        assert_eq!(unknown.rows[0].resets_unix, None);
+        assert_eq!(unknown.rows[0].window_seconds, None);
+        assert!(matches!(unknown.rows[0].kind, LimitKind::Other(_)));
     }
 
     #[test]
     fn parses_sanitized_codex_fixture_matrix() {
         let normal = parse_fixture("normal").unwrap();
         assert_eq!(normal.rows.len(), 2);
-        assert_eq!(normal.rows[0].kind, "session");
-        assert_eq!(normal.rows[1].kind, "weekly_all");
+        assert_eq!(normal.rows[0].kind, LimitKind::Session);
+        assert_eq!(normal.rows[1].kind, LimitKind::Weekly);
         assert_eq!(normal.fetched_unix, OBSERVED_AT);
+        assert_eq!(normal.provider, ProviderId::Codex);
+        assert!(normal.account == AccountKey::from_digest([2; 32]));
+        assert_eq!(
+            normal.source.support,
+            crate::provider::model::SourceSupport::Compatibility
+        );
+        assert_eq!(normal.rows[0].window_seconds, Some(18_000));
+        assert_eq!(normal.rows[1].window_seconds, Some(604_800));
 
         let partial = parse_fixture("partial").unwrap();
         assert_eq!(partial.rows.len(), 1);
-        assert_eq!(partial.rows[0].kind, "weekly_all");
+        assert_eq!(partial.rows[0].kind, LimitKind::Weekly);
 
         assert_eq!(parse_fixture("unknown-fields").unwrap().rows.len(), 1);
         assert!(parse_fixture("malformed").is_err());
@@ -346,14 +396,16 @@ mod tests {
 
         let missing_reset = parse_fixture("missing-reset").unwrap();
         assert_eq!(missing_reset.rows[0].resets_unix, None);
-        assert!(missing_reset.rows[0].reset_text.is_empty());
+        assert!(crate::gfx::LimitRow::from(missing_reset.rows[0].clone())
+            .reset_text
+            .is_empty());
 
         let weekly = parse_fixture("weekly-primary").unwrap();
-        assert_eq!(weekly.rows[0].kind, "weekly_all");
+        assert_eq!(weekly.rows[0].kind, LimitKind::Weekly);
         assert_eq!(weekly.rows[0].label, "Weekly");
 
         let out_of_range = parse_fixture("out-of-range").unwrap();
-        assert_eq!(out_of_range.rows[0].percent, 0.0);
-        assert_eq!(out_of_range.rows[1].percent, 100.0);
+        assert_eq!(out_of_range.rows[0].percent.get(), 0.0);
+        assert_eq!(out_of_range.rows[1].percent.get(), 100.0);
     }
 }

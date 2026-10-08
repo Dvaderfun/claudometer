@@ -47,7 +47,8 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use provider::model::{
-    AccountContext, AccountKey, CompletionEvent, FetchCompletion, Generation, ProviderId, RequestId,
+    AccountContext, AccountKey, CompletionEvent, FetchCompletion, FetchOutcome, Generation,
+    LimitKind, ProviderId, RequestId, UsageSnapshot,
 };
 use state_policy::{Clock, ClockReading, RefreshGate, RefreshTrigger, SystemClock};
 
@@ -88,7 +89,7 @@ static MANUAL_COOLDOWN_NOTICES: AtomicU32 = AtomicU32::new(0);
 /// (recent stale data beats errors, strict 429 backoff, 3 s debounce).
 struct Slot {
     identity: Mutex<SlotIdentity>,
-    state: Mutex<Option<FetchCompletion<api::FetchOutcome>>>,
+    state: Mutex<Option<FetchCompletion<FetchOutcome>>>,
     last_good: Mutex<Option<AccountSnapshot>>,
     preparation_error: Mutex<Option<String>>,
     last_fetch: Mutex<Option<Instant>>,
@@ -110,7 +111,7 @@ struct SlotIdentity {
 #[derive(Clone)]
 struct AccountSnapshot {
     account: AccountKey,
-    snapshot: api::UsageSnapshot,
+    snapshot: UsageSnapshot,
 }
 
 impl Slot {
@@ -150,11 +151,11 @@ fn codex_active() -> bool {
 
 /// Snapshot to display for a provider (fresh, or stale on error) plus the
 /// current error message when the last fetch failed.
-fn effective(p: ProviderId) -> (Option<api::UsageSnapshot>, Option<String>) {
+fn effective(p: ProviderId) -> (Option<UsageSnapshot>, Option<String>) {
     effective_at(slot(p), SystemClock.read())
 }
 
-fn effective_at(s: &Slot, now: ClockReading) -> (Option<api::UsageSnapshot>, Option<String>) {
+fn effective_at(s: &Slot, now: ClockReading) -> (Option<UsageSnapshot>, Option<String>) {
     let identity = s.identity.lock().unwrap();
     let current_account = identity.account.as_ref().map(|account| &account.key);
     let matching_last_good = || {
@@ -177,8 +178,8 @@ fn effective_at(s: &Slot, now: ClockReading) -> (Option<api::UsageSnapshot>, Opt
                 && completion.generation == identity.generation =>
         {
             match &completion.payload {
-                api::FetchOutcome::Ok(snapshot) => (Some(snapshot.clone()), None),
-                api::FetchOutcome::Err { msg, .. } => {
+                FetchOutcome::Ok(snapshot) => (Some(snapshot.clone()), None),
+                FetchOutcome::Err { msg, .. } => {
                     let recent = matching_last_good().filter(|snapshot| {
                         state_policy::within_stale_window(now, snapshot.fetched_unix)
                     });
@@ -1454,11 +1455,11 @@ fn manual_refresh_label() -> String {
         .unwrap_or_else(|| "Refresh usage now".to_string())
 }
 
-fn section(title: &'static str, s: api::UsageSnapshot) -> gfx::Section {
+fn section(title: &'static str, s: UsageSnapshot) -> gfx::Section {
     gfx::Section {
         title,
-        plan: s.plan,
-        body: gfx::SectionBody::Rows(s.rows),
+        plan: s.plan.unwrap_or_default(),
+        body: gfx::SectionBody::Rows(s.rows.into_iter().map(gfx::LimitRow::from).collect()),
     }
 }
 
@@ -2098,22 +2099,23 @@ unsafe fn update_tray(owner: HWND) {
     let (c_snap, c_err) = effective(ProviderId::Claude);
     let (style, mut tip) = match (&c_snap, &c_err) {
         (Some(s), _) => {
-            let session = s.rows.iter().find(|r| r.kind == "session");
-            let weekly = s.rows.iter().find(|r| r.kind == "weekly_all");
+            let session = s.rows.iter().find(|r| r.kind == LimitKind::Session);
+            let weekly = s.rows.iter().find(|r| r.kind == LimitKind::Weekly);
             let (frac, rgb, mut tip) = match session {
                 Some(row) => (
-                    (row.percent / 100.0) as f32,
-                    util::severity_rgb(&row.severity, row.percent, accent),
-                    format!("Claude · Session {:.0}%", row.percent),
+                    (row.percent.get() / 100.0) as f32,
+                    util::severity_rgb(&row.severity, row.percent.get(), accent),
+                    format!("Claude · Session {:.0}%", row.percent.get()),
                 ),
                 None => (0.0, accent, "Claude".to_string()),
             };
             if let Some(wk) = weekly {
-                tip.push_str(&format!(" · Week {:.0}%", wk.percent));
+                tip.push_str(&format!(" · Week {:.0}%", wk.percent.get()));
             }
             if let Some(row) = session {
-                if !row.reset_text.is_empty() {
-                    tip.push_str(&format!(" · {}", row.reset_text));
+                let reset = row.resets_unix.map(api::fmt_reset_unix).unwrap_or_default();
+                if !reset.is_empty() {
+                    tip.push_str(&format!(" · {reset}"));
                 }
             }
             (trayicon::Style::Ring { frac, rgb }, tip)
@@ -2132,11 +2134,11 @@ unsafe fn update_tray(owner: HWND) {
         match effective(ProviderId::Codex) {
             (Some(s), _) => {
                 let mut line = "Codex".to_string();
-                if let Some(row) = s.rows.iter().find(|r| r.kind == "session") {
-                    line.push_str(&format!(" · Session {:.0}%", row.percent));
+                if let Some(row) = s.rows.iter().find(|r| r.kind == LimitKind::Session) {
+                    line.push_str(&format!(" · Session {:.0}%", row.percent.get()));
                 }
-                if let Some(row) = s.rows.iter().find(|r| r.kind == "weekly_all") {
-                    line.push_str(&format!(" · Week {:.0}%", row.percent));
+                if let Some(row) = s.rows.iter().find(|r| r.kind == LimitKind::Weekly) {
+                    line.push_str(&format!(" · Week {:.0}%", row.percent.get()));
                 }
                 tip.push_str(&format!("\n{line}"));
             }
@@ -2223,10 +2225,7 @@ fn run_alert_check(event: CompletionEvent) {
     }
 }
 
-fn alert_candidate(
-    s: &Slot,
-    event: CompletionEvent,
-) -> Option<(AccountContext, api::UsageSnapshot)> {
+fn alert_candidate(s: &Slot, event: CompletionEvent) -> Option<(AccountContext, UsageSnapshot)> {
     let identity = s.identity.lock().unwrap();
     match &*s.state.lock().unwrap() {
         Some(completion)
@@ -2239,10 +2238,10 @@ fn alert_candidate(
                     .is_some_and(|account| account.key == completion.account) =>
         {
             match &completion.payload {
-                api::FetchOutcome::Ok(snapshot) => {
+                FetchOutcome::Ok(snapshot) => {
                     Some((identity.account.as_ref()?.clone(), snapshot.clone()))
                 }
-                api::FetchOutcome::Err { .. } => None,
+                FetchOutcome::Err { .. } => None,
             }
         }
         Some(_) | None => None,
@@ -2264,7 +2263,7 @@ impl PreparedFetch {
         }
     }
 
-    fn execute(self) -> api::FetchOutcome {
+    fn execute(self) -> FetchOutcome {
         // One prepared request executes one selected source. In particular,
         // authentication and 429 failures return directly; they never trigger
         // an immediate request to another source.
@@ -2477,11 +2476,17 @@ fn record_preparation_failure(
 fn record_fetch_completion(
     s: &Slot,
     expected_provider: ProviderId,
-    completion: FetchCompletion<api::FetchOutcome>,
+    completion: FetchCompletion<FetchOutcome>,
     completed_at: ClockReading,
 ) -> bool {
     let mut identity = s.identity.lock().unwrap();
     let matches = completion.provider == expected_provider
+        && match &completion.payload {
+            FetchOutcome::Ok(snapshot) => {
+                snapshot.provider == completion.provider && snapshot.account == completion.account
+            }
+            FetchOutcome::Err { .. } => true,
+        }
         && identity.pending_request_id == Some(completion.request_id)
         && identity.generation == completion.generation
         && identity
@@ -2494,7 +2499,7 @@ fn record_fetch_completion(
     identity.pending_request_id = None;
 
     match &completion.payload {
-        api::FetchOutcome::Ok(snapshot) => {
+        FetchOutcome::Ok(snapshot) => {
             *s.last_good.lock().unwrap() = Some(AccountSnapshot {
                 account: completion.account.clone(),
                 snapshot: snapshot.clone(),
@@ -2506,7 +2511,7 @@ fn record_fetch_completion(
             );
             s.rl_streak.store(streak, Ordering::SeqCst);
         }
-        api::FetchOutcome::Err {
+        FetchOutcome::Err {
             rate_limited: true,
             retry_after,
             ..
@@ -2520,7 +2525,7 @@ fn record_fetch_completion(
             let delay = state_policy::rate_limit_delay(*retry_after, consecutive);
             *s.cooldown_until.lock().unwrap() = Some(completed_at.monotonic + delay);
         }
-        api::FetchOutcome::Err { .. } => {
+        FetchOutcome::Err { .. } => {
             let streak = state_policy::next_rate_limit_streak(
                 s.rl_streak.load(Ordering::SeqCst),
                 state_policy::CompletionKind::OtherFailure,
@@ -2538,7 +2543,7 @@ fn record_fetch_completion(
 #[cfg(test)]
 mod state_characterization_tests {
     use super::*;
-    use crate::provider::model::IdentityPersistence;
+    use crate::provider::model::{IdentityPersistence, SourceProvenance};
 
     fn reading(monotonic: Instant, unix_seconds: i64) -> ClockReading {
         ClockReading {
@@ -2547,8 +2552,8 @@ mod state_characterization_tests {
         }
     }
 
-    fn failure(rate_limited: bool, retry_after: Option<u64>) -> api::FetchOutcome {
-        api::FetchOutcome::Err {
+    fn failure(rate_limited: bool, retry_after: Option<u64>) -> FetchOutcome {
+        FetchOutcome::Err {
             msg: "sanitized failure".to_string(),
             retry_after,
             rate_limited,
@@ -2578,8 +2583,13 @@ mod state_characterization_tests {
         request_id: RequestId,
         generation: Generation,
         account: &AccountContext,
-        payload: api::FetchOutcome,
-    ) -> FetchCompletion<api::FetchOutcome> {
+        mut payload: FetchOutcome,
+    ) -> FetchCompletion<FetchOutcome> {
+        if let FetchOutcome::Ok(snapshot) = &mut payload {
+            snapshot.provider = provider;
+            snapshot.account = account.key.clone();
+            snapshot.source = SourceProvenance::compatibility(provider);
+        }
         FetchCompletion {
             provider,
             generation,
@@ -2589,12 +2599,44 @@ mod state_characterization_tests {
         }
     }
 
-    fn snapshot(fetched_unix: i64) -> api::UsageSnapshot {
-        api::UsageSnapshot {
+    fn snapshot(fetched_unix: i64) -> UsageSnapshot {
+        UsageSnapshot {
+            provider: ProviderId::Claude,
+            account: AccountKey::from_digest([1; 32]),
+            source: SourceProvenance::compatibility(ProviderId::Claude),
             rows: Vec::new(),
-            plan: String::new(),
+            plan: None,
             fetched_unix,
         }
+    }
+
+    #[test]
+    fn snapshot_identity_mismatch_cannot_be_accepted() {
+        let slot = Slot::new();
+        let now = Instant::now();
+        let (request_id, generation, account) = start_request(&slot, account(1));
+        let mut completion = completion(
+            ProviderId::Claude,
+            request_id,
+            generation,
+            &account,
+            FetchOutcome::Ok(snapshot(100)),
+        );
+        if let FetchOutcome::Ok(snapshot) = &mut completion.payload {
+            snapshot.account = AccountKey::from_digest([2; 32]);
+        }
+        assert!(!record_fetch_completion(
+            &slot,
+            ProviderId::Claude,
+            completion,
+            reading(now, 100)
+        ));
+        assert!(slot.last_good.lock().unwrap().is_none());
+        assert!(slot.fetching.load(Ordering::SeqCst));
+        assert_eq!(
+            slot.identity.lock().unwrap().pending_request_id,
+            Some(request_id)
+        );
     }
 
     #[test]
@@ -2718,7 +2760,7 @@ mod state_characterization_tests {
                 request_id,
                 generation,
                 &current,
-                api::FetchOutcome::Ok(snapshot(123)),
+                FetchOutcome::Ok(snapshot(123)),
             ),
             reading(Instant::now(), 123),
         ));
@@ -2762,7 +2804,7 @@ mod state_characterization_tests {
                 request_a,
                 generation_a,
                 &account_a,
-                api::FetchOutcome::Ok(snapshot(100)),
+                FetchOutcome::Ok(snapshot(100)),
             ),
             reading(now, 100),
         ));
@@ -2824,7 +2866,7 @@ mod state_characterization_tests {
         let now = Instant::now();
         let (request_a, generation_a, account_a) = start_request(&slot, account(1));
         let mut old = snapshot(100);
-        old.plan = "Old plan".to_string();
+        old.plan = Some("Old plan".to_string());
         assert!(record_fetch_completion(
             &slot,
             ProviderId::Claude,
@@ -2833,7 +2875,7 @@ mod state_characterization_tests {
                 request_a,
                 generation_a,
                 &account_a,
-                api::FetchOutcome::Ok(old),
+                FetchOutcome::Ok(old),
             ),
             reading(now, 100),
         ));
@@ -2877,7 +2919,7 @@ mod state_characterization_tests {
                 request,
                 generation,
                 &current,
-                api::FetchOutcome::Ok(snapshot(100)),
+                FetchOutcome::Ok(snapshot(100)),
             ),
             reading(now, 100),
         ));

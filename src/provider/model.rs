@@ -32,6 +32,155 @@ impl ProviderId {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceId {
+    ClaudeOAuthCompatibility,
+    CodexWhamCompatibility,
+    CodexAppServer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceSupport {
+    Compatibility,
+    Documented,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceProvenance {
+    pub id: SourceId,
+    pub support: SourceSupport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LimitKind {
+    Session,
+    Weekly,
+    Model,
+    ExtraUsage,
+    Other(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitClass {
+    Quota,
+    Spend,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderSeverity {
+    Critical,
+    Warning,
+    Normal,
+}
+
+impl ProviderSeverity {
+    pub fn from_hint(value: &str) -> Option<Self> {
+        if value.is_empty() {
+            return None;
+        }
+        let value = value.to_ascii_lowercase();
+        Some(
+            if value.contains("exceed") || value.contains("critical") || value.contains("error") {
+                Self::Critical
+            } else if value.contains("warn") || value.contains("elevated") {
+                Self::Warning
+            } else {
+                Self::Normal
+            },
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct Percent(f64);
+
+impl Percent {
+    pub fn new(value: f64) -> Option<Self> {
+        value.is_finite().then(|| Self(value.clamp(0.0, 100.0)))
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+#[derive(Clone)]
+pub struct UsageLimit {
+    pub id: LimitId,
+    pub kind: LimitKind,
+    pub class: LimitClass,
+    pub label: String,
+    pub percent: Percent,
+    pub severity: Option<ProviderSeverity>,
+    pub resets_unix: Option<i64>,
+    pub window_seconds: Option<u32>,
+}
+
+#[derive(Clone)]
+pub struct UsageSnapshot {
+    pub provider: ProviderId,
+    pub account: AccountKey,
+    pub source: SourceProvenance,
+    pub rows: Vec<UsageLimit>,
+    pub plan: Option<String>,
+    pub fetched_unix: i64,
+}
+
+#[derive(Clone)]
+pub enum FetchOutcome {
+    Ok(UsageSnapshot),
+    Err {
+        msg: String,
+        retry_after: Option<u64>,
+        rate_limited: bool,
+    },
+}
+
+impl SourceProvenance {
+    pub fn compatibility(provider: ProviderId) -> Self {
+        Self {
+            id: match provider {
+                ProviderId::Claude => SourceId::ClaudeOAuthCompatibility,
+                ProviderId::Codex => SourceId::CodexWhamCompatibility,
+            },
+            support: SourceSupport::Compatibility,
+        }
+    }
+}
+
+impl UsageLimit {
+    pub fn from_adapter(
+        identity: String,
+        kind: LimitKind,
+        label: String,
+        percent: f64,
+        severity: Option<ProviderSeverity>,
+        resets_unix: Option<i64>,
+        window_seconds: Option<u32>,
+    ) -> Option<Self> {
+        let id = LimitId::new(identity.clone()).or_else(|| {
+            // Preserve bounded stable identity even for an unknown long/empty kind.
+            sha256(identity.as_bytes())
+                .ok()
+                .and_then(|digest| LimitId::new(encode_hex(&digest)))
+        })?;
+        Some(Self {
+            id,
+            class: if kind == LimitKind::ExtraUsage {
+                LimitClass::Spend
+            } else {
+                LimitClass::Quota
+            },
+            kind,
+            label,
+            percent: Percent::new(percent)?,
+            severity,
+            resets_unix,
+            window_seconds,
+        })
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AccountKey([u8; ACCOUNT_KEY_BYTES]);
 
@@ -274,6 +423,36 @@ fn hex_nibble(value: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_rejects_nonfinite_and_clamps_at_boundary() {
+        assert!(Percent::new(f64::NAN).is_none());
+        assert!(Percent::new(f64::INFINITY).is_none());
+        assert_eq!(Percent::new(-3.0).unwrap().get(), 0.0);
+        assert_eq!(Percent::new(104.0).unwrap().get(), 100.0);
+        assert_eq!(Percent::new(42.5).unwrap().get(), 42.5);
+    }
+
+    #[test]
+    fn adapter_identity_is_stable_and_spend_is_explicit() {
+        let make = |label| {
+            UsageLimit::from_adapter(
+                "x".repeat(MAX_LIMIT_ID_BYTES + 1),
+                LimitKind::ExtraUsage,
+                label,
+                75.0,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let first = make("Original label".into());
+        let second = make("Changed label".into());
+        assert_eq!(first.id, second.id);
+        assert!(first.id.as_str().len() <= MAX_LIMIT_ID_BYTES);
+        assert_eq!(first.class, LimitClass::Spend);
+    }
 
     #[test]
     fn opaque_account_keys_round_trip_without_debug_or_display_contracts() {

@@ -31,9 +31,9 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `accessibility.rs` | `WM_GETOBJECT` UIA fragment roots, names and bounds from view/geometry, Invoke/Toggle dispatch to the UI thread, and focus events; Narrator verification pending |
 | `gfx.rs` | `Surface` (D3D/DXGI/DComp/D2D stack), all drawing, layout constants, Fluent palette, brush/format caches |
 | `auth.rs` | Claude account: identity from local files + explicit interactive browser sign-in (own console, cancellable) delegated to the resolved native `claude` executable |
-| `api.rs` | Claude credentials read + usage fetch; shared display model (`UsageSnapshot`, `LimitRow`, `FetchOutcome`), time formatting |
+| `api.rs` | Claude credentials read + usage fetch; adapter to typed provider model, bounded parsing, Windows reset-time formatting |
 | `codex.rs` | Codex (OpenAI) credentials read + usage fetch → same `UsageSnapshot` |
-| `provider/model.rs` | stable provider/account/limit/request identities and typed completion envelope |
+| `provider/model.rs` | provider/account/source/limit/request identities, normalized snapshots, typed kind/class/severity/Percent/window duration, and completion envelope |
 | `runtime_state.rs` | atomic optional `state.json` envelope, CNG install salt, and account-scoped receipt schema |
 | `state_policy.rs` | fake-clock-testable debounce, stale, flyout-refresh, and 429 policy |
 | `store.rs` | typed atomic JSON commit, verified `.bak` generation, corruption preservation, and failure injection |
@@ -60,6 +60,16 @@ Key decisions, with reasons:
 ## Data layer (`api.rs` + `codex.rs`)
 
 Two independent providers, one worker thread each per poll (~1/min), both producing the same display-ready `UsageSnapshot`:
+
+The shared snapshot lives in `provider/model.rs` and carries provider, opaque
+account, compatibility-source provenance, optional plan, observation time, and
+bounded `UsageLimit` rows. Each row has a stable `LimitId`, typed kind/class,
+finite/clamped `Percent`, optional provider severity hint, reset epoch, and
+window duration. `gfx::LimitRow` is the formatted view: reset strings are
+created when a snapshot is rendered or alerted, never stored in the domain
+snapshot. The completion boundary also rejects a snapshot whose embedded
+provider/account disagrees with its envelope. Compatibility endpoint strings
+are interpreted only inside their adapters.
 
 **Claude** (`api.rs::fetch`):
 

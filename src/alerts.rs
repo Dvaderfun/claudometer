@@ -27,10 +27,11 @@ use windows::UI::Notifications::{
     NotificationSetting, ToastNotification, ToastNotificationManager,
 };
 
-use crate::api::{LimitRow, UsageSnapshot};
+use crate::gfx::LimitRow;
 use crate::provider::model::{
     AccountContext, AccountKey, IdentityPersistence, LimitId, ProviderId,
 };
+use crate::provider::model::{LimitClass, UsageLimit, UsageSnapshot};
 use crate::runtime_state::AlertReceiptV1;
 use crate::{config, util};
 
@@ -105,6 +106,9 @@ fn ensure_icon() -> Option<std::path::PathBuf> {
 /// Evaluate a fresh (just-fetched) snapshot; toast every limit row newly
 /// at/over `WARN_AT` for its current window instance. UI thread only.
 pub fn check(provider: ProviderId, account: &AccountContext, snap: &UsageSnapshot) {
+    if snap.provider != provider || snap.account != account.key {
+        return;
+    }
     if !config::settings().alerts_enabled {
         return;
     }
@@ -115,18 +119,16 @@ pub fn check(provider: ProviderId, account: &AccountContext, snap: &UsageSnapsho
     let mut receipts_changed = false;
     let mut crossed = Vec::new();
     for row in &snap.rows {
-        if row.kind == "extra" {
+        if row.class == LimitClass::Spend {
             continue;
         }
-        let Some(limit) = LimitId::new(row.kind.clone()) else {
-            continue;
-        };
+        let limit = row.id.clone();
         let decision = apply_observation(
             &mut state.receipts,
             provider,
             &account.key,
             limit,
-            row.percent,
+            row.percent.get(),
             row.resets_unix,
         );
         receipts_changed |= decision.receipts_changed;
@@ -154,7 +156,12 @@ pub fn check(provider: ProviderId, account: &AccountContext, snap: &UsageSnapsho
     let mut legacy = config::legacy_alert_receipts();
     for row in &crossed {
         legacy.insert(
-            format!("{}.{}.{}", provider_name(provider), row.kind, row.label),
+            format!(
+                "{}.{}.{}",
+                provider_name(provider),
+                row.id.as_str(),
+                row.label
+            ),
             row.resets_unix.unwrap_or(0),
         );
     }
@@ -285,7 +292,12 @@ fn should_fire(
     apply_observation(receipts, provider, account, limit, pct, reset_instance_unix).fire
 }
 
-fn notify(provider: &str, rows: &[&LimitRow]) {
+fn notify(provider: &str, limits: &[&UsageLimit]) {
+    let rendered: Vec<LimitRow> = limits
+        .iter()
+        .map(|row| LimitRow::from((*row).clone()))
+        .collect();
+    let rows: Vec<&LimitRow> = rendered.iter().collect();
     let worst = rows
         .iter()
         .max_by(|a, b| a.percent.total_cmp(&b.percent))
@@ -397,12 +409,10 @@ fn esc(s: &str) -> String {
 /// The exe has no console, so the outcome lands in alert-test.txt.
 pub fn show_test() {
     let row = LimitRow {
-        kind: "session".into(),
         label: "Session (5h)".into(),
         percent: 78.0,
-        severity: String::new(),
+        severity: None,
         reset_text: "resets 18:59".into(),
-        resets_unix: None,
     };
     let out = match show_toast(
         &format!("Claude (test): {} at 78%", row.label),

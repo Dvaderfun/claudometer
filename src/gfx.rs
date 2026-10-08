@@ -22,7 +22,29 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
-use crate::api::LimitRow;
+use crate::provider::model::{ProviderSeverity, UsageLimit};
+
+#[derive(Clone)]
+pub struct LimitRow {
+    pub label: String,
+    pub percent: f64,
+    pub severity: Option<ProviderSeverity>,
+    pub reset_text: String,
+}
+
+impl From<UsageLimit> for LimitRow {
+    fn from(row: UsageLimit) -> Self {
+        Self {
+            label: row.label,
+            percent: row.percent.get(),
+            severity: row.severity,
+            reset_text: row
+                .resets_unix
+                .map(crate::api::fmt_reset_unix)
+                .unwrap_or_default(),
+        }
+    }
+}
 use crate::util;
 
 /// One provider block in the flyout: header (name + plan) and either limit
@@ -587,7 +609,11 @@ impl Surface {
     }
 
     /// severity → cached fill brush (accent / amber / red)
-    fn sev_brush<'a>(&'a self, severity: &str, percent: f64) -> &'a ID2D1SolidColorBrush {
+    fn sev_brush<'a>(
+        &'a self,
+        severity: &Option<ProviderSeverity>,
+        percent: f64,
+    ) -> &'a ID2D1SolidColorBrush {
         let b = self.cache();
         if b.key.2.is_some() {
             return &b.accent;
