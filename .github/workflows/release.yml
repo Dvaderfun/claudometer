@@ -164,9 +164,16 @@ jobs:
           $assets = Get-ChildItem -LiteralPath release-assets -File |
             Sort-Object Name |
             ForEach-Object FullName
+          $notesPath = Join-Path $env:RUNNER_TEMP 'claudometer-release-notes.md'
+          ./ci/new-release-notes.ps1 `
+            -Tag $env:GITHUB_REF_NAME `
+            -AssetsPath release-assets `
+            -PublicKeyHex $env:RELEASE_PUBLIC_KEY_HEX `
+            -Sequence $env:RELEASE_SEQUENCE `
+            -OutputPath $notesPath
           gh release create $env:GITHUB_REF_NAME @assets `
             --draft `
-            --generate-notes `
+            --notes-file $notesPath `
             --repo $env:GITHUB_REPOSITORY `
             --verify-tag
           if ($LASTEXITCODE -ne 0) {

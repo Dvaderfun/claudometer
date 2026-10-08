@@ -2,7 +2,7 @@
 
 **Your Claude + Codex usage limits, live in the Windows 11 tray.**
 
-A tiny native Windows app that shows how much of your Claude (and optionally OpenAI Codex) session and weekly limits you've used — as a colored ring in the taskbar corner and an acrylic flyout with the details. No Electron, no webview, no background bloat: the current unsigned build is a single 941,056-byte (919 KiB) executable built with Rust + Win32 + Direct2D.
+A tiny native Windows app that shows how much of your Claude (and optionally OpenAI Codex) session and weekly limits you've used — as a colored ring in the taskbar corner and an acrylic flyout with the details. No Electron, no webview, no background bloat: the release is a single executable around 1.1 MiB, built with Rust + Win32 + Direct2D.
 
 ## What you get
 
@@ -16,15 +16,15 @@ A tiny native Windows app that shows how much of your Claude (and optionally Ope
 - Survives Explorer restarts, per-monitor DPI aware, respects `Retry-After` on rate limits, keeps showing cached data through network blips.
 - Frugal by design: the reproducible no-network baseline is 1.53 MiB hidden and 4.45 MiB with the two-provider flyout visible (p95 private working set), with less than 0.002% idle CPU. See the [measurement method and raw runs](docs/performance/foundation-baseline.md).
 
-> Known gap: screen-reader (UI Automation) support is not implemented yet — the UI is fully keyboard-operable, but not announced to narrators.
+> Accessibility: UI Automation names, Invoke/Toggle, and keyboard focus are implemented. Narrator verification, additional patterns, and dynamic announcements remain incomplete.
 
 ## Install
 
-1. Grab `claudometer.exe` from [Releases](../../releases).
-2. Run it. A ring appears in the tray overflow (`^` near the clock) — drag it onto the taskbar to pin it.
+1. Download the matching versioned x64 or ARM64 executable from [Releases](https://github.com/Dvaderfun/claudometer/releases). ARM64 runtime verification remains incomplete.
+2. Follow the release notes to verify SHA-256 and GitHub provenance, then run it. A ring appears in the tray overflow (`^` near the clock) — drag it onto the taskbar to pin it.
 3. Optional: right-click the icon → **Start with Windows**.
 
-> **SmartScreen note:** the exe is unsigned, so Windows may warn on first run. "More info" → "Run anyway", or build from source below.
+> **Manual update from 0.7.x:** this first trust-root release cannot be installed by the old updater. Windows executables remain unsigned, so SmartScreen may warn. Verify the release before choosing to run it, or build from source. Subsequent updates require authenticated manifests.
 
 ## Requirements
 
@@ -36,7 +36,7 @@ A tiny native Windows app that shows how much of your Claude (and optionally Ope
 
 - Reads the OAuth access token from `%USERPROFILE%\.claude\.credentials.json`, or `$CLAUDE_CONFIG_DIR\.credentials.json` when configured (and, if present, `%USERPROFILE%\.codex\auth.json`) — **read-only**. Claudometer never writes either file and never receives or rotates a refresh token.
 - Uses the installed Claude Code CLI only for an explicit Connect/Reconnect. It opens `claude auth login` in a console window so the browser flow's fallback code can be pasted if needed; click the card again to cancel. Current native and npm installs are resolved to the real `claude.exe`, avoiding a CMD shim. Claude Code alone owns token refresh and durable credential storage.
-- Calls the Anthropic usage/profile APIs and, when Codex is signed in, the ChatGPT usage API. It also checks GitHub Releases for updates. There is no telemetry or analytics; the complete network, file, registry, process, notification, and power inventory is in [PRIVACY.md](PRIVACY.md).
+- Calls the Anthropic usage/profile APIs and, when Codex is signed in, the ChatGPT usage API. Automatic GitHub update checks default off for new installs; enable them in Settings. Existing settings retain enabled checks. There is no telemetry or analytics; the complete network, file, registry, process, notification, and power inventory is in [PRIVACY.md](PRIVACY.md).
 - Settings and runtime state live under `%APPDATA%\Claudometer`.
 
 ⚠️ Both usage endpoints are **unofficial**. Anthropic/OpenAI can change them any time, at which point the flyout will tell you it can't parse the response until this app is updated.

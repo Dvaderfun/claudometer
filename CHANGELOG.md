@@ -4,7 +4,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 
 ## [Unreleased]
 
-**Proposed trust-root release: 0.9.0 (human chooses version). Manual installation required.** Existing versions through 0.7.3 cannot authenticate this first trust-root release. Before running the download, compare its SHA-256 with an independently authenticated record and verify the Authenticode publisher/certificate. See the [verification procedure](docs/release-manifest-v1.md#trust-root-bootstrap) and [draft release notes](docs/release-notes/0.9.0.md). The package version remains 0.7.3; these notes do not publish a release.
+## [0.9.0] — 2026-10-09
+
+**Manual installation required.** Existing versions through 0.7.3 cannot authenticate this first trust-root release. Verify the download hash and GitHub release-workflow provenance before running it. Windows executables remain unsigned; Authenticode signing is deferred to v1.0 by owner decision. See the [verification procedure](docs/release-manifest-v1.md#trust-root-bootstrap) and [release notes](docs/release-notes/0.9.0.md).
 
 ### Added
 - Local diagnostics now keeps three bounded 256 KiB log files of sanitized event codes and exposes `--diagnose` / `--version` support commands. Rendering, configuration, registry, provider, update, and clipboard failures appear in diagnostics; raw messages, credentials, identifiers, and personal paths are excluded.
@@ -16,8 +18,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 - Vibecode keeps its wake lock separate from the Advanced lid-close override. Power changes use a durable recovery journal, checked writes/read-back, and conservative restoration of the recorded scheme. Legacy lid values require an explicit Restore action.
 
 ### Changed
+- Remove optional Ed25519 precomputed `fast` tables to keep both release architectures inside the existing size gates. Signature verification and trust-policy behavior are unchanged.
 - Provider state and result acceptance move onto the UI thread. Short-lived polling workers wait for an identity-bound request ticket; obsolete preparation/results cannot trigger requests, alerts, or redraws. The ten demo scenarios preserve identical rendering.
-- Introduce a pure provider state reducer with clock-driven transitions, account/generation/request checks, cached and outdated view states, and explicit accepted-fetch/cooldown outcomes. Runtime ownership moves in the next APP-01 slice; current display behavior and provider requests are preserved.
+- Introduce a pure provider state reducer with clock-driven transitions, account/generation/request checks, cached and outdated view states, and explicit accepted-fetch/cooldown outcomes. Runtime ownership is on the UI thread; provider requests retain their existing compatibility sources.
 - Optimize release builds for size with `opt-level = "z"`: the local provisioned x64 executable shrinks by 74,240 bytes and ARM64 by 88,576 bytes. The size audit records startup measurements and milestone allowances; dependency features and runtime behavior are preserved.
 - Shared usage snapshots carry provider/account/source identities and typed quota kinds, classes, percentages, severity hints, and window durations. Reset timestamps are formatted in the view layer; alerts and tray classification no longer depend on kind strings. Missing Codex duration remains unknown in the model while preserving its existing caption.
 - Automatic update checks default off for genuinely new installations; existing settings migrate to enabled. Settings provides an explicit toggle. Portable installs use authenticated journaled updates; managed or ambiguous installs offer a release-page action.
@@ -29,7 +32,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 
 ### Security
 - Release tags now build once with `--locked`, publish signed manifests and an SPDX SBOM, create GitHub provenance/SBOM attestations, verify downloaded draft assets, smoke-test the downloaded x64 executable, and publish only with immutable releases enabled.
-- **Manual trust-root bootstrap required.** Versions without an embedded Ed25519 release key—including all published versions through 0.7.3—cannot authenticate a trust-root-enabled update. They will not update automatically across that boundary. Existing users must manually download and independently verify the first trust-root-enabled release using its published hash and Authenticode identity before installing it. Later releases can use signed-manifest updates. See the [bootstrap verification procedure](docs/release-manifest-v1.md#trust-root-bootstrap).
+- **Manual trust-root bootstrap required.** Versions without an embedded Ed25519 release key—including all published versions through 0.7.3—cannot authenticate a trust-root-enabled update. They will not update automatically across that boundary. Existing users must manually download and independently verify the first trust-root-enabled release using its published hash and GitHub release-workflow provenance before installing it. Later releases can use signed-manifest updates. See the [bootstrap verification procedure](docs/release-manifest-v1.md#trust-root-bootstrap).
 - Portable self-updates now use an atomic `update-operation.v1.json` journal, attempt-unique candidate and backup names, and hash-reconciled startup recovery. The previous verified executable remains available until the candidate commit is durable.
 
 ### Known gaps
