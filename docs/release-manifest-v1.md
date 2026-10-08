@@ -32,12 +32,12 @@ missing, or incorrectly typed fields are invalid:
   "schema": "claudometer-release-manifest-v1",
   "channel": "stable",
   "sequence": 18,
-  "version": "0.9.0",
-  "tag": "v0.9.0",
+  "version": "0.9.1",
+  "tag": "v0.9.1",
   "issued_at": "2026-09-03T12:00:00Z",
   "policy_expires_at": "2026-09-10T12:00:00Z",
   "architecture": "x64",
-  "asset": "claudometer-v0.9.0-windows-x64.exe",
+  "asset": "claudometer-v0.9.1-windows-x64.exe",
   "size": 812345,
   "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "minimum_updater_version": "0.8.0"
@@ -117,7 +117,7 @@ other network response may bridge this boundary. An unprovisioned build
 likewise rejects every manifest, even when the manifest is otherwise valid and
 correctly signed.
 
-Existing users must manually install 0.9.0. Owner decision ADR 0006 defers
+Existing users must manually install 0.9.1. Owner decision ADR 0006 defers
 Authenticode signing to v1.0: these executables are unsigned for Windows.
 Bootstrap verification uses SHA-256 plus GitHub build provenance for the
 `Dvaderfun/claudometer` repository and `.github/workflows/release.yml` at the
@@ -138,12 +138,12 @@ clients, so they report no automatic-update candidate across this boundary.
 Verify before running (replace the hash with the value in release notes):
 
 ```powershell
-$asset = Resolve-Path '.\claudometer-v0.9.0-windows-x64.exe'
+$asset = Resolve-Path '.\claudometer-v0.9.1-windows-x64.exe'
 $expectedSha256 = '<64 lowercase hex characters from verified release notes>'
 if ((Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedSha256) {
     throw 'Claudometer SHA-256 mismatch'
 }
-gh attestation verify $asset.Path --repo Dvaderfun/claudometer --signer-workflow Dvaderfun/claudometer/.github/workflows/release.yml --source-ref refs/tags/v0.9.0
+gh attestation verify $asset.Path --repo Dvaderfun/claudometer --signer-workflow Dvaderfun/claudometer/.github/workflows/release.yml --source-ref refs/tags/v0.9.1
 if ($LASTEXITCODE -ne 0) { throw 'Claudometer provenance verification failed' }
 ```
 
@@ -157,11 +157,11 @@ and exact sizes; the public key below authenticates subsequent updates.
 |---|---|
 | Status | Production public policy provisioned; release prepared for GitHub |
 | Provisioned at (UTC) | 2026-10-08T23:33:54Z |
-| Bootstrap version and tag | 0.9.0 / v0.9.0 |
+| Bootstrap version and tag | 0.9.1 / v0.9.1 |
 | Ed25519 public key (lowercase hex) | 5741ac7eec5c56c96c5dcf12e7be47a2586b2739ec1f309f26b52527578660f9 |
 | Ed25519 raw-key SHA-256 fingerprint | ee7fcaf40164c6d8f8b9f3a34050b0173a7d3e28ef5c5b6bffc12b61af86d1a5 |
-| Initial embedded release sequence | 1 |
-| Minimum updater version | 0.9.0 |
+| Initial embedded release sequence | 2 |
+| Minimum updater version | 0.9.1 |
 | Windows publisher/signature | Unsigned; SIGN-01 deferred to v1.0 by ADR 0006 |
 | Verification record | Tagged source record plus verified GitHub release-workflow attestations |
 
@@ -191,10 +191,10 @@ currently trusted key using the normal one-signature envelope:
   "from_sequence": 19,
   "from_version": "0.9.1",
   "target_sequence": 20,
-  "target_version": "0.9.0",
-  "target_tag": "v0.9.0",
+  "target_version": "0.9.1",
+  "target_tag": "v0.9.1",
   "architecture": "x64",
-  "asset": "claudometer-v0.9.0-windows-x64.exe",
+  "asset": "claudometer-v0.9.1-windows-x64.exe",
   "issued_at": "2026-09-03T12:00:00Z",
   "expires_at": "2026-09-04T12:00:00Z"
 }

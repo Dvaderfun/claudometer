@@ -60,14 +60,14 @@ SIZE-01 selects release `opt-level = "z"`: current x64 **947,712 bytes unprovisi
 
 ## Release process
 
-R0 0.9.0 removes Ed25519's optional `fast` tables after production-key ARM64
+R0 0.9.1 removes Ed25519's optional `fast` tables after production-key ARM64
 failed the original 10% size gate. Final local provisioned sizes are x64
 1,145,344 bytes and ARM64 1,029,120 bytes; all signature/recovery tests pass.
 The production manifest key is configured. Release notes are rendered from
 the actual GitHub artifacts before draft publication. Windows signing remains
 SIGN-01/v1.0; never claim Authenticode or completed Narrator/ARM64 runtime proof.
 
-Human-only by default. The owner explicitly authorized agent setup, tagging, approval, and publication for 0.9.0 (ADR 0006); future releases require separate authorization.
+Human-only by default. The owner explicitly authorized agent setup, tagging, approval, and publication for 0.9.1 (ADR 0006); future releases require separate authorization.
 
 1. Bump `Cargo.toml` version, update `CHANGELOG.md`.
 2. Commit, push, wait for `build` workflow green.
