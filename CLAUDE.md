@@ -22,7 +22,7 @@ Drive the flyout programmatically: find the hidden window by class `Claudometer.
 
 Toast alerts: `.\target\release\claudometer.exe --test-alert` fires the whole pipeline with fake data; read `%APPDATA%\Claudometer\alert-test.txt` ("ok" or the error). Delivered toasts are queryable from Windows PowerShell 5.1 (not pwsh): `[Windows.UI.Notifications.ToastNotificationManager]::History.GetHistory('Claudometer')` after loading the WinRT type.
 
-Foundation runtime baseline on the reference x64 machine: **1.53 MiB hidden and 4.45 MiB with the two-provider flyout visible (p95 private working set), below 0.002% idle CPU, 10/13 GDI handles, and 50.387 ms median / 76.551 ms p95 tray readiness in the slower 50-start run**. The current unsigned x64 artifact is 941,056 bytes; per-slice sizes are in `docs/performance/artifact-ledger.md`. The controlled runtime mode excludes provider refresh/TLS work; methodology and both ten-minute runs are in `docs/performance/foundation-baseline.md`. Investigate a greater-than-10% per-slice regression.
+Foundation runtime baseline on the reference x64 machine: **1.53 MiB hidden and 4.45 MiB with the two-provider flyout visible (p95 private working set), below 0.002% idle CPU, 10/13 GDI handles, and 50.387 ms median / 76.551 ms p95 tray readiness in the slower 50-start run**. The current x64 artifact is 1,010,688 bytes unprovisioned and 1,097,728 bytes with the release trust root provisioned (hard ceiling 1,310,720); per-slice sizes are in `docs/performance/artifact-ledger.md`. The controlled runtime mode excludes provider refresh/TLS work; methodology and both ten-minute runs are in `docs/performance/foundation-baseline.md`. Investigate a greater-than-10% per-slice regression.
 
 ## Hard-won gotchas (do not re-learn these)
 
@@ -54,7 +54,9 @@ Foundation runtime baseline on the reference x64 machine: **1.53 MiB hidden and 
 
 ## Release process
 
+Human-only; agents prepare notes and stop (see `plans/state-of-the-art-v1.md` §7).
+
 1. Bump `Cargo.toml` version, update `CHANGELOG.md`.
 2. Commit, push, wait for `build` workflow green.
-3. `git tag vX.Y.Z && git push --tags` — `release.yml` builds and attaches the exe.
-4. `gh release edit vX.Y.Z --notes-file <notes>` if custom notes wanted.
+3. `git tag vX.Y.Z && git push origin vX.Y.Z`, then approve the `release` environment. `release.yml` signs the manifest, attests, creates a draft with generated notes, smoke-tests the downloaded assets, and **publishes automatically** (a failed run deletes its draft). It needs `CLAUDOMETER_RELEASE_PUBLIC_KEY_HEX`, `CLAUDOMETER_RELEASE_SEQUENCE`, and `CLAUDOMETER_RELEASE_ADMIN_READ_TOKEN` provisioned.
+4. Optionally replace the notes: `gh release edit vX.Y.Z --notes-file <notes>`. Tags and assets are immutable; never reuse a version.
