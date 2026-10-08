@@ -32,6 +32,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | CACHE-01 normalized runtime cache, synthetic trust root provisioned | 1,109,504 | +3.24% vs APP-01 provisioned | not measured | — |
 | ERR-01 actionable errors, unprovisioned | 1,038,336 | +3.95% vs CACHE-01 unprovisioned | not measured | — |
 | ERR-01 actionable errors, synthetic trust root provisioned | 1,148,928 | +3.55% vs CACHE-01 provisioned | not measured | — |
+| DIAG-01 operational snapshot, unprovisioned | 1,048,576 | +0.99% vs ERR-01 unprovisioned | not measured | — |
+| DIAG-01 operational snapshot, synthetic trust root provisioned | 1,159,168 | +0.89% vs ERR-01 provisioned | not measured | — |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;
@@ -264,3 +266,17 @@ HelpText. Tooltip uses the Win32 V2 TTTOOLINFO size confirmed at runtime.
 Scope shape checked locally with boolean-only output. No ARM64 or new
 ten-minute idle claim. Evidence/rollback:
 [`../verification/err-01.md`](../verification/err-01.md).
+
+## DIAG-01 (2026-10-09)
+
+Local fixed-field snapshot, diagnostics card/UIA text, and explicit Unicode
+clipboard export add 10,240 bytes per x64 mode. Unprovisioned 1,048,576;
+synthetic trust root provisioned 1,159,168. No new crate; Windows 0.58
+DataExchange/Memory features are enabled for clipboard ownership. Both modes
+pass unchanged size/regression/PE/version gates. Provisioned hard-ceiling
+headroom 151,552 bytes, unsigned soft-target headroom 86,016 bytes.
+
+165 tests and required gates pass. Settings screenshots/Copy Invoke/keyboard
+path/UIA text/demo clipboard guard and demo safety pass. Privacy/dependency/
+workflow policy passes. No ARM64 or new idle-CPU measurement claim. Rollback
+and limitations: [`../verification/diag-01.md`](../verification/diag-01.md).

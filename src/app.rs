@@ -29,6 +29,9 @@ struct ProviderSlot {
     last_error: Option<String>,
     error: Option<FetchError>,
     manual_cooldown_notice: bool,
+    detected: Option<bool>,
+    last_attempt_unix: Option<i64>,
+    last_success_unix: Option<i64>,
 }
 
 impl ProviderSlot {
@@ -40,6 +43,9 @@ impl ProviderSlot {
             last_error: None,
             error: None,
             manual_cooldown_notice: false,
+            detected: None,
+            last_attempt_unix: None,
+            last_success_unix: None,
         }
     }
 
@@ -47,6 +53,9 @@ impl ProviderSlot {
         self.pending = None;
         self.last_error = None;
         self.error = None;
+        self.detected = None;
+        self.last_attempt_unix = None;
+        self.last_success_unix = None;
         self.manual_cooldown_notice = false;
         self.state.reduce(
             if disabled {
@@ -87,6 +96,7 @@ impl ProviderSlot {
         };
         self.next_operation = self.next_operation.wrapping_add(1).max(1);
         self.pending = Some(preparation);
+        self.last_attempt_unix = Some(clock.read().unix_seconds);
         Some(preparation)
     }
 
@@ -137,6 +147,7 @@ impl ProviderSlot {
             return None;
         }
         self.pending = None;
+        self.detected = Some(true);
         if self
             .state
             .account()
@@ -144,6 +155,7 @@ impl ProviderSlot {
         {
             self.last_error = None;
             self.error = None;
+            self.last_success_unix = None;
             self.manual_cooldown_notice = false;
             let cache = load(preparation.provider, &account, clock.read().unix_seconds);
             self.state
@@ -182,11 +194,17 @@ impl ProviderSlot {
             return false;
         }
         self.pending = None;
+        self.detected = Some(!matches!(
+            failure.kind,
+            crate::api::PreparationFailureKind::Missing
+                | crate::api::PreparationFailureKind::Unsupported
+        ));
         let invalidates = failure.invalidates_account();
         self.last_error = Some(failure.message.to_string());
         self.error = Some(failure.error());
         if invalidates {
             self.manual_cooldown_notice = false;
+            self.last_success_unix = None;
         }
         self.state.reduce(
             ProviderEvent::PreparationFailed {
@@ -234,6 +252,11 @@ impl ProviderSlot {
         if !matches!(transition, Transition::Ignored) {
             self.last_error = error.as_ref().map(|error| error.message.clone());
             self.error = error;
+            if matches!(transition, Transition::AcceptedSuccess { .. }) {
+                self.last_success_unix = Some(clock.read().unix_seconds);
+            } else if self.state.account().is_none() {
+                self.last_success_unix = None;
+            }
         }
         transition
     }
@@ -257,6 +280,63 @@ impl ProviderSlot {
             });
         (snapshot, error)
     }
+}
+
+pub fn provider_diagnostics(interval: Duration) -> [crate::diagnostics::ProviderDiagnostic; 2] {
+    APP.with_borrow(|app| {
+        std::array::from_fn(|index| {
+            let provider = if index == 0 {
+                ProviderId::Claude
+            } else {
+                ProviderId::Codex
+            };
+            let slot = &app.providers[index];
+            let view = slot.state.view(&SystemClock, interval);
+            crate::diagnostics::ProviderDiagnostic {
+                provider,
+                enabled: provider != ProviderId::Codex || crate::config::settings().codex_enabled,
+                detected: slot.detected,
+                authenticated: slot.state.account().is_some(),
+                source: slot.state.snapshot().map_or_else(
+                    || SourceProvenance::compatibility(provider),
+                    |snapshot| snapshot.source,
+                ),
+                fallback_reason: if provider == ProviderId::Claude {
+                    "compatibility source only"
+                } else {
+                    "documented source not enabled"
+                },
+                phase: if slot.pending.is_some() {
+                    "preparing"
+                } else {
+                    match slot.state.phase() {
+                        ProviderPhase::Disabled => "disabled",
+                        ProviderPhase::Unavailable(_) => "unavailable",
+                        ProviderPhase::Idle => "idle",
+                        ProviderPhase::Fetching { .. } => "fetching",
+                        ProviderPhase::Ready => "ready",
+                        ProviderPhase::Backoff { .. } => "backoff",
+                        ProviderPhase::Failed(_) => "failed",
+                    }
+                },
+                freshness: view.state,
+                age_seconds: view.age_seconds,
+                last_attempt_unix: slot.last_attempt_unix,
+                last_success_unix: slot.last_success_unix,
+                observed_at_unix: slot.state.snapshot().map(|snapshot| snapshot.fetched_unix),
+                retry_at_unix: view.retry_at_unix,
+                next_retry_unix: view.retry_at_unix.or_else(|| {
+                    slot.last_attempt_unix
+                        .map(|_| slot.state.next_attempt_unix(&SystemClock, interval))
+                }),
+                error_code: slot
+                    .error
+                    .as_ref()
+                    .map(|error| error.code())
+                    .or_else(|| view.error.map(|error| error.code())),
+            }
+        })
+    })
 }
 
 pub struct AppState {
@@ -991,6 +1071,39 @@ mod tests {
             slot.state.phase(),
             ProviderPhase::Unavailable(UnavailableReason::Authentication)
         ));
+    }
+
+    #[test]
+    fn diagnostic_timestamps_accept_success_once_and_ignore_obsolete_results() {
+        let mut clock = FakeClock::new();
+        let mut slot = ProviderSlot::new(ProviderId::Claude);
+        let ticket = request(&mut slot, &clock, 1);
+        assert_eq!(slot.detected, Some(true));
+        assert_eq!(slot.last_attempt_unix, Some(1000));
+        assert_eq!(slot.last_success_unix, None);
+        slot.complete(
+            completion(&ticket, FetchOutcome::Ok(snapshot(1, 1000))),
+            &clock,
+        );
+        assert_eq!(slot.last_success_unix, Some(1000));
+        clock.advance(3);
+        let next = request(&mut slot, &clock, 1);
+        clock.advance(1);
+        slot.complete(
+            completion(&ticket, FetchOutcome::Ok(snapshot(1, 1000))),
+            &clock,
+        );
+        assert_eq!(slot.last_attempt_unix, Some(1003));
+        assert_eq!(slot.last_success_unix, Some(1000));
+        slot.complete(
+            completion(
+                &next,
+                FetchOutcome::Failure(FetchError::new(FailureKind::Offline)),
+            ),
+            &clock,
+        );
+        assert_eq!(slot.last_success_unix, Some(1000));
+        assert_eq!(slot.error.unwrap().code(), "connection_failed");
     }
 
     #[test]

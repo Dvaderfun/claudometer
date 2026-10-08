@@ -148,6 +148,22 @@ memory-only account digest; the token itself is not persisted.
 
 ## Registry and Windows integration
 
+Settings → Diagnostics shows a local operational snapshot: version,
+architecture, Windows build, install channel, provider detection/sign-in
+booleans, selected source/fallback, attempt/success/observation timestamps,
+freshness/age, retry deadline, stable error code, settings, and update/power
+recovery status. It reads existing in-process state, the Windows version,
+existing channel metadata, and presence of the adjacent update journal.
+It does not probe provider endpoints or start a CLI. No diagnostics log/file
+or upload is added by this feature. Provider account identifiers, emails,
+tokens, plan/limit labels, response bodies, and home paths are excluded.
+
+Explicit **Copy diagnostics** writes that snapshot as Unicode text to the
+Windows clipboard. Clipboard retention follows Windows/user clipboard
+settings (including any enabled clipboard history/sync); Claudometer does
+not clear the clipboard automatically. Demo mode tests the action without
+writing the clipboard or reading user state.
+
 | Location or API | Access | Trigger and retained effect |
 | --- | --- | --- |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme` | Read only | Read while choosing the Windows light/dark appearance; Claudometer does not change it. |

@@ -12,6 +12,7 @@ mod auth;
 mod codex;
 mod config;
 mod demo;
+mod diagnostics;
 mod gfx;
 mod network;
 mod poller;
@@ -101,6 +102,7 @@ fn effective(provider: ProviderId) -> (Option<UsageSnapshot>, Option<String>) {
 struct Ui {
     error_tooltip: Option<HWND>,
     error_tooltip_text: Vec<u16>,
+    diagnostics_copy: &'static str,
     fly: Option<gfx::Surface>,
     set: Option<gfx::Surface>,
     fly_hover: gfx::FlyHover,
@@ -124,6 +126,7 @@ thread_local! {
         RefCell::new(Ui {
             error_tooltip: None,
             error_tooltip_text: Vec::new(),
+            diagnostics_copy: "Copy",
             fly: None,
             set: None,
             fly_hover: gfx::FlyHover::None,
@@ -724,7 +727,7 @@ extern "system" fn settings_wndproc(
                         hit as usize,
                     );
                 }
-                if demo::is_active() {
+                if demo::is_active() && hit != gfx::CARD_DIAGNOSTICS as i32 {
                     render_settings(hwnd);
                     return LRESULT(0);
                 }
@@ -947,6 +950,12 @@ unsafe fn step_interval(dir: i32) {
 }
 
 unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
+    if i == gfx::CARD_DIAGNOSTICS {
+        let copied = diagnostics::copy(hwnd).is_ok();
+        UI.with_borrow_mut(|ui| ui.diagnostics_copy = if copied { "Copied" } else { "Retry" });
+        render_settings(hwnd);
+        return;
+    }
     if demo::is_active() {
         return;
     }
@@ -1181,7 +1190,7 @@ unsafe fn scroll_settings_focus_into_view(hwnd: HWND) {
             return;
         }
         let card = gfx::settings_rects(0.0)[ui.set_focus as usize];
-        if card.top < ui.set_scroll + 8.0 {
+        if card.top < ui.set_scroll + 8.0 || ui.set_focus == gfx::CARD_DIAGNOSTICS as i32 {
             ui.set_scroll = card.top - 8.0;
         } else if card.bottom > ui.set_scroll + viewport - 8.0 {
             ui.set_scroll = card.bottom - viewport + 8.0;
@@ -1702,7 +1711,7 @@ unsafe fn open_settings() {
 
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     let client_w = (gfx::SET_W * scale).round() as i32;
-    let client_h = (gfx::settings_height() * scale).round() as i32;
+    let client_h = (gfx::settings_height().min(704.0) * scale).round() as i32;
     let mut rc = RECT {
         left: 0,
         top: 0,
@@ -1796,7 +1805,8 @@ unsafe fn render_settings(hwnd: HWND) {
             if ui.set.is_none() {
                 ui.set = gfx::Surface::new(hwnd).ok();
             }
-            let st = demo::settings_view(ui.set_hover, ui.set_focus);
+            let mut st = demo::settings_view(ui.set_hover, ui.set_focus);
+            st.diagnostics_copy = ui.diagnostics_copy;
             let scroll = ui.set_scroll;
             if let Some(surface) = ui.set.as_mut() {
                 let _ = surface.render_settings(
@@ -1915,6 +1925,8 @@ unsafe fn render_settings(hwnd: HWND) {
             ),
         };
         let st = gfx::SettingsView {
+            diagnostics: diagnostics::text(),
+            diagnostics_copy: ui.diagnostics_copy,
             account_caption,
             account_action,
             account_connected,

@@ -253,6 +253,8 @@ fn build_state(request: Request, now_unix: i64) -> State {
 
 pub fn settings_view(hover: i32, focus: i32) -> SettingsView {
     SettingsView {
+        diagnostics: crate::diagnostics::text(),
+        diagnostics_copy: "Copy",
         account_caption: "Connected account · Max".to_string(),
         account_action: "Reconnect",
         account_connected: true,
