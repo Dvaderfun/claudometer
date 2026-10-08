@@ -34,6 +34,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | ERR-01 actionable errors, synthetic trust root provisioned | 1,148,928 | +3.55% vs CACHE-01 provisioned | not measured | — |
 | DIAG-01 operational snapshot, unprovisioned | 1,048,576 | +0.99% vs ERR-01 unprovisioned | not measured | — |
 | DIAG-01 operational snapshot, synthetic trust root provisioned | 1,159,168 | +0.89% vs ERR-01 provisioned | not measured | — |
+| DIAG-02 bounded log/support commands, unprovisioned | 1,053,184 | +0.44% vs DIAG-01 unprovisioned | not measured | — |
+| DIAG-02 bounded log/support commands, synthetic trust root provisioned | 1,163,776 | +0.40% vs DIAG-01 provisioned | not measured | — |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;
@@ -280,3 +282,26 @@ headroom 151,552 bytes, unsigned soft-target headroom 86,016 bytes.
 path/UIA text/demo clipboard guard and demo safety pass. Privacy/dependency/
 workflow policy passes. No ARM64 or new idle-CPU measurement claim. Rollback
 and limitations: [`../verification/diag-01.md`](../verification/diag-01.md).
+
+## DIAG-02 (2026-10-09)
+
+Final x64 builds: 1,053,184 unprovisioned / 1,163,776 synthetic trust root
+provisioned, +4,608 bytes per mode (+0.44% / +0.40%) versus DIAG-01.
+The first provisioned build measured 1,170,944 and failed the cumulative
+CI 10% gate of 1,164,134 bytes. Fixed status formatting, shared native stdout/
+log writes, whole-field vocabulary filtering, and allocation-free timestamp
+formatting reduce the final build by 7,168 bytes without changing gates,
+profile, dependency versions, or behavior requirements. No crate/feature added.
+
+The final artifact passes PE architecture/version, the original regression
+gate, and hard ceiling. Regression-gate margin is only 358 bytes; upcoming
+CODEX work requires size reduction before adding runtime code. Hard-ceiling
+headroom is 146,944 bytes; unsigned soft-target headroom is 81,408 bytes.
+Neither headroom permits bypassing the tighter cumulative CI gate.
+
+168 tests and required gates pass; corpus redaction, three bounded rotations,
+write failure, support stdout/corrupt-profile preservation, demo safety,
+diagnostics UI/keyboard/clipboard guard and 22 UIA checks are verified.
+Dedicated support process reads local identity without creating UI or
+executing requests. No new ARM64/idle-CPU claim. Evidence/rollback:
+[`../verification/diag-02.md`](../verification/diag-02.md).

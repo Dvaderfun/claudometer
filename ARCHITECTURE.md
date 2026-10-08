@@ -41,7 +41,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `provider/error.rs` | stable failure categories/codes, generated recovery copy, HTTP/IO mapping, and numeric/date Retry-After parsing |
 | `store.rs` | typed atomic JSON commit, verified `.bak` generation, corruption preservation, and failure injection |
 | `demo.rs` | deterministic provider/view scenarios and guarded no-side-effect launch mode |
-| `diagnostics.rs` | bounded local operational snapshot, Windows build, and explicit Unicode clipboard export; no provider requests or diagnostics log |
+| `diagnostics.rs` | fixed-field snapshot, explicit clipboard export, three bounded local event logs, support commands, and operational failure reporting; no network |
 | `trayicon.rs` | CPU-rasterized ring/alert HICON (premultiplied DIB, no fonts) |
 | `alerts.rs` | 75% toast alerts: WinRT toast pipeline, AUMID registration, per-window dedup |
 | `updater.rs` | GitHub-Releases self-update: daily check, verified download, rename-swap handover |
@@ -50,6 +50,16 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `vibecode.rs` | independent wake lock plus journaled Advanced lid override, conservative recovery, legacy one-shot restore, and lifecycle reconciliation |
 
 ## Rendering (`gfx::Surface`)
+
+DIAG-02 logs only fixed code vocabulary plus UTC time, with whole-field
+redaction of unknown input and three 256 KiB generations. Normal startup
+enables logging; repeated failure codes do not perform repeated writes.
+Support commands bypass normal startup: read-only config/state readers,
+dedicated support-process identity preparation without execute, no provider/update poll,
+tray, window, log, repair, or settings migration. Rendering/configuration/
+registry/update/provider failures report through fixed codes and the
+Diagnostics last-issue/log-write status. Tests use temporary log stores and
+synthetic redaction corpus; demo mode disables all diagnostic side effects.
 
 DIAG-01 adds a scrollable Diagnostics card after the existing Settings actions,
 with Invoke/Tab/Enter/Space copy. Snapshot/provider projection is read-only;

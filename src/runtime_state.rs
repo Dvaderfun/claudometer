@@ -208,6 +208,7 @@ fn save_cache<F: FaultInjector>(
         return Ok(());
     }
     if let Err(error) = store.save(&encoded) {
+        crate::diagnostics::record("runtime_failed");
         runtime.status = RuntimeStateStatus::WriteFailed(error);
         return Err(runtime.status);
     }
@@ -334,6 +335,18 @@ pub fn initialize() -> RuntimeStateStatus {
                 raw: Map::new(),
             },
         };
+        Mutex::new(state)
+    });
+    runtime.lock().unwrap().status
+}
+
+pub fn initialize_read_only() -> RuntimeStateStatus {
+    let runtime = RUNTIME.get_or_init(|| {
+        let state = state_path()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .map(|raw| decode(raw, RuntimeStateStatus::Ready))
+            .unwrap_or_else(|| invalid(Map::new()));
         Mutex::new(state)
     });
     runtime.lock().unwrap().status
@@ -471,11 +484,11 @@ pub fn diagnostic() -> Option<String> {
         RuntimeStateStatus::PathUnavailable => {
             Some("Runtime state path unavailable · cache disabled".to_string())
         }
-        RuntimeStateStatus::ReadFailed(error) => {
-            Some(format!("Runtime state read failed · {:?}", error.stage))
+        RuntimeStateStatus::ReadFailed(_) => {
+            Some("Runtime state read failed · Copy diagnostics".to_string())
         }
-        RuntimeStateStatus::WriteFailed(error) => {
-            Some(format!("Runtime state write failed · {:?}", error.stage))
+        RuntimeStateStatus::WriteFailed(_) => {
+            Some("Runtime state write failed · Copy diagnostics".to_string())
         }
         RuntimeStateStatus::EntropyUnavailable => {
             Some("Runtime state entropy unavailable · cache disabled".to_string())
