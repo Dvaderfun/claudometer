@@ -447,3 +447,13 @@ GDI 10/13 and no TCP. Five-start readiness median/p95 49.147/80.892 ms.
 This is short runtime proof, not a new ten-minute baseline. ARM64 cross-build
 only; physical lid-close and Narrator remain unverified.
 Evidence/rollback: verification/ui-clarity-01.md and ADR 0009.
+
+
+## Vibecode caption alignment (2026-10-10)
+
+Two-line title/caption bounds center around the existing card midpoint, sharing
+its icon/switch vertical anchor; caption uses cached single-line ellipsis.
+x64 unchanged: 1,071,104 unprovisioned / 1,163,264 synthetic-root provisioned.
+Ordered gates/192 tests, 59 UI clarity checks and demo safety pass; off/on
+captures reviewed in dark/light/High Contrast. No runtime/power behavior change.
+Rollback: previous binary; no settings or journal change.

@@ -73,3 +73,14 @@ Docs updated: plan, CHANGELOG, PRIVACY, CLAUDE, architecture, ADR, ledger, verif
 Deviations: owner-requested combined mode supersedes independent-control presentation; compact Next in Nm copy; Settings reuses footer schedule instead of manual-notice state
 Follow-ups: existing Narrator, real ARM64 and physical lid-close verification; no live provider/credential operation
 ```
+
+
+2026-10-10 alignment follow-up: title/caption previously started at fixed 4/24
+DIP top offsets while icon/switch used card center. Both lines now occupy a
+36-DIP block centered on that same midpoint. Cached no-wrap caption format
+keeps one line and ellipsizes long failures; full help remains in UIA. Ordered
+fmt/Clippy/192 tests, release build, 59 UI checks and demo safety pass. Off/on
+theme captures reviewed under target/vibe-alignment/ui. Both x64 trust-root
+size variants unchanged (1,071,104 / 1,163,264). Rollback: previous binary;
+no settings/schema/privacy/power change. ARM64 not rebuilt for this geometry
+fix. No new CPU or physical lid-close claim.

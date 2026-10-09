@@ -30,6 +30,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
   is 2.198 seconds, so app-server stays opt-in under the two-second gate.
 
 ### Changed
+- Center the Vibecode title and caption vertically beside its icon and switch.
 - Clearer Vibecode mode combines idle-sleep protection and verified lid-close
   protection; failed enable restores the prior wake request, and disabling
   restores lid settings. Existing recovery actions remain available.
