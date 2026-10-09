@@ -27,6 +27,9 @@ jobs:
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Prepare SBOM output directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Path sbom-assets -Force | Out-Null
       - name: Generate SPDX SBOM from tagged locked source
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         env:

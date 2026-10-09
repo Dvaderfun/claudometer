@@ -1,14 +1,14 @@
 # ADR 0006: R0 bootstrap through GitHub
 
 - Status: Accepted by the owner, 2026-10-09
-- Scope: first trust-root release 0.9.0; supersedes ADR 0001's R0 signing prerequisite
+- Scope: first trust-root release 0.9.1; supersedes ADR 0001's R0 signing prerequisite
 
 The owner authorized completing GitHub setup and publishing the existing work.
 The release remains portable and uses an embedded Ed25519 key, signed exact-byte
 manifests, immutable GitHub assets, and verified GitHub build/SBOM attestations.
 Windows Authenticode publisher signing stays a v1.0 requirement (SIGN-01).
 
-The 0.9.0 executables are unsigned for Windows. Manual bootstrap verification
+The 0.9.1 executables are unsigned for Windows. Manual bootstrap verification
 uses the expected SHA-256 and GitHub provenance for this repository and its
 release workflow. This establishes GitHub source/workflow identity, not a
 Windows publisher identity or SmartScreen reputation. Users must trust that

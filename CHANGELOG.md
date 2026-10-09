@@ -4,9 +4,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 
 ## [Unreleased]
 
-## [0.9.0] — 2026-10-09
+## [0.9.1] — 2026-10-09
 
-**Manual installation required.** Existing versions through 0.7.3 cannot authenticate this first trust-root release. Verify the download hash and GitHub release-workflow provenance before running it. Windows executables remain unsigned; Authenticode signing is deferred to v1.0 by owner decision. See the [verification procedure](docs/release-manifest-v1.md#trust-root-bootstrap) and [release notes](docs/release-notes/0.9.0.md).
+The initial immutable `v0.9.0` tag failed before publication because the SBOM
+output directory was missing. This release fixes the directory creation and
+uses a new version/tag and sequence 2; the old tag remains unchanged.
+
+**Manual installation required.** Existing versions through 0.7.3 cannot authenticate this first trust-root release. Verify the download hash and GitHub release-workflow provenance before running it. Windows executables remain unsigned; Authenticode signing is deferred to v1.0 by owner decision. See the [verification procedure](docs/release-manifest-v1.md#trust-root-bootstrap) and [release notes](docs/release-notes/0.9.1.md).
 
 ### Added
 - Local diagnostics now keeps three bounded 256 KiB log files of sanitized event codes and exposes `--diagnose` / `--version` support commands. Rendering, configuration, registry, provider, update, and clipboard failures appear in diagnostics; raw messages, credentials, identifiers, and personal paths are excluded.

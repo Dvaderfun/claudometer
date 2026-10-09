@@ -65,7 +65,7 @@ A task is **done** only when code, tests, docs, and the rollback note (§6) land
 - Never add Tokio, a WebView, a managed runtime, a loopback server, a service, or a scheduled task.
 - Never add a crate without recording its x64 size delta, license, and maintenance status in the commit message.
 - Never delete or hand-edit `power-override.v1.json` or `update-operation.v1.json`.
-- Tags, releases, repository settings/rulesets, and secrets/variables are human-only by default (§7). The owner explicitly authorized agent setup and publication of 0.9.0 on 2026-10-09 (ADR 0006); this does not authorize future releases or provider credential changes.
+- Tags, releases, repository settings/rulesets, and secrets/variables are human-only by default (§7). The owner explicitly authorized agent setup and publication of 0.9.1 on 2026-10-09 (ADR 0006); this does not authorize future releases or provider credential changes.
 - Never bump `Cargo.toml` `version` unless the task explicitly says so.
 - Never use `git push --force`, `--no-verify`, or interactive git commands.
 - Never “modernize” anything `CLAUDE.md` calls load-bearing (acrylic policy, WARP device, `LoadIconW` allow, `CREATE_NEW_CONSOLE` login).
@@ -149,9 +149,9 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | Milestone | Theme | State |
 |---|---|---|
 | Foundation | Baseline and required gates | **Done**; SIZE-01 profile audit complete on `chore/size-audit` |
-| `v0.8` | Trustworthy state and system safety | **Done on `main`; included in prepared 0.9.0 release** |
-| `v0.9` | Authenticated, crash-safe updates | **Done on `main`; included in prepared 0.9.0 release** |
-| R0 | Ship the trust-root release | **0.9.0 preparation authorized**; GitHub manifest policy provisioned, Windows signing deferred to v1.0 (ADR 0006) |
+| `v0.8` | Trustworthy state and system safety | **Done on `main`; included in prepared 0.9.1 release** |
+| `v0.9` | Authenticated, crash-safe updates | **Done on `main`; included in prepared 0.9.1 release** |
+| R0 | Ship the trust-root release | **0.9.1 preparation authorized**; GitHub manifest policy provisioned, Windows signing deferred to v1.0 (ADR 0006) |
 | `v0.10` | State core, diagnostics, Codex documented source | **In progress** (model/state/cache/errors/diagnostics committed on `main`; CODEX-01 blocked on the app-server credential contract) |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
 | `v0.12` | Glanceable status, tray, and alerts | Not started |
@@ -159,7 +159,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | `v1.1` | History-refined pacing | **Gated** on field evidence |
 | `v1.2` | One gated provider | Not started |
 
-`Cargo.toml` says `0.9.0`. Everything since `5b735ce` ships in the first R0 release, including the completed state/cache/error/diagnostic slices.
+`Cargo.toml` says `0.9.1`. Everything since `5b735ce` ships in the first R0 release, including the completed state/cache/error/diagnostic slices.
 
 ### 2.2 Facts an executor needs now
 
@@ -177,7 +177,7 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 
 1. **WIP-00** — verify the committed accessibility work (§9.1); **Narrator verification deferred by the owner on 2026-10-08**. WIP-00 and A11Y-01 remain unchecked; the owner explicitly authorized proceeding to SIZE-01 and release-note preparation without this check.
 2. **SIZE-01** — **done**: size audit, measured `z` profile, and headroom plan (§3.2) on `chore/size-audit`, branched from PR #2.
-3. **REL-03** — **done (notes only)**: proposed `docs/release-notes/0.9.0.md`, expanded Unreleased changelog, local release-input check, and live protection audit (§7). Human publishes.
+3. **REL-03** — **done (notes only)**: proposed `docs/release-notes/0.9.1.md`, expanded Unreleased changelog, local release-input check, and live protection audit (§7). Human publishes.
 4. **MODEL-01 done** → **STATE-01 done** → **APP-01 done** → **CACHE-01 done** (§8.1).
 5. **ERR-01 done** — actionable error states (§8.2).
 6. **DIAG-01 done** → **DIAG-02 done** (§8.3).
@@ -454,9 +454,9 @@ Abort a rollout immediately if: cross-account data is rendered, cached, alerted,
 
 ## 7. R0: ship the trust-root release
 
-Owner decision 2026-10-09 (ADR 0006) supersedes the historical human-only/Authenticode prerequisites below for 0.9.0: agent setup and publication are authorized, Windows signing stays SIGN-01/v1.0, and bootstrap uses hashes plus GitHub source/workflow provenance. Narrator and real ARM64 runtime remain disclosed as unverified. All existing source, artifact, signature, manifest, and repository-protection gates remain required.
+Owner decision 2026-10-09 (ADR 0006) supersedes the historical human-only/Authenticode prerequisites below for 0.9.1: agent setup and publication are authorized, Windows signing stays SIGN-01/v1.0, and bootstrap uses hashes plus GitHub source/workflow provenance. Narrator and real ARM64 runtime remain disclosed as unverified. All existing source, artifact, signature, manifest, and repository-protection gates remain required.
 
-Everything in `v0.8` and `v0.9` is on `main` and included in the prepared 0.9.0 release. The first authenticated release is also the trust-root bootstrap (UPD-02): existing users must install it manually and verify it independently; the old updater cannot authenticate it.
+Everything in `v0.8` and `v0.9` is on `main` and included in the prepared 0.9.1 release. The first authenticated release is also the trust-root bootstrap (UPD-02): existing users must install it manually and verify it independently; the old updater cannot authenticate it.
 
 - [x] **REL-03 — Prepare the trust-root release (agent prepares; human publishes).**
   - Prepare notes after WIP-00 local verification. The owner deferred Narrator on 2026-10-08 and authorized proceeding; notes must disclose incomplete A11Y-01 and do not authorize publishing or claim screen-reader support.
@@ -465,10 +465,10 @@ Everything in `v0.8` and `v0.9` is on `main` and included in the prepared 0.9.0 
   - Run `ci/check-release.ps1` and `ci/check-release-infrastructure.ps1` locally where they can run without secrets; report which checks need the release environment.
   - Write a human checklist in the handoff report and stop. Human-only steps, in this order:
     1. Generate and store the offline Ed25519 release key; set `CLAUDOMETER_RELEASE_PUBLIC_KEY_HEX` and `CLAUDOMETER_RELEASE_SEQUENCE`; provision `CLAUDOMETER_RELEASE_ADMIN_READ_TOKEN` in the `release` environment.
-    2. Choose the version (recommended `0.9.0`), bump `Cargo.toml`, commit, and wait for `build` to go green.
+    2. Choose the version (recommended `0.9.1`), bump `Cargo.toml`, commit, and wait for `build` to go green.
     3. Push the tag and approve the `release` environment. The workflow smoke-tests and publishes automatically; then apply the drafted notes with `gh release edit <tag> --notes-file docs/release-notes/<version>.md`.
     4. Record the dated provisioning entry in `docs/release-manifest-v1.md`.
-  - Completed 2026-10-08: proposed 0.9.0 notes and Unreleased changelog cover v0.8/v0.9, manual verification, Vibecode recovery, update consent, and deferred A11Y. fmt/clippy/115 tests/x64 build pass; `ci/check-release.ps1` passes on actual v0.7.3 isolated assets and live `ci/check-release-infrastructure.ps1` passes. No version bump or publication. **Publishing prerequisite:** current release workflow signs Ed25519 manifests but has no Authenticode signing/verification step required by the bootstrap contract. The human checklist records signing integration, private/public policy provisioning, real ARM64 runtime, version PR, immutable tag, and approval. Rollback: revert the notes; no runtime/data change. See `docs/release-notes/0.9.0.md` for §0.7 handoff.
+  - Completed 2026-10-08: proposed 0.9.1 notes and Unreleased changelog cover v0.8/v0.9, manual verification, Vibecode recovery, update consent, and deferred A11Y. fmt/clippy/115 tests/x64 build pass; `ci/check-release.ps1` passes on actual v0.7.3 isolated assets and live `ci/check-release-infrastructure.ps1` passes. No version bump or publication. **Publishing prerequisite:** current release workflow signs Ed25519 manifests but has no Authenticode signing/verification step required by the bootstrap contract. The human checklist records signing integration, private/public policy provisioning, real ARM64 runtime, version PR, immutable tag, and approval. Rollback: revert the notes; no runtime/data change. See `docs/release-notes/0.9.1.md` for §0.7 handoff.
 
 ---
 

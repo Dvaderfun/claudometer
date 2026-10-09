@@ -329,3 +329,11 @@ hashes are generated from the exact GitHub artifacts and appear in published
 notes. Authenticode remains deferred to v1.0 per owner ADR 0006. Rollback:
 restore `fast` only with renewed size proof, or publish an authenticated
 higher-sequence rollback; never overwrite release tags/assets or delete journals.
+
+## R0 retry / 0.9.1 (2026-10-09)
+
+v0.9.0 passed tagged source/security and both builds, then stopped before
+publication on a missing SBOM output directory. The immutable tag remains.
+v0.9.1 creates the directory and uses sequence 2 with the same key. The Syft
+1.51.1 scan was reproduced locally and identifies exactly one claudometer
+package at canonical version 0.9.1. Artifact size gates remain unchanged.
