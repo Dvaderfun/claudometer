@@ -16,6 +16,7 @@ const KEY_SCHEMA: &str = "schema_version";
 const KEY_POLL: &str = "poll_interval_seconds";
 const KEY_CODEX: &str = "codex_enabled";
 const KEY_CODEX_SERVER: &str = "codex_app_server_enabled";
+const KEY_PACE: &str = "pace_colors_enabled";
 const KEY_ALERTS: &str = "alerts_enabled";
 const KEY_UPDATE_CHECKS: &str = "update_checks_enabled";
 const KEY_WAKE_LOCK: &str = "wake_lock_enabled";
@@ -33,6 +34,7 @@ pub struct SettingsV1 {
     pub poll_interval_seconds: u32,
     pub codex_enabled: bool,
     pub codex_app_server_enabled: bool,
+    pub pace_colors_enabled: bool,
     pub alerts_enabled: bool,
     pub update_checks_enabled: bool,
     pub wake_lock_enabled: bool,
@@ -45,6 +47,7 @@ impl Default for SettingsV1 {
             poll_interval_seconds: DEFAULT_POLL_INTERVAL_SECONDS,
             codex_enabled: true,
             codex_app_server_enabled: false,
+            pace_colors_enabled: true,
             alerts_enabled: true,
             update_checks_enabled: false,
             wake_lock_enabled: false,
@@ -233,31 +236,42 @@ pub fn diagnostic() -> Option<String> {
 }
 
 pub fn set_poll_interval_seconds(seconds: u32) -> Result<(), ConfigError> {
-    update_settings(|settings| settings.poll_interval_seconds = seconds)
+    let runtime = RUNTIME.get().ok_or(ConfigError::NotInitialized)?;
+    runtime
+        .lock()
+        .unwrap()
+        .update_settings(|settings| settings.poll_interval_seconds = seconds)
 }
 
 pub fn set_codex_enabled(enabled: bool) -> Result<(), ConfigError> {
-    update_settings(|settings| settings.codex_enabled = enabled)
+    update_bool_setting(|settings| &mut settings.codex_enabled, enabled)
 }
 
 pub fn set_codex_app_server_enabled(enabled: bool) -> Result<(), ConfigError> {
-    update_settings(|settings| settings.codex_app_server_enabled = enabled)
+    update_bool_setting(|settings| &mut settings.codex_app_server_enabled, enabled)
 }
 
 pub fn set_alerts_enabled(enabled: bool) -> Result<(), ConfigError> {
-    update_settings(|settings| settings.alerts_enabled = enabled)
+    update_bool_setting(|settings| &mut settings.alerts_enabled, enabled)
+}
+
+pub fn set_pace_colors_enabled(enabled: bool) -> Result<(), ConfigError> {
+    update_bool_setting(|settings| &mut settings.pace_colors_enabled, enabled)
 }
 
 pub fn set_update_checks_enabled(enabled: bool) -> Result<(), ConfigError> {
-    update_settings(|settings| settings.update_checks_enabled = enabled)
+    update_bool_setting(|settings| &mut settings.update_checks_enabled, enabled)
 }
 
 pub fn set_wake_lock_enabled(enabled: bool) -> Result<(), ConfigError> {
-    update_settings(|settings| settings.wake_lock_enabled = enabled)
+    update_bool_setting(|settings| &mut settings.wake_lock_enabled, enabled)
 }
 
 pub fn set_persistent_lid_override_enabled(enabled: bool) -> Result<(), ConfigError> {
-    update_settings(|settings| settings.persistent_lid_override_enabled = enabled)
+    update_bool_setting(
+        |settings| &mut settings.persistent_lid_override_enabled,
+        enabled,
+    )
 }
 
 pub fn legacy_lid_recovery() -> Option<(u32, u32)> {
@@ -285,9 +299,16 @@ pub fn save_legacy_alert_receipts(receipts: &HashMap<String, i64>) -> Result<(),
     })
 }
 
-fn update_settings(update: impl FnOnce(&mut SettingsV1)) -> Result<(), ConfigError> {
+#[inline(never)]
+fn update_bool_setting(
+    field: fn(&mut SettingsV1) -> &mut bool,
+    enabled: bool,
+) -> Result<(), ConfigError> {
     let runtime = RUNTIME.get().ok_or(ConfigError::NotInitialized)?;
-    runtime.lock().unwrap().update_settings(update)
+    runtime
+        .lock()
+        .unwrap()
+        .update_settings(|settings| *field(settings) = enabled)
 }
 
 fn update_raw(update: impl FnOnce(&mut Map<String, Value>)) -> Result<(), ConfigError> {
@@ -379,6 +400,11 @@ impl<F: FaultInjector> Runtime<F> {
         self.ensure_writable()?;
         let mut next_settings = self.state.settings.clone();
         update(&mut next_settings);
+        self.save_settings(next_settings)
+    }
+
+    #[inline(never)]
+    fn save_settings(&mut self, mut next_settings: SettingsV1) -> Result<(), ConfigError> {
         next_settings = next_settings.validated();
         let next_raw = encode(&self.state.raw, &next_settings);
         self.persist(&next_raw)?;
@@ -460,6 +486,7 @@ fn decode(raw: Map<String, Value>, existing_install: bool) -> Decoded {
             .or_else(|| bool_value(raw.get(LEGACY_CODEX)))
             .unwrap_or(true),
         codex_app_server_enabled: bool_value(raw.get(KEY_CODEX_SERVER)).unwrap_or(false),
+        pace_colors_enabled: bool_value(raw.get(KEY_PACE)).unwrap_or(true),
         alerts_enabled: bool_value(raw.get(KEY_ALERTS))
             .or_else(|| bool_value(raw.get(LEGACY_ALERTS)))
             .unwrap_or(true),
@@ -492,42 +519,29 @@ fn encode(raw: &Map<String, Value>, settings: &SettingsV1) -> Map<String, Value>
         KEY_POLL.to_string(),
         Value::from(settings.poll_interval_seconds),
     );
-    encoded.insert(KEY_CODEX.to_string(), Value::from(settings.codex_enabled));
-    encoded.insert(
-        KEY_CODEX_SERVER.to_string(),
-        Value::from(settings.codex_app_server_enabled),
-    );
-    encoded.insert(KEY_ALERTS.to_string(), Value::from(settings.alerts_enabled));
-    encoded.insert(
-        KEY_UPDATE_CHECKS.to_string(),
-        Value::from(settings.update_checks_enabled),
-    );
-    encoded.insert(
-        KEY_WAKE_LOCK.to_string(),
-        Value::from(settings.wake_lock_enabled),
-    );
-    encoded.insert(
-        KEY_PERSISTENT_LID_OVERRIDE.to_string(),
-        Value::from(settings.persistent_lid_override_enabled),
-    );
+    for (key, enabled) in [
+        (KEY_CODEX, settings.codex_enabled),
+        (KEY_CODEX_SERVER, settings.codex_app_server_enabled),
+        (KEY_ALERTS, settings.alerts_enabled),
+        (KEY_PACE, settings.pace_colors_enabled),
+        (KEY_UPDATE_CHECKS, settings.update_checks_enabled),
+        (KEY_WAKE_LOCK, settings.wake_lock_enabled),
+        (
+            KEY_PERSISTENT_LID_OVERRIDE,
+            settings.persistent_lid_override_enabled,
+        ),
+        (LEGACY_CODEX, settings.codex_enabled),
+        (LEGACY_ALERTS, settings.alerts_enabled),
+        (LEGACY_WAKE_LOCK, settings.wake_lock_enabled),
+    ] {
+        encoded.insert(key.to_string(), Value::from(enabled));
+    }
 
     // Compatibility window: v0.7.x and two following releases keep reading
     // these exact unversioned keys. Do not contract them implicitly.
     encoded.insert(
         LEGACY_POLL.to_string(),
         Value::from(settings.poll_interval_seconds),
-    );
-    encoded.insert(
-        LEGACY_CODEX.to_string(),
-        Value::from(settings.codex_enabled),
-    );
-    encoded.insert(
-        LEGACY_ALERTS.to_string(),
-        Value::from(settings.alerts_enabled),
-    );
-    encoded.insert(
-        LEGACY_WAKE_LOCK.to_string(),
-        Value::from(settings.wake_lock_enabled),
     );
     encoded
 }
@@ -567,6 +581,30 @@ fn legacy_alerts_from_raw(raw: &Map<String, Value>) -> HashMap<String, i64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pace_defaults_on_and_disabled_preference_survives_restart_and_downgrade() {
+        use super::*;
+        assert!(decode(Map::new(), false).settings.pace_colors_enabled);
+        let settings = SettingsV1 {
+            pace_colors_enabled: false,
+            ..SettingsV1::default()
+        };
+        let raw = encode(&Map::new(), &settings);
+        assert!(!decode(raw.clone(), true).settings.pace_colors_enabled);
+        let mut older_reader = raw;
+        older_reader.insert(LEGACY_POLL.into(), Value::from(120));
+        assert!(!decode(older_reader, true).settings.pace_colors_enabled);
+        let mut malformed = Map::new();
+        malformed.insert(KEY_PACE.into(), Value::from("false"));
+        assert!(decode(malformed, true).settings.pace_colors_enabled);
+        let directory = TestDirectory::new();
+        let path = directory.settings_path();
+        let mut runtime = load_runtime(&path);
+        runtime
+            .update_settings(|settings| settings.pace_colors_enabled = false)
+            .unwrap();
+        assert!(!load_runtime(&path).state.settings.pace_colors_enabled);
+    }
     use std::io;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -661,6 +699,7 @@ mod tests {
                 poll_interval_seconds: 120,
                 codex_enabled: false,
                 codex_app_server_enabled: false,
+                pace_colors_enabled: true,
                 alerts_enabled: false,
                 update_checks_enabled: true,
                 wake_lock_enabled: true,

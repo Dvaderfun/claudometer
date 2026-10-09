@@ -413,6 +413,7 @@ pub fn show_test() {
         percent: 78.0,
         severity: None,
         reset_text: "resets 18:59".into(),
+        pace: crate::provider::pace::Pace::Level,
     };
     let out = match show_toast(
         &format!("Claude (test): {} at 78%", row.label),

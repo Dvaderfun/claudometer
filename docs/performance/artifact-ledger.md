@@ -38,6 +38,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | DIAG-02 bounded log/support commands, synthetic trust root provisioned | 1,163,776 | +0.40% vs DIAG-01 provisioned | not measured | — |
 | CODEX-01 isolated source, unprovisioned | 1,071,104 | +1.70% vs DIAG-02 unprovisioned | not measured | — |
 | CODEX-01 isolated source, synthetic trust root provisioned | 1,163,776 | +1.61% vs local R0 provisioned | 1,017,856 | -1.09% vs local R0 provisioned |
+| PACE-01 stateless flyout pace, unprovisioned | 1,071,616 | +0.048% vs CODEX-01 unprovisioned | 978,432 | no matching CODEX-01 unprovisioned row |
+| PACE-01 stateless flyout pace, synthetic trust root provisioned | 1,163,776 | 0.00% vs CODEX-01 provisioned | 1,017,856 | 0.00% vs CODEX-01 provisioned |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;
@@ -372,3 +374,17 @@ synthetic native-CLI isolation, manual live credential-unchanged reads, and
 artifact/privacy/dependency/workflow checks pass. Final live p95 2,198 ms keeps
 app-server opt-in; latency includes cleanup. No new ten-minute idle/memory
 claim. Evidence/rollback: verification/codex-01.md and performance/codex-02.md.
+
+## PACE-01 (2026-10-09)
+
+Final x64 1,071,616 unprovisioned / 1,163,776 synthetic-root provisioned;
+ARM64 978,432 / 1,017,856. Matching provisioned artifacts have zero growth
+versus CODEX-01. The initial 1,166,848-byte x64 build failed the unchanged
+cumulative gate; shared settings/formatting and one display label per row
+recover headroom. No crate, feature, profile, budget, or baseline changed.
+
+Final ten-minute controlled hidden/visible run: p95 private working set
+1.64/4.01 MiB, idle CPU 0.0000/0.0006%, GDI 10/13, zero TCP. Five-start
+readiness median/p95 59.688/97.351 ms. All 181 tests, required gates,
+demo safety, 22 existing UIA checks, and 19 pace/theme checks pass.
+Evidence/rollback: verification/pace-01.md and performance/pace-01.md.
