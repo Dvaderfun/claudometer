@@ -4,6 +4,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-10
+
 ### Added
 - Provider freshness headers (Updating…, Outdated, and typed error warnings),
   retained last-good flyout values, and a minute-granular next-update footer.

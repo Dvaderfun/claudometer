@@ -70,7 +70,7 @@ The production manifest key is configured. Release notes are rendered from
 the actual GitHub artifacts before draft publication. Windows signing remains
 SIGN-01/v1.0; never claim Authenticode or completed Narrator/ARM64 runtime proof.
 
-Human-only by default. The owner explicitly authorized agent setup, tagging, approval, and publication for 0.9.1 (ADR 0006); future releases require separate authorization.
+Human-only by default. The owner explicitly authorized 0.9.1 (ADR 0006) and consolidation/publication of 0.10.0 (ADR 0010); subsequent releases require separate authorization.
 
 1. Bump `Cargo.toml` version, update `CHANGELOG.md`.
 2. Commit, push, wait for `build` workflow green.
