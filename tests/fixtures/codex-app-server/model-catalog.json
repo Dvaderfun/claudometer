@@ -1,0 +1,18 @@
+{
+  "models": [{
+    "slug": "synthetic-contract-model",
+    "display_name": "Synthetic contract model",
+    "description": null,
+    "base_instructions": "Synthetic fixture. Never execute a turn.",
+    "supported_reasoning_levels": [],
+    "shell_type": "shell_command",
+    "visibility": "list",
+    "supported_in_api": true,
+    "priority": 2,
+    "support_verbosity": false,
+    "truncation_policy": { "mode": "tokens", "limit": 10000 },
+    "experimental_supported_tools": [],
+    "supports_parallel_tool_calls": true,
+    "default_reasoning_summary": "none"
+  }]
+}

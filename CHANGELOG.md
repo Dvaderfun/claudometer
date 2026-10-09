@@ -4,6 +4,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 
 ## [Unreleased]
 
+### Known gaps
+- CODEX-01/02 remain blocked after an isolated external-token audit of Codex
+  0.159.1 and 0.160.0. Synthetic local-backend probes confirm no access-token
+  file, but external login performs account discovery; business login also
+  downloads cloud configuration and persists raw account identifiers. A manual
+  probe reproduces the findings without real credentials or provider traffic.
+  See [CODEX-01 preflight](docs/verification/codex-01-preflight.md).
+
 ## [0.9.1] — 2026-10-09
 
 The initial immutable `v0.9.0` tag failed before publication because the SBOM
