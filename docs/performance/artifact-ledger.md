@@ -457,3 +457,15 @@ x64 unchanged: 1,071,104 unprovisioned / 1,163,264 synthetic-root provisioned.
 Ordered gates/192 tests, 59 UI clarity checks and demo safety pass; off/on
 captures reviewed in dark/light/High Contrast. No runtime/power behavior change.
 Rollback: previous binary; no settings or journal change.
+
+
+## Release 0.10.0 preparation (2026-10-10)
+
+Production public root, embedded sequence 3: x64 1,163,264 bytes, ARM64
+1,018,368 bytes. Existing artifact ceilings pass (versus
+published 0.9.1 production 1,145,344/1,029,120: x64 +1.56%, ARM64 -1.04%).
+192 tests, ordered gates, 59 versioned UI clarity checks, demo safety,
+privacy/dependency/workflow policy and local exact-version/PE/hash checks pass.
+Release notes render from these local artifacts for preflight only; the release
+workflow renders publication notes from its exact tested GitHub artifacts.
+No dependency/profile/budget changes; no new runtime-baseline claim.
