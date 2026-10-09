@@ -35,6 +35,8 @@ $app = [Diagnostics.Process]::Start($start)
 try {
     winapp ui wait-for Usage0 -a $app.Id -t 5000 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'No demo rows' }
+    winapp ui wait-for FooterRefresh -a $app.Id --value 'Next update in 5m' -t 5000 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Initial freshness deadline missing' }
     $window = @(winapp ui list-windows -a $app.Id --json | ConvertFrom-Json)[0]
     $main = [RowTimer]::Main($app.Id)
     if ($main -eq [IntPtr]::Zero) { throw 'No demo main window' }
@@ -46,6 +48,10 @@ try {
     # Runtime observation, not a unit test: permit two real 30-second ticks.
     Start-Sleep -Seconds 33
     Start-Sleep -Seconds 33
+    winapp ui wait-for FooterRefresh -a $app.Id --value 'Next update in 4m' -t 5000 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Minute-granular footer did not advance' }
+    winapp ui wait-for Usage4 -a $app.Id --value 'Updated 1m ago' -t 5000 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Accessible observation age did not advance' }
     winapp ui screenshot -a $app.Id --capture-screen -o (Join-Path $OutputPath 'after.png') | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Tick capture failed' }
     # Timer ownership stays on the application's thread. Drive hide/reopen
@@ -59,7 +65,7 @@ try {
     if ([regex]::Matches($source, 'TIMER_TICK,\s*30_000,').Count -ne 2) { throw 'Unexpected visible tick interval' }
     if ($source -notmatch '(?s)unsafe fn hide_flyout\(\).*?KillTimer\([^;]*TIMER_TICK\)') { throw 'Hide path does not remove the tick timer' }
     if ($source -notmatch '(?s)unsafe fn render_flyout_current\(\).*?if !IsWindowVisible\(fh\).as_bool\(\) \{\s*return;') { throw 'Hidden repaint guard is missing' }
-    [pscustomobject]@{ visible = 'countdown captures'; hidden = 'tray hide/reopen and source guard'; interval_ms = 30000; observed_seconds = 66 } |
+    [pscustomobject]@{ visible = 'countdown captures, next update 5m to 4m, Updated 1m ago'; hidden = 'tray hide/reopen and source guard'; interval_ms = 30000; observed_seconds = 66 } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputPath 'results.json')
     Write-Output 'Row timer passed: tray hide/reopen, 30-second interval and hidden guards. Review before/after captures for countdown progression.'
 } finally {

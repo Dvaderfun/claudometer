@@ -127,7 +127,7 @@ struct Ui {
     set: Option<gfx::Surface>,
     fly_hover: gfx::FlyHover,
     set_hover: i32,
-    fly_focus: i32, // keyboard focus: -1 none, 0 refresh, 1 gear, 2 vibecode
+    fly_focus: i32, // -1 none, 0 refresh, 1 gear, 2 vibecode, 3 footer
     fly_scroll: f32,
     set_focus: i32, // keyboard focus card index, -1 none
     set_scroll: f32,
@@ -139,7 +139,7 @@ struct Ui {
 }
 
 /// Flyout keyboard focus targets (refresh, gear, Vibecode row).
-const FLY_FOCUS_N: i32 = 3;
+const FLY_FOCUS_N: i32 = 4;
 
 thread_local! {
     static UI: RefCell<Ui> = const {
@@ -667,6 +667,7 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     gfx::FlyHover::Refresh => 0,
                     gfx::FlyHover::Gear => 1,
                     gfx::FlyHover::Vibe => 2,
+                    gfx::FlyHover::Footer => 3,
                     gfx::FlyHover::None => -1,
                 };
                 if control >= 0 {
@@ -911,8 +912,12 @@ extern "system" fn settings_wndproc(
 
 unsafe fn activate_flyout_control(index: i32) {
     match index {
-        0 => {
-            spawn_fetch_all(RefreshTrigger::Manual);
+        0 | 3 => {
+            let view = demo::view().unwrap_or_else(current_view);
+            let blocked = matches!(&view, gfx::View::Data(data) if data.retry_at_unix.is_some_and(|at| at > SystemClock.read().unix_seconds));
+            if index == 0 || !blocked {
+                spawn_fetch_all(RefreshTrigger::Manual);
+            }
             render_flyout_current();
         }
         1 => {
@@ -1168,6 +1173,12 @@ fn fly_hit(x: f32, y: f32) -> gfx::FlyHover {
         y,
     ) {
         gfx::FlyHover::Vibe
+    } else if contains(
+        &gfx::footer_action_rect(&demo::view().unwrap_or_else(current_view)),
+        x,
+        y,
+    ) {
+        gfx::FlyHover::Footer
     } else {
         gfx::FlyHover::None
     }
@@ -1206,6 +1217,7 @@ unsafe fn scroll_flyout_focus_into_view(hwnd: HWND) {
             0 => refresh,
             1 => settings,
             2 => gfx::vibe_row(&view),
+            3 => gfx::footer_action_rect(&view),
             _ => return,
         };
         if rect.top < ui.fly_scroll + 8.0 {
@@ -1323,99 +1335,21 @@ unsafe fn apply_flyout_theme(h: HWND) {
     util::apply_acrylic(h, dark, ui_contrast().is_some());
 }
 
-/// Last good snapshot survives transient errors (429, network blips):
-/// the flyout and tray keep showing stale data; the whole-flyout error view
-/// only appears when nothing was ever fetched from any provider. Per-provider
-/// failures degrade to a dim note line inside that provider's section.
+/// Project the account-bound reducer state, including freshness and deadlines.
 fn current_view() -> gfx::View {
-    let (c_snap, mut c_err) = effective(ProviderId::Claude);
     let interval = Duration::from_secs(u64::from(POLL_SECS.load(Ordering::SeqCst)));
-    if let Some((short, detail)) = app::error_text(ProviderId::Claude, interval) {
-        c_err = Some(format!("{short}\n{detail}"));
+    let mut sections = vec![app::flyout_section(ProviderId::Claude, interval)];
+    if codex_active() {
+        sections.push(app::flyout_section(ProviderId::Codex, interval));
     }
-    let codex_on = codex_active();
-    let refresh_note = join_notes(app::cached_notes(), manual_cooldown_note());
-
-    // Claude-only path — identical to the single-provider behavior
-    if !codex_on {
-        return match (c_snap, c_err) {
-            (None, None) => gfx::View::Loading,
-            (None, Some(mut msg)) => {
-                if let Some(note) = refresh_note {
-                    msg.push('\n');
-                    msg.push_str(&note);
-                }
-                gfx::View::Error(msg)
-            }
-            (Some(s), err) => gfx::View::Data(gfx::FlyoutData {
-                fetched_unix: Some(s.fetched_unix),
-                note: join_notes(err.as_deref().map(err_head), refresh_note),
-                sections: vec![section("Claude", s)],
-            }),
-        };
-    }
-
-    let (x_snap, mut x_err) = effective(ProviderId::Codex);
-    if let Some((short, detail)) = app::error_text(ProviderId::Codex, interval) {
-        x_err = Some(format!("{short}\n{detail}"));
-    }
-    if c_snap.is_none() && c_err.is_none() && x_snap.is_none() && x_err.is_none() {
-        return gfx::View::Loading;
-    }
-
-    let mut sections = Vec::new();
-    let mut notes = Vec::new();
-    let mut fetched: Option<i64> = None;
-    for (title, snap, err) in [("Claude", c_snap, c_err), ("Codex", x_snap, x_err)] {
-        match (snap, err) {
-            (Some(s), err) => {
-                // footer shows the OLDEST data on screen — a fresh Codex fetch
-                // must not say "Updated just now" over stale Claude rows
-                fetched = Some(fetched.map_or(s.fetched_unix, |f| f.min(s.fetched_unix)));
-                if err.is_some() {
-                    notes.push(format!(
-                        "{title}: {}",
-                        err.as_deref().map(err_head).unwrap_or_default()
-                    ));
-                }
-                sections.push(section(title, s));
-            }
-            (None, Some(msg)) => sections.push(gfx::Section {
-                title,
-                plan: String::new(),
-                status: None,
-                body: gfx::SectionBody::Note(
-                    msg.lines().next().unwrap_or("Can't load usage").to_string(),
-                ),
-            }),
-            (None, None) => sections.push(gfx::Section {
-                title,
-                plan: String::new(),
-                status: None,
-                body: gfx::SectionBody::Note("Loading…".to_string()),
-            }),
-        }
-    }
-    if let Some(note) = refresh_note {
-        notes.push(note);
-    }
+    let (fetched_unix, next_update_unix, retry_at_unix) = app::flyout_schedule(interval);
     gfx::View::Data(gfx::FlyoutData {
         sections,
-        fetched_unix: fetched,
-        note: if notes.is_empty() {
-            None
-        } else {
-            Some(notes.join(" · "))
-        },
+        fetched_unix,
+        note: None,
+        next_update_unix,
+        retry_at_unix,
     })
-}
-
-fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(format!("{first} · {second}")),
-        (Some(note), None) | (None, Some(note)) => Some(note),
-        (None, None) => None,
-    }
 }
 
 fn manual_cooldown_deadlines() -> Vec<(ProviderId, i64)> {
@@ -1423,23 +1357,6 @@ fn manual_cooldown_deadlines() -> Vec<(ProviderId, i64)> {
         POLL_SECS.load(Ordering::SeqCst),
     )))
 }
-fn manual_cooldown_note() -> Option<String> {
-    let notices: Vec<_> = manual_cooldown_deadlines()
-        .into_iter()
-        .map(|(provider, deadline)| {
-            format!(
-                "{} refresh available at {}",
-                match provider {
-                    ProviderId::Claude => "Claude",
-                    ProviderId::Codex => "Codex",
-                },
-                api::fmt_unix_hhmm(deadline)
-            )
-        })
-        .collect();
-    (!notices.is_empty()).then(|| notices.join(" · "))
-}
-
 fn manual_refresh_label() -> String {
     manual_cooldown_deadlines()
         .into_iter()
@@ -1447,30 +1364,6 @@ fn manual_refresh_label() -> String {
         .min()
         .map(|deadline| format!("Refresh available at {}", api::fmt_unix_hhmm(deadline)))
         .unwrap_or_else(|| "Refresh usage now".to_string())
-}
-
-fn section(title: &'static str, s: UsageSnapshot) -> gfx::Section {
-    let now = SystemClock.read().unix_seconds;
-    let pace_enabled = config::settings().pace_colors_enabled;
-    gfx::Section {
-        title,
-        plan: s.plan.unwrap_or_default(),
-        status: app::error_text(
-            s.provider,
-            Duration::from_secs(u64::from(POLL_SECS.load(Ordering::SeqCst))),
-        )
-        .map(|(short, _)| short)
-        .or_else(|| {
-            s.reset_credits_available
-                .map(|count| format!("Reset credits available: {count}"))
-        }),
-        body: gfx::SectionBody::Rows(
-            s.rows
-                .into_iter()
-                .map(|row| gfx::LimitRow::with_pace(row, s.provider, now, pace_enabled))
-                .collect(),
-        ),
-    }
 }
 
 /// First line, no trailing period — footer-note form of an error message.

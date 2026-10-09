@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 ## [Unreleased]
 
 ### Added
+- Provider freshness headers (Updating…, Outdated, and typed error warnings),
+  retained last-good flyout values, and a minute-granular next-update footer.
+  The footer supports click, Tab/Enter/Space and UIA Invoke, and waits during
+  provider cooldowns. UIA exposes observation age, cached origin and source.
 - Persistent Clock/Countdown reset formatting and Used/Left quota display,
   reachable through Settings, keyboard, UIA, and row-value/reset clicks. Reset
   and pace run-out times share the preference; countdown updates only while

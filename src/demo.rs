@@ -202,30 +202,51 @@ fn build_state(request: Request, now_unix: i64, render_now: i64) -> State {
             Some(0.64),
             "Demo · highest session 64%",
         ),
-        Scenario::Loading => (View::Loading, true, None, "Demo · loading usage"),
-        Scenario::Stale => (
-            data(
-                vec![claude(), codex()],
-                now_unix - 7 * 60,
-                Some("Compatibility source · cached 7m ago"),
-            ),
-            false,
-            Some(0.64),
-            "Demo · cached usage",
-        ),
-        Scenario::Cooldown => (
-            data(
-                vec![claude(), codex()],
-                now_unix - 2 * 60,
-                Some("Rate limited · retry available in 2m"),
-            ),
-            false,
-            Some(0.64),
-            "Demo · retry in 2m",
-        ),
+        Scenario::Loading => {
+            let mut section = claude();
+            section.status = Some("Updating…".into());
+            section.body = SectionBody::Note("Loading usage…".into());
+            let mut view = data(vec![section], now_unix, None);
+            if let View::Data(data) = &mut view {
+                data.fetched_unix = None;
+                data.next_update_unix = None;
+            }
+            (view, true, None, "Demo · loading usage")
+        }
+        Scenario::Stale | Scenario::Cooldown => {
+            let mut sections = vec![claude(), codex()];
+            let stale = request.scenario == Scenario::Stale;
+            let cooldown = request.scenario == Scenario::Cooldown;
+            for section in &mut sections {
+                section.status = Some(
+                    if stale {
+                        "Outdated"
+                    } else if cooldown {
+                        "⚠ Paused by provider"
+                    } else {
+                        "⚠ Offline"
+                    }
+                    .into(),
+                );
+                section.help = if stale {
+                    "Last updated 3h ago. Cached values. Source: Compatibility.".into()
+                } else if cooldown {
+                    "Rate limited. Wait until the retry time. Source: Compatibility.".into()
+                } else {
+                    "Offline. Check your connection. Showing the last values. Source: Compatibility.".into()
+                };
+            }
+            let mut view = data(sections, now_unix - if stale { 10800 } else { 120 }, None);
+            if let View::Data(data) = &mut view {
+                data.next_update_unix = Some(now_unix + 240);
+                data.retry_at_unix = cooldown.then_some(now_unix + 120);
+            }
+            (view, false, Some(0.64), "Demo · preserved usage")
+        }
         Scenario::Error => (
             View::Error(
-                "Offline\nCan't reach api.anthropic.com. Showing the last values.".to_string(),
+                "⚠ Offline\nCan't reach api.anthropic.com. Check your connection and refresh."
+                    .into(),
             ),
             false,
             None,
@@ -237,10 +258,13 @@ fn build_state(request: Request, now_unix: i64, render_now: i64) -> State {
                     title: "Providers",
                     plan: String::new(),
                     status: None,
+                    help: String::new(),
                     body: SectionBody::Note("Claude and Codex are not signed in".to_string()),
                 }],
                 fetched_unix: None,
                 note: Some("Open Settings to get started".to_string()),
+                next_update_unix: None,
+                retry_at_unix: None,
             }),
             false,
             None,
@@ -324,6 +348,8 @@ fn data(sections: Vec<Section>, fetched_unix: i64, note: Option<&str>) -> View {
         sections,
         fetched_unix: Some(fetched_unix),
         note: note.map(str::to_string),
+        next_update_unix: Some(fetched_unix + 300),
+        retry_at_unix: None,
     })
 }
 
@@ -339,6 +365,7 @@ fn provider_section(
         title,
         plan: plan.to_string(),
         status: None,
+        help: String::new(),
         body: SectionBody::Rows(
             [
                 ("Session (5h)", session, 18000, 8100),

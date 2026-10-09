@@ -24,8 +24,7 @@ struct ProviderSlot {
     state: ProviderState,
     pending: Option<Preparation>,
     next_operation: u64,
-    // Compatibility presentation survives entering Fetching. FRESH-01 will
-    // expose the richer reducer view without changing APP-01 screenshots.
+    // Legacy tray/parity presentation; the flyout uses the reducer view.
     last_error: Option<String>,
     error: Option<FetchError>,
     manual_cooldown_notice: bool,
@@ -453,6 +452,136 @@ pub fn effective(provider: ProviderId) -> (Option<UsageSnapshot>, Option<String>
     APP.with_borrow(|app| app.providers[provider.index()].effective(SystemClock.read()))
 }
 
+pub fn flyout_section(provider: ProviderId, interval: Duration) -> crate::gfx::Section {
+    APP.with_borrow(|app| app.providers[provider.index()].section(&SystemClock, interval))
+}
+
+impl ProviderSlot {
+    fn section(&self, clock: &impl Clock, interval: Duration) -> crate::gfx::Section {
+        use crate::gfx::{LimitRow, Section, SectionBody};
+        use crate::provider::state::ViewState;
+        let now = clock.read().unix_seconds;
+        let view = self.state.view(clock, interval);
+        let error = self.error.as_ref().or(view.error);
+        let updating = self.pending.is_some()
+            || matches!(view.state, ViewState::UpdatingWithData)
+            || matches!(self.state.phase(), ProviderPhase::Fetching { .. });
+        let outdated = view
+            .age_seconds
+            .is_some_and(|age| age as u64 >= interval.as_secs().saturating_mul(2).max(600));
+        let status = if updating {
+            Some("Updating…".into())
+        } else if outdated {
+            Some("Outdated".into())
+        } else {
+            error
+                .map(|error| format!("⚠ {}", error.message))
+                .or_else(|| {
+                    view.snapshot
+                        .and_then(|snapshot| snapshot.reset_credits_available)
+                        .map(|count| format!("Reset credits available: {count}"))
+                })
+        };
+        let mut help = format!(
+            "Last updated {}. Source: {}.",
+            crate::gfx::age_text(view.age_seconds),
+            if self.source.support == crate::provider::model::SourceSupport::Documented {
+                "Documented"
+            } else {
+                "Compatibility"
+            }
+        );
+        if self.state.is_cached() {
+            help.push_str(" Cached values; awaiting a successful update.");
+        }
+        if let Some(error) = error {
+            let retry = view
+                .retry_at_unix
+                .or_else(|| {
+                    (error.kind == FailureKind::Timeout)
+                        .then(|| self.state.next_attempt_unix(clock, interval))
+                })
+                .map(crate::api::fmt_unix_hhmm);
+            help.push(' ');
+            help.push_str(&error.detail(self.state.provider(), retry.as_deref()));
+        }
+        let snapshot = view.snapshot;
+        Section {
+            title: if self.state.provider() == ProviderId::Claude {
+                "Claude"
+            } else {
+                "Codex"
+            },
+            plan: snapshot
+                .and_then(|snapshot| snapshot.plan.clone())
+                .unwrap_or_default(),
+            status,
+            help,
+            body: match snapshot {
+                Some(snapshot) => SectionBody::Rows(
+                    snapshot
+                        .rows
+                        .iter()
+                        .cloned()
+                        .map(|row| {
+                            LimitRow::with_pace(
+                                row,
+                                snapshot.provider,
+                                now,
+                                crate::config::settings().pace_colors_enabled,
+                            )
+                        })
+                        .collect(),
+                ),
+                None => SectionBody::Note(if updating {
+                    "Loading usage…".into()
+                } else {
+                    error
+                        .map_or("Usage unavailable", |error| error.message.as_str())
+                        .into()
+                }),
+            },
+        }
+    }
+}
+
+pub fn flyout_schedule(interval: Duration) -> (Option<i64>, Option<i64>, Option<i64>) {
+    APP.with_borrow(|app| app.schedule(&SystemClock, interval, crate::codex_active()))
+}
+
+impl AppState {
+    fn schedule(
+        &self,
+        clock: &impl Clock,
+        interval: Duration,
+        codex_on: bool,
+    ) -> (Option<i64>, Option<i64>, Option<i64>) {
+        let mut observed = None;
+        let mut next = None;
+        let mut retry = None;
+        for (index, slot) in self.providers.iter().enumerate() {
+            if index == 1 && !codex_on {
+                continue;
+            }
+            let view = slot.state.view(clock, interval);
+            if let Some(snapshot) = view.snapshot {
+                observed = Some(observed.map_or(snapshot.fetched_unix, |at: i64| {
+                    at.min(snapshot.fetched_unix)
+                }));
+            }
+            if let Some(at) = view.retry_at_unix {
+                retry = Some(retry.map_or(at, |previous: i64| previous.max(at)));
+            } else if slot.pending.is_none()
+                && !matches!(slot.state.phase(), ProviderPhase::Fetching { .. })
+            {
+                let at = slot.state.next_attempt_unix(clock, interval);
+                next = Some(next.map_or(at, |previous: i64| previous.min(at)));
+            }
+        }
+        (observed, next, retry)
+    }
+}
+
 pub fn any_fetching() -> bool {
     APP.with_borrow(|app| {
         app.providers.iter().any(|slot| {
@@ -505,24 +634,6 @@ pub fn invalidate(provider: ProviderId, disabled: bool) {
     if !disabled {
         let _ = crate::runtime_state::clear_provider_cache(provider);
     }
-}
-
-pub fn cached_notes() -> Option<String> {
-    APP.with_borrow(|app| {
-        let notes: Vec<_> = app
-            .providers
-            .iter()
-            .enumerate()
-            .filter(|(_, slot)| slot.state.is_cached())
-            .map(|(index, _)| {
-                format!(
-                    "{}: Cached values",
-                    if index == 0 { "Claude" } else { "Codex" }
-                )
-            })
-            .collect();
-        (!notes.is_empty()).then(|| notes.join(" · "))
-    })
 }
 
 pub fn refresh(provider: ProviderId, trigger: RefreshTrigger, interval: Duration) {
@@ -810,6 +921,182 @@ mod tests {
             }),
             view.1,
         )
+    }
+
+    #[test]
+    fn flyout_retains_last_good_after_legacy_stale_cutoff_and_exposes_age() {
+        let mut clock = FakeClock::new();
+        let mut slot = ProviderSlot::new(ProviderId::Claude);
+        let ticket = request(&mut slot, &clock, 1);
+        slot.complete(
+            completion(&ticket, FetchOutcome::Ok(snapshot(1, 1000))),
+            &clock,
+        );
+        clock.advance(60);
+        let ticket = request(&mut slot, &clock, 1);
+        assert_eq!(
+            slot.section(&clock, Duration::from_secs(60))
+                .status
+                .as_deref(),
+            Some("Updating…")
+        );
+        slot.complete(
+            completion(
+                &ticket,
+                FetchOutcome::Failure(FetchError::new(FailureKind::Offline)),
+            ),
+            &clock,
+        );
+        assert_eq!(
+            slot.section(&clock, Duration::from_secs(60))
+                .status
+                .as_deref(),
+            Some("⚠ Offline")
+        );
+        clock.advance(540);
+        assert!(slot.effective(clock.read()).0.is_none()); // original tray/parity contract
+        let section = slot.section(&clock, Duration::from_secs(60));
+        assert_eq!(section.status.as_deref(), Some("Outdated"));
+        assert!(section.help.contains("Last updated 10m ago"));
+        assert!(matches!(section.body, crate::gfx::SectionBody::Rows(_)));
+        clock.advance(10200);
+        assert!(slot
+            .section(&clock, Duration::from_secs(60))
+            .help
+            .contains("3h ago"));
+    }
+
+    #[test]
+    fn flyout_preparation_cooldown_and_authentication_preserve_identity_rules() {
+        let mut clock = FakeClock::new();
+        let mut slot = ProviderSlot::new(ProviderId::Claude);
+        let ticket = request(&mut slot, &clock, 1);
+        slot.complete(
+            completion(&ticket, FetchOutcome::Ok(snapshot(1, 1000))),
+            &clock,
+        );
+        clock.advance(60);
+        let preparation = slot
+            .reserve(
+                ProviderId::Claude,
+                RefreshTrigger::Manual,
+                &clock,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(
+            slot.section(&clock, Duration::from_secs(60))
+                .status
+                .as_deref(),
+            Some("Updating…")
+        );
+        let ticket = slot
+            .prepared(preparation, account(1), &clock, Duration::from_secs(60))
+            .unwrap();
+        slot.complete(
+            completion(
+                &ticket,
+                FetchOutcome::Failure(FetchError::new(FailureKind::RateLimited)),
+            ),
+            &clock,
+        );
+        assert!(slot
+            .section(&clock, Duration::from_secs(60))
+            .status
+            .unwrap()
+            .contains("Paused by provider"));
+        assert!(slot
+            .reserve(
+                ProviderId::Claude,
+                RefreshTrigger::Manual,
+                &clock,
+                Duration::from_secs(60)
+            )
+            .is_none());
+        clock.advance(900);
+        let ticket = request(&mut slot, &clock, 1);
+        slot.complete(
+            completion(
+                &ticket,
+                FetchOutcome::Failure(FetchError::new(FailureKind::Authentication)),
+            ),
+            &clock,
+        );
+        assert!(matches!(
+            slot.section(&clock, Duration::from_secs(60)).body,
+            crate::gfx::SectionBody::Note(_)
+        ));
+        assert!(slot.state.snapshot().is_none());
+    }
+
+    #[test]
+    fn flyout_schedule_uses_oldest_observation_and_latest_active_cooldown() {
+        let mut clock = FakeClock::new();
+        let mut app = AppState::new();
+        for index in 0..2 {
+            let provider = if index == 0 {
+                ProviderId::Claude
+            } else {
+                ProviderId::Codex
+            };
+            let slot = &mut app.providers[index];
+            let prep = slot
+                .reserve(
+                    provider,
+                    RefreshTrigger::Manual,
+                    &clock,
+                    Duration::from_secs(300),
+                )
+                .unwrap();
+            let ticket = slot
+                .prepared(prep, account(1), &clock, Duration::from_secs(300))
+                .unwrap();
+            let mut data = snapshot(1, 1000 - index as i64 * 60);
+            data.provider = provider;
+            data.source = SourceProvenance::compatibility(provider);
+            slot.complete(completion(&ticket, FetchOutcome::Ok(data)), &clock);
+        }
+        assert_eq!(
+            app.schedule(&clock, Duration::from_secs(300), true),
+            (Some(940), Some(1300), None)
+        );
+        assert_eq!(
+            app.schedule(&clock, Duration::from_secs(300), false),
+            (Some(1000), Some(1300), None)
+        );
+        clock.advance(60);
+        for index in 0..2 {
+            let provider = if index == 0 {
+                ProviderId::Claude
+            } else {
+                ProviderId::Codex
+            };
+            let slot = &mut app.providers[index];
+            let prep = slot
+                .reserve(
+                    provider,
+                    RefreshTrigger::Manual,
+                    &clock,
+                    Duration::from_secs(300),
+                )
+                .unwrap();
+            let ticket = slot
+                .prepared(prep, account(1), &clock, Duration::from_secs(300))
+                .unwrap();
+            let mut error = FetchError::new(FailureKind::RateLimited);
+            error.retry_after = Some(120 + index as u64 * 60);
+            slot.complete(completion(&ticket, FetchOutcome::Failure(error)), &clock);
+        }
+        assert_eq!(
+            app.schedule(&clock, Duration::from_secs(300), true),
+            (Some(940), None, Some(1240))
+        );
+        assert_eq!(
+            app.schedule(&clock, Duration::from_secs(300), false),
+            (Some(1000), None, Some(1180))
+        );
+        clock.advance(180);
+        assert_eq!(app.schedule(&clock, Duration::from_secs(300), true).2, None);
     }
 
     #[test]

@@ -42,6 +42,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | PACE-01 stateless flyout pace, synthetic trust root provisioned | 1,163,776 | 0.00% vs CODEX-01 provisioned | 1,017,856 | 0.00% vs CODEX-01 provisioned |
 | ROW-01 reset/value choices, unprovisioned | 1,071,104 | -0.048% vs PACE-01 | 978,432 | 0.00% vs PACE-01 |
 | ROW-01 reset/value choices, synthetic trust root provisioned | 1,163,776 | 0.00% vs PACE-01 | 1,018,368 | +0.050% vs PACE-01 |
+| FRESH-01 freshness/footer, unprovisioned | 1,071,104 | 0.00% vs ROW-01 | 978,944 | +0.052% vs ROW-01 |
+| FRESH-01 freshness/footer, synthetic trust root provisioned | 1,163,776 | 0.00% vs ROW-01 | 1,018,880 | +0.050% vs ROW-01 |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;
@@ -405,3 +407,23 @@ countdown progression; source checks pin visible-only 30-second ticks.
 Evidence/runtime/rollback: verification/row-01.md and performance/row-01.md.
 Final ten-minute p95 private working set 1.61/4.95 MiB, idle CPU
 0.0000/0.0013%, GDI 10/13, zero TCP. Five-start median/p95 37.531/67.446 ms.
+
+
+## FRESH-01 (2026-10-10)
+
+Final x64 1,071,104 unprovisioned / 1,163,776 synthetic-root provisioned;
+ARM64 978,944 / 1,018,880. x64 is unchanged from ROW-01; ARM64 adds 512
+bytes (+0.052% unprovisioned / +0.050% provisioned). Original cumulative
+artifact gates and hard ceiling remain unchanged; no dependency, Windows
+feature, release profile, baseline or budget changed.
+
+191 tests, ordered gates, both architecture/trust-root builds, demo safety,
+72 freshness UI checks, 52 row checks, 19 pace checks and 22 existing UIA
+checks pass. Timer checks prove minute-granular footer/age progression,
+hide/reopen and the visible-only 30-second guard. Evidence/runtime/rollback:
+verification/fresh-01.md and performance/fresh-01.md.
+
+Final ten-minute visible p95 private working set 4.55 MiB, idle CPU 0.0033%,
+GDI 13, no TCP; five-start median/p95 38.023/78.379 ms. Concurrent hidden
+sample acquired flyout graphics and exceeds hidden memory; it is not hidden
+baseline proof. The isolated short-check scope is documented in fresh-01.md.

@@ -126,7 +126,14 @@ Resilience rules (UI-owned providers in `app.rs`, with time decisions isolated i
 - Credential parsing and secret-bearing request preparation run only on short-lived provider workers. A stable provider account ID is salted with the CNG-generated install salt and SHA-256; when none exists, an access-token fingerprint uses a process-only salt and is never persisted. Secret strings have no `Debug`/serialization surface and overwrite their buffers on drop.
 - Every provider has a current opaque account, generation, request ID, and account-bound last-good state. Worker preparation has a separate operation identity and cannot start a request after UI invalidation. Account changes clear snapshot, plan, error, cooldown, debounce, and alerts before replacement work. A completion must match provider + generation + request + account before any side effect; obsolete work cannot clear a newer request.
 - Claude's profile-plan cache is keyed by opaque account. Its local fallback plan and stable ID are captured from the same worker-local identity read, so a concurrent account switch cannot attach another account's plan.
-- `last_good` snapshot survives failed fetches for up to 10 minutes — UI shows stale data + footer note; a provider with no data degrades to a dim note line in its own section; the whole-flyout error view exists only for the nothing-ever-fetched case.
+- Same-account last-good snapshots survive transient failures. FRESH-01 projects
+  reducer freshness into provider headers; Outdated begins at max(two poll
+  intervals, ten minutes). Authentication/account changes clear data. The
+  footer uses the oldest shown observation and the next eligible attempt;
+  its all-provider action waits for the latest active cooldown. Header refresh
+  keeps independent provider gating. Age, cached origin and source are in UIA.
+  Footer click/keyboard/Invoke share dispatch and scroll/focus geometry.
+  The existing visible-only 30-second timer supplies minute-granular copy.
 - Every 429 starts a 60–900 s `cooldown_until` immediately (server `Retry-After` when useful, exponential fallback otherwise). Automatic and manual refreshes both honor it; there is no fast retry.
 - 3 s debounce on refresh; UI-owned pending preparation/request state dedupes worker spawns. Characterization uses an injected fake clock and never sleeps.
 - Workers publish non-secret AppEvents through one mutexed queue and `PostMessageW(WM_DATA_READY)`; polling ticks also drain the queue if Windows drops a wakeup. The UI owns all state transitions; workers retain prepared credentials while waiting up to ten seconds for an accepted request ticket. Rejected preparation never makes a provider request. Alerts run directly from accepted successful transitions after releasing UI state borrows.
@@ -138,9 +145,10 @@ debounce, and consecutive-429 state. A successful accepted transition is the
 only alert/cache candidate; rejected completions produce no effects. Cache
 loads are account-checked and never fresh. Transient failures retain the
 same-account snapshot, with an Outdated view at the §5.2 age threshold. The
-compatibility presentation retains its characterized ten-minute stale display
-for live errors. Restored snapshots carry a Cached values note and true age;
-FRESH-01 exposes richer freshness states later. `state_reference.rs` retains the old slot logic only
+tray/parity presentation retains its characterized ten-minute stale display
+for live errors. Restored snapshots carry a Cached values caption and true
+age; FRESH-01 exposes richer freshness states in the flyout.
+`state_reference.rs` retains the old slot logic only
 under `cfg(test)` for direct behavior comparisons and original characterization.
 
 CACHE-01 adds optional `provider_cache` version 1 inside state schema 1.

@@ -93,6 +93,7 @@ impl LimitRow {
         }
     }
 }
+use crate::provider::state::Clock;
 use crate::util;
 
 /// One provider block in the flyout: header (name + plan) and either limit
@@ -102,6 +103,7 @@ pub struct Section {
     pub title: &'static str,
     pub plan: String,
     pub status: Option<String>,
+    pub help: String,
     pub body: SectionBody,
 }
 
@@ -118,6 +120,8 @@ pub struct FlyoutData {
     pub fetched_unix: Option<i64>,
     /// footer note (stale-data errors), e.g. "Codex: rate limited"
     pub note: Option<String>,
+    pub next_update_unix: Option<i64>,
+    pub retry_at_unix: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -130,6 +134,7 @@ pub enum View {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FlyHover {
     None,
+    Footer,
     Refresh,
     Gear,
     Vibe,
@@ -276,14 +281,60 @@ pub fn vibe_row_at(top: f32) -> D2D_RECT_F {
 }
 
 pub fn flyout_height(view: &View) -> f32 {
-    let bottom = vibe_row(view).bottom;
-    match view {
-        View::Data(data) => {
-            let footer_lines = if data.note.is_some() { 2.0 } else { 1.0 };
-            bottom + FOOTER_GAP_ABOVE + 1.0 + FOOTER_GAP_BELOW + CAPTION_H * footer_lines + PAD
-        }
-        _ => bottom + PAD,
+    footer_action_rect(view).bottom + PAD
+}
+
+pub fn footer_action_rect(view: &View) -> D2D_RECT_F {
+    let top = vibe_row(view).bottom + FOOTER_GAP_ABOVE + 1.0 + FOOTER_GAP_BELOW;
+    rect(
+        PAD,
+        top + CAPTION_H + GAP,
+        FLYOUT_W - PAD,
+        top + 2.0 * CAPTION_H + 2.0 * GAP,
+    )
+}
+
+pub fn age_text(age: Option<i64>) -> String {
+    match age {
+        None => "never".into(),
+        Some(age) if age < 60 => "just now".into(),
+        Some(age) if age < 3600 => format!("{}m ago", age / 60),
+        Some(age) => format!("{}h ago", age / 3600),
     }
+}
+
+pub fn footer_action(view: &View, now: i64) -> String {
+    if let View::Data(data) = view {
+        if let Some(at) = data.retry_at_unix.filter(|at| *at > now) {
+            return format!("Retry at {}", crate::api::fmt_unix_hhmm(at));
+        }
+        if let Some(at) = data.next_update_unix.filter(|at| *at > now) {
+            let minutes = at.saturating_sub(now).saturating_add(59) / 60;
+            return format!("Next update in {minutes}m");
+        }
+    }
+    "Refresh usage now".into()
+}
+
+pub fn updated_caption(view: &View) -> String {
+    if let View::Data(data) = view {
+        if let Some(at) = data.fetched_unix {
+            let prefix = if data
+                .sections
+                .iter()
+                .any(|section| section.help.contains("Cached values"))
+            {
+                "Cached values · "
+            } else {
+                ""
+            };
+            return format!("{prefix}Updated {}", relative_time(at));
+        }
+        if let Some(note) = &data.note {
+            return note.clone();
+        }
+    }
+    "No successful update yet".into()
 }
 
 fn section_body_h(body: &SectionBody) -> f32 {
@@ -355,13 +406,11 @@ pub fn accessible_rows(view: &View) -> Vec<(D2D_RECT_F, String)> {
             }
         }
     }
-    if let Some(note) = &data.note {
-        let top = vibe_row(view).bottom + FOOTER_GAP_ABOVE + 1.0 + FOOTER_GAP_BELOW;
-        rows.push((
-            rect(PAD, top, FLYOUT_W - PAD, top + 2.0 * CAPTION_H),
-            format!("Status, {note}"),
-        ));
-    }
+    let r = footer_action_rect(view);
+    rows.push((
+        rect(PAD, r.top - CAPTION_H - GAP, FLYOUT_W - PAD, r.top - GAP),
+        updated_caption(view),
+    ));
     rows
 }
 
@@ -859,9 +908,7 @@ impl Surface {
                 hover == FlyHover::Vibe,
                 focus == 2,
             )?;
-            if let View::Data(d) = view {
-                self.draw_footer(w_dip, vibe.bottom + FOOTER_GAP_ABOVE, d)?;
-            }
+            self.draw_footer(view, hover == FlyHover::Footer, focus == 3)?;
 
             self.draw_header_buttons(hover, focus, fetching, update_dot)?;
 
@@ -1071,33 +1118,34 @@ impl Surface {
         Ok(())
     }
 
-    /// Divider + "Updated …" caption, drawn under the Vibecode row.
-    fn draw_footer(&self, w: f32, div_y: f32, d: &FlyoutData) -> Result<()> {
+    fn draw_footer(&self, view: &View, hover: bool, focused: bool) -> Result<()> {
         let b = self.cache();
-        self.fill(rect(PAD, div_y, w - PAD, div_y + 1.0), &b.divider);
-        let foot_y = div_y + 1.0 + FOOTER_GAP_BELOW;
-        let mut footer = match d.fetched_unix {
-            Some(u) => format!("Updated {}", relative_time(u)),
-            None => String::new(),
-        };
-        if let Some(n) = &d.note {
-            if !footer.is_empty() {
-                footer.push_str(" · ");
-            }
-            footer.push_str(n);
-        }
+        let r = footer_action_rect(view);
+        let div_y = r.top - GAP - CAPTION_H - FOOTER_GAP_BELOW - 1.0;
+        self.fill(rect(PAD, div_y, FLYOUT_W - PAD, div_y + 1.0), &b.divider);
         self.text(
-            &footer,
-            &self.fmt_caption,
-            rect(
-                PAD,
-                foot_y,
-                w - PAD,
-                foot_y + CAPTION_H * if d.note.is_some() { 2.0 } else { 1.0 },
-            ),
+            &updated_caption(view),
+            &self.fmt_caption_1,
+            rect(PAD, r.top - CAPTION_H - GAP, FLYOUT_W - PAD, r.top - GAP),
             &b.dim,
             false,
         )?;
+        if hover {
+            self.rounded(r, 4.0, &b.control_hover)?;
+        }
+        self.text(
+            &footer_action(
+                view,
+                crate::provider::state::SystemClock.read().unix_seconds,
+            ),
+            &self.fmt_caption_1,
+            r,
+            &b.text,
+            false,
+        )?;
+        if focused {
+            self.focus_ring(r, 4.0)?;
+        }
         Ok(())
     }
 
@@ -1743,6 +1791,54 @@ fn relative_time(unix: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn footer_minutes_deadlines_and_geometry_are_bounded() {
+        let mut data = FlyoutData {
+            sections: vec![],
+            fetched_unix: None,
+            note: None,
+            next_update_unix: None,
+            retry_at_unix: None,
+        };
+        for (seconds, expected) in [
+            (1, "Next update in 1m"),
+            (60, "Next update in 1m"),
+            (61, "Next update in 2m"),
+            (240, "Next update in 4m"),
+        ] {
+            data.next_update_unix = Some(1000 + seconds);
+            assert_eq!(footer_action(&View::Data(data.clone()), 1000), expected);
+        }
+        data.retry_at_unix = Some(1120);
+        assert_eq!(
+            footer_action(&View::Data(data.clone()), 1000),
+            format!("Retry at {}", crate::api::fmt_unix_hhmm(1120))
+        );
+        data.next_update_unix = Some(1000);
+        assert_eq!(
+            footer_action(&View::Data(data.clone()), 1120),
+            "Refresh usage now"
+        );
+        for view in [
+            View::Loading,
+            View::Error("Offline".into()),
+            View::Data(data),
+        ] {
+            let r = footer_action_rect(&view);
+            assert!(r.top > vibe_row(&view).bottom);
+            assert_eq!(flyout_height(&view), r.bottom + PAD);
+        }
+        for (seconds, expected) in [
+            (None, "never"),
+            (Some(59), "just now"),
+            (Some(60), "1m ago"),
+            (Some(10800), "3h ago"),
+        ] {
+            assert_eq!(age_text(seconds), expected);
+        }
+    }
     #[test]
     fn quota_display_complements_value_without_changing_severity() {
         for (used, expected) in [
@@ -1781,6 +1877,7 @@ mod tests {
                 assert_eq!(row.reset_text, if started { "Not started" } else { "" });
                 let view = View::Data(FlyoutData {
                     sections: vec![Section {
+                        help: String::new(),
                         title: if provider == ProviderId::Claude {
                             "Claude"
                         } else {
@@ -1792,6 +1889,8 @@ mod tests {
                     }],
                     fetched_unix: Some(9000),
                     note: None,
+                    next_update_unix: None,
+                    retry_at_unix: None,
                 });
                 let rows = accessible_rows(&view);
                 assert_eq!(
@@ -1856,10 +1955,13 @@ mod tests {
                 title: "Claude",
                 plan: String::new(),
                 status: None,
+                help: String::new(),
                 body: SectionBody::Rows(vec![projected]),
             }],
             fetched_unix: Some(9000),
             note: None,
+            next_update_unix: None,
+            retry_at_unix: None,
         });
         let name = &accessible_rows(&view)[0].1;
         assert!(name.starts_with(&format!("Claude, {projected_label}, 60% used")));
@@ -1896,7 +1998,6 @@ mod tests {
         );
         assert!(row.reset_text.is_empty());
     }
-    use super::*;
 
     fn settings_view(update_checks_on: bool) -> SettingsView {
         SettingsView {
@@ -1963,10 +2064,13 @@ mod tests {
         let mut data = FlyoutData {
             fetched_unix: Some(1000),
             note: None,
+            next_update_unix: None,
+            retry_at_unix: None,
             sections: vec![Section {
                 title: "Claude",
                 plan: "Synthetic".to_string(),
                 status: None,
+                help: String::new(),
                 body: SectionBody::Rows(vec![LimitRow {
                     label: "Session".to_string(),
                     percent: 50.0,
