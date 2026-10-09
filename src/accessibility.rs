@@ -2,6 +2,7 @@
 //! no app state: they derive names and bounds from the same view and geometry as
 //! rendering, and dispatch actions back to the window's UI thread.
 
+use crate::provider::state::Clock;
 use windows::core::{implement, IUnknown, Interface, Result, BSTR, VARIANT};
 use windows::Win32::Foundation::{E_NOTIMPL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
@@ -100,6 +101,15 @@ fn flyout_items(hwnd: HWND) -> Vec<Item> {
             Role::Button,
         ),
         wake,
+        item(
+            "FooterRefresh",
+            gfx::footer_action(
+                &view,
+                crate::provider::state::SystemClock.read().unix_seconds,
+            ),
+            scrolled(gfx::footer_action_rect(&view), scroll),
+            Role::Button,
+        ),
     ];
     for (index, (rect, name)) in gfx::accessible_rows(&view).into_iter().enumerate() {
         result.push(item(
@@ -109,11 +119,29 @@ fn flyout_items(hwnd: HWND) -> Vec<Item> {
             Role::Text,
         ));
     }
+    if let gfx::View::Data(data) = &view {
+        result[3].help =
+            "Refresh all providers now. During cooldown, wait until the retry time.".into();
+        result[3].enabled = !data
+            .retry_at_unix
+            .is_some_and(|at| at > crate::provider::state::SystemClock.read().unix_seconds);
+        for item in result.iter_mut().skip(4) {
+            if let Some(section) = data
+                .sections
+                .iter()
+                .find(|section| item.name.starts_with(section.title))
+            {
+                item.help.clone_from(&section.help);
+            }
+        }
+    }
     if let Some(detail) = crate::app::error_details(std::time::Duration::from_secs(u64::from(
         config::settings().poll_interval_seconds,
     ))) {
         for item in &mut result {
-            item.help = detail.clone();
+            if item.help.is_empty() {
+                item.help = detail.clone();
+            }
         }
     }
     result

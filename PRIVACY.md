@@ -28,6 +28,15 @@ its Settings control changes the same global preference. Countdown formatting
 uses the local clock in memory and repaints on the existing 30-second visible
 flyout timer. Demo actions change these choices in memory only and never save.
 
+Freshness tokens and the next-update footer use the existing in-memory reducer,
+observation timestamps and retry deadlines. Clicking the footer or pressing
+Enter/Space requests the existing manual refresh for all providers. While any
+shown provider is cooling down, the footer waits until the latest deadline and
+does not fetch. The header refresh keeps the existing per-provider gates.
+The visible-only 30-second timer updates age and minute-granular copy; no new
+endpoint, persisted field, timer, credential operation or child process is added.
+Demo refresh actions remain side-effect free.
+
 Windows, the selected provider, GitHub, the default browser, or the Claude Code
 CLI may independently keep their own network, notification, process, or crash
 records. Those records are governed by those components rather than by

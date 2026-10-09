@@ -250,6 +250,10 @@ impl ProviderState {
         &self.phase
     }
 
+    pub fn provider(&self) -> ProviderId {
+        self.provider
+    }
+
     pub fn account(&self) -> Option<&AccountContext> {
         self.account.as_ref()
     }
