@@ -21,6 +21,7 @@ const LID_CLOSE_ACTION: GUID = GUID::from_u128(0x5ca83367_6e45_459f_a27b_476b1d0
 const LID_DO_NOTHING: LidValues = LidValues { ac: 0, dc: 0 };
 
 static WAKE_LOCK_ON: AtomicBool = AtomicBool::new(false);
+static DEMO_MODE_ON: AtomicBool = AtomicBool::new(false);
 static PERSISTENT_STATUS: AtomicU8 = AtomicU8::new(PersistentStatus::Disabled as u8);
 static LAST_ERROR: Mutex<Option<VibeErrorCode>> = Mutex::new(None);
 
@@ -48,6 +49,7 @@ impl PersistentStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VibeErrorCode {
+    WakeLock,
     Config,
     JournalPath,
     JournalRead,
@@ -584,13 +586,76 @@ pub fn is_on() -> bool {
     WAKE_LOCK_ON.load(Ordering::SeqCst)
 }
 
-pub fn set(on: bool) {
+fn set(on: bool) -> bool {
     if crate::demo::is_active() {
+        return false;
+    }
+    let previous = config::settings().wake_lock_enabled;
+    if config::set_wake_lock_enabled(on).is_ok() {
+        if set_wake_lock(on) {
+            return true;
+        }
+        let _ = config::set_wake_lock_enabled(previous);
+        return false;
+    }
+    if !on {
+        set_wake_lock(false);
+    }
+    false
+}
+
+#[inline(never)]
+pub fn mode_is_on() -> bool {
+    if crate::demo::is_active() {
+        return DEMO_MODE_ON.load(Ordering::SeqCst);
+    }
+    is_on() && persistent_status() == PersistentStatus::Applied
+}
+
+trait ModeApi {
+    fn wake(&mut self, on: bool) -> bool;
+    fn lid(&mut self, on: bool) -> bool;
+}
+
+fn change_mode(api: &mut impl ModeApi, on: bool, previous_wake: bool, previous_lid: bool) -> bool {
+    if on {
+        if !api.wake(true) {
+            return false;
+        }
+        if previous_lid || api.lid(true) {
+            return true;
+        }
+        api.wake(previous_wake);
+        false
+    } else {
+        // Always drop wake before restoring lid policy, even if saving fails.
+        let wake = api.wake(false);
+        let lid = api.lid(false);
+        wake && lid
+    }
+}
+
+#[inline(never)]
+pub fn set_mode(on: bool) {
+    if crate::demo::is_active() {
+        DEMO_MODE_ON.store(on, Ordering::SeqCst);
         return;
     }
-    if config::set_wake_lock_enabled(on).is_ok() {
-        set_wake_lock(on);
+    struct Real;
+    impl ModeApi for Real {
+        fn wake(&mut self, on: bool) -> bool {
+            set(on)
+        }
+        fn lid(&mut self, on: bool) -> bool {
+            set_persistent_override(on)
+        }
     }
+    change_mode(
+        &mut Real,
+        on,
+        is_on(),
+        persistent_status() == PersistentStatus::Applied,
+    );
 }
 
 pub fn persistent_status() -> PersistentStatus {
@@ -752,21 +817,28 @@ pub fn restore_for_exit() {
 }
 
 pub fn flyout_caption() -> &'static str {
+    if crate::demo::is_active() {
+        return caption_for(
+            mode_is_on(),
+            if mode_is_on() {
+                PersistentStatus::Applied
+            } else {
+                PersistentStatus::Disabled
+            },
+        );
+    }
     caption_for(is_on(), persistent_status())
 }
 
 fn caption_for(wake_lock_on: bool, status: PersistentStatus) -> &'static str {
     match (wake_lock_on, status) {
-        (true, PersistentStatus::Applied) => "Awake · lid override journaled",
-        (false, PersistentStatus::Applied) => "Lid override journaled",
-        (true, PersistentStatus::LegacyRecoveryPending) => "Awake · legacy lid recovery saved",
-        (false, PersistentStatus::LegacyRecoveryPending) => "Legacy lid recovery saved",
-        (true, PersistentStatus::RecoveryRequired) => "Awake · lid recovery required",
-        (false, PersistentStatus::RecoveryRequired) => "Lid recovery required",
-        (true, PersistentStatus::Error) => "Awake · lid override unavailable",
-        (false, PersistentStatus::Error) => "Lid override unavailable",
-        (true, PersistentStatus::Disabled) => "Awake · no lid-policy changes",
-        (false, PersistentStatus::Disabled) => "Off · no lid-policy changes",
+        (true, PersistentStatus::Applied) => "On · stays awake with lid closed",
+        (false, PersistentStatus::Applied) => "Lid protected · idle sleep allowed",
+        (_, PersistentStatus::LegacyRecoveryPending) => "Restore saved lid settings first",
+        (_, PersistentStatus::RecoveryRequired) => "Lid settings need recovery",
+        (_, PersistentStatus::Error) => "Lid protection failed · open Settings",
+        (true, PersistentStatus::Disabled) => "Awake · closing lid may sleep",
+        (false, PersistentStatus::Disabled) => "Keep running with lid closed",
     }
 }
 
@@ -777,16 +849,22 @@ pub fn diagnostic() -> Option<String> {
         .and_then(|error| error.map(|code| format!("Vibecode recovery · {code:?}")))
 }
 
-fn set_wake_lock(on: bool) {
-    unsafe {
+fn set_wake_lock(on: bool) -> bool {
+    let success = unsafe {
         let flags = if on {
             ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
         } else {
             ES_CONTINUOUS
         };
-        SetThreadExecutionState(flags);
+        SetThreadExecutionState(flags).0 != 0
+    };
+    if success || !on {
+        WAKE_LOCK_ON.store(on && success, Ordering::SeqCst);
     }
-    WAKE_LOCK_ON.store(on, Ordering::SeqCst);
+    if !success {
+        set_error(VibeError::new(VibeErrorCode::WakeLock));
+    }
+    success
 }
 
 fn journal_path() -> Result<PathBuf, VibeError> {
@@ -1390,15 +1468,108 @@ mod tests {
     fn captions_never_conflate_wake_lock_and_persistent_override() {
         assert_eq!(
             caption_for(true, PersistentStatus::Disabled),
-            "Awake · no lid-policy changes"
+            "Awake · closing lid may sleep"
         );
         assert_eq!(
             caption_for(false, PersistentStatus::Applied),
-            "Lid override journaled"
+            "Lid protected · idle sleep allowed"
         );
         assert_eq!(
             caption_for(true, PersistentStatus::RecoveryRequired),
-            "Awake · lid recovery required"
+            "Lid settings need recovery"
+        );
+    }
+
+    #[test]
+    fn unified_mode_orders_protection_and_rolls_back_failed_enable() {
+        struct Fake {
+            calls: Vec<(char, bool)>,
+            fail_wake: bool,
+            fail_lid: bool,
+        }
+        impl ModeApi for Fake {
+            fn wake(&mut self, on: bool) -> bool {
+                self.calls.push(('w', on));
+                !self.fail_wake
+            }
+            fn lid(&mut self, on: bool) -> bool {
+                self.calls.push(('l', on));
+                !self.fail_lid
+            }
+        }
+        for (on, wake, lid, fail_wake, fail_lid, expected, calls) in [
+            (
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                vec![('w', true), ('l', true)],
+            ),
+            (true, false, false, true, false, false, vec![('w', true)]),
+            (
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+                vec![('w', true), ('l', true), ('w', false)],
+            ),
+            (
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                vec![('w', true), ('l', true), ('w', true)],
+            ),
+            (true, false, true, false, false, true, vec![('w', true)]),
+            (
+                false,
+                true,
+                true,
+                true,
+                false,
+                false,
+                vec![('w', false), ('l', false)],
+            ),
+            (
+                false,
+                true,
+                true,
+                false,
+                true,
+                false,
+                vec![('w', false), ('l', false)],
+            ),
+            (
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                vec![('w', false), ('l', false)],
+            ),
+        ] {
+            let mut api = Fake {
+                calls: vec![],
+                fail_wake,
+                fail_lid,
+            };
+            assert_eq!(change_mode(&mut api, on, wake, lid), expected);
+            assert_eq!(api.calls, calls);
+        }
+        assert_eq!(
+            caption_for(true, PersistentStatus::Applied),
+            "On · stays awake with lid closed"
+        );
+        assert_eq!(
+            caption_for(false, PersistentStatus::Disabled),
+            "Keep running with lid closed"
         );
     }
 }

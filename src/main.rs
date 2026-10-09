@@ -780,6 +780,7 @@ extern "system" fn settings_wndproc(
                     );
                 }
                 if demo::is_active()
+                    && hit != gfx::CARD_LID as i32
                     && hit != gfx::CARD_DIAGNOSTICS as i32
                     && hit != gfx::CARD_QUOTA_DISPLAY as i32
                     && hit != gfx::CARD_RESET_FORMAT as i32
@@ -925,7 +926,7 @@ unsafe fn activate_flyout_control(index: i32) {
             open_settings();
         }
         2 => {
-            vibecode::set(!vibecode::is_on());
+            vibecode::set_mode(!vibecode::mode_is_on());
             render_flyout_current();
         }
         _ => {}
@@ -1026,6 +1027,11 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
         return;
     }
     if demo::is_active() {
+        if i == gfx::CARD_LID {
+            vibecode::set_mode(!vibecode::mode_is_on());
+            render_flyout_current();
+            render_settings(hwnd);
+        }
         return;
     }
     match i {
@@ -1088,11 +1094,11 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
                     vibecode::retry_recovery();
                 }
                 vibecode::PersistentStatus::Error if vibecode::persistent_preference_enabled() => {
-                    vibecode::set_persistent_override(false);
+                    vibecode::set_mode(false);
                 }
                 status => {
-                    vibecode::set_persistent_override(
-                        status != vibecode::PersistentStatus::Applied,
+                    vibecode::set_mode(
+                        status != vibecode::PersistentStatus::Applied || !vibecode::is_on(),
                     );
                 }
             }
@@ -1352,18 +1358,8 @@ fn current_view() -> gfx::View {
     })
 }
 
-fn manual_cooldown_deadlines() -> Vec<(ProviderId, i64)> {
-    app::manual_cooldown_deadlines(Duration::from_secs(u64::from(
-        POLL_SECS.load(Ordering::SeqCst),
-    )))
-}
 fn manual_refresh_label() -> String {
-    manual_cooldown_deadlines()
-        .into_iter()
-        .map(|(_, deadline)| deadline)
-        .min()
-        .map(|deadline| format!("Refresh available at {}", api::fmt_unix_hhmm(deadline)))
-        .unwrap_or_else(|| "Refresh usage now".to_string())
+    gfx::footer_action(&current_view(), SystemClock.read().unix_seconds)
 }
 
 /// First line, no trailing period — footer-note form of an error message.
@@ -1519,13 +1515,9 @@ unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f
     let accent = demo.map_or_else(util::accent_rgb, |_| (96, 159, 255));
     let contrast = ui_contrast();
     let fetching = demo.map_or_else(any_fetching, |state| state.fetching);
-    let vibe_on = demo.is_none() && vibecode::is_on();
+    let vibe_on = vibecode::mode_is_on();
     let update_dot = demo.is_none() && updater::has_update();
-    let caption = if demo.is_some() {
-        "Off · demo mode makes no system changes"
-    } else {
-        vibecode::flyout_caption()
-    };
+    let caption = vibecode::flyout_caption();
     update_error_tooltip(fh);
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
@@ -1827,15 +1819,13 @@ fn live_settings_view(hover: i32, focus: i32, copy: &'static str) -> gfx::Settin
             }),
         ),
         vibecode::PersistentStatus::Applied => (
-            "Advanced · ignore lid close",
-            "Active · restores on exit",
+            "Vibecode mode",
+            "On · restores when turned off or exiting",
             None,
         ),
-        vibecode::PersistentStatus::Disabled => (
-            "Advanced · ignore lid close",
-            "Restores on exit when enabled",
-            None,
-        ),
+        vibecode::PersistentStatus::Disabled => {
+            ("Vibecode mode", "Keep running with lid closed", None)
+        }
     };
     let account = auth::snapshot();
     let (account_caption, account_action, account_connected) = if account.busy {
@@ -1897,7 +1887,7 @@ fn live_settings_view(hover: i32, focus: i32, copy: &'static str) -> gfx::Settin
         update_checks_on: settings.update_checks_enabled,
         lid_label: lid_label.to_string(),
         lid_caption: lid_caption.to_string(),
-        lid_on: vibecode::persistent_status() == vibecode::PersistentStatus::Applied,
+        lid_on: vibecode::mode_is_on(),
         lid_action,
         about,
         about_btn,

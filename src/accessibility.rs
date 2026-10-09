@@ -78,14 +78,14 @@ fn flyout_items(hwnd: HWND) -> Vec<Item> {
     let (refresh, settings) = gfx::fly_btns();
     let mut wake = item(
         "KeepAwake",
-        "Keep computer awake",
+        "Vibecode mode",
         scrolled(gfx::vibe_row(&view), scroll),
-        Role::Toggle(!demo::is_active() && vibecode::is_on()),
+        Role::Toggle(vibecode::mode_is_on()),
     );
     wake.help = if demo::is_active() {
         "Demo mode makes no system changes".to_string()
     } else {
-        vibecode::flyout_caption().to_string()
+        format!("{}. Prevents idle sleep and lid-close sleep. Off or exit restores lid settings. Manual Sleep, shutdown, lost network and empty battery still stop work.", vibecode::flyout_caption())
     };
     let mut result = vec![
         item(
@@ -212,7 +212,7 @@ fn settings_items(hwnd: HWND) -> Vec<Item> {
     };
     let mut lid = item(
         "LidOverride",
-        "Advanced, ignore lid close",
+        "Vibecode mode",
         rects[gfx::CARD_LID],
         lid_role,
     );
@@ -259,11 +259,11 @@ fn settings_items(hwnd: HWND) -> Vec<Item> {
     result.push(diagnostics);
     let mut source = item(
         "CodexAppServer",
-        "Codex app-server",
+        gfx::CODEX_SOURCE_LABEL,
         rects[gfx::CARD_CODEX_SERVER],
         Role::Toggle(view.codex_server_on),
     );
-    source.help = "Prefer the documented source when the installed CLI is audited. Turn off to use Compatibility.".into();
+    source.help = "Reads usage and additional quotas through Codex CLI. About two seconds per check. Unsupported versions use direct checks; turn off for faster checks.".into();
     result.push(source);
     let pace = item(
         "PaceColors",

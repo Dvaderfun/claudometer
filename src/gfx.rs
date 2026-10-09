@@ -286,12 +286,7 @@ pub fn flyout_height(view: &View) -> f32 {
 
 pub fn footer_action_rect(view: &View) -> D2D_RECT_F {
     let top = vibe_row(view).bottom + FOOTER_GAP_ABOVE + 1.0 + FOOTER_GAP_BELOW;
-    rect(
-        PAD,
-        top + CAPTION_H + GAP,
-        FLYOUT_W - PAD,
-        top + 2.0 * CAPTION_H + 2.0 * GAP,
-    )
+    rect(PAD, top, FLYOUT_W - PAD, top + 28.0)
 }
 
 pub fn age_text(age: Option<i64>) -> String {
@@ -310,10 +305,10 @@ pub fn footer_action(view: &View, now: i64) -> String {
         }
         if let Some(at) = data.next_update_unix.filter(|at| *at > now) {
             let minutes = at.saturating_sub(now).saturating_add(59) / 60;
-            return format!("Next update in {minutes}m");
+            return format!("Next in {minutes}m");
         }
     }
-    "Refresh usage now".into()
+    "Refresh now".into()
 }
 
 pub fn updated_caption(view: &View) -> String {
@@ -392,6 +387,9 @@ pub fn accessible_rows(view: &View) -> Vec<(D2D_RECT_F, String)> {
                     if !matches!(limit.pace, Pace::Level) {
                         name.push_str(", ");
                         name.push_str(limit.pace.name());
+                        if limit.pace.even_fraction().is_some() {
+                            name.push_str(". Bar tick marks elapsed window time; usage past it is ahead of an even pace.");
+                        }
                     }
                     rows.push((rect(PAD, y, FLYOUT_W - PAD, y + ROW_BLOCK), name));
                     y += ROW_BLOCK;
@@ -408,7 +406,7 @@ pub fn accessible_rows(view: &View) -> Vec<(D2D_RECT_F, String)> {
     }
     let r = footer_action_rect(view);
     rows.push((
-        rect(PAD, r.top - CAPTION_H - GAP, FLYOUT_W - PAD, r.top - GAP),
+        rect(PAD, r.top, FLYOUT_W - PAD, r.bottom),
         updated_caption(view),
     ));
     rows
@@ -483,14 +481,15 @@ pub const CARD_ABOUT: usize = 9;
 pub const CARD_QUIT: usize = 10;
 pub const CARD_DIAGNOSTICS: usize = 11;
 pub const CARD_CODEX_SERVER: usize = 12;
+pub const CODEX_SOURCE_LABEL: &str = "Use Codex CLI for usage";
+pub const CODEX_SOURCE_CAPTION: &str = "Optional · more quota details, slower checks";
 pub const CARD_PACE: usize = 13;
 pub const CARD_QUOTA_DISPLAY: usize = 14;
 pub const CARD_RESET_FORMAT: usize = 15;
-const DIAGNOSTICS_H: f32 = 720.0;
+const DIAGNOSTICS_H: f32 = 128.0;
 
 pub fn settings_height() -> f32 {
-    let cards = N_CARDS as f32 * CARD_H + (N_CARDS as f32 - 1.0) * CARD_GAP;
-    SET_PAD + cards + DIAGNOSTICS_H - CARD_H + SET_PAD
+    settings_rects(0.0)[N_CARDS - 1].bottom + SET_PAD
 }
 
 pub fn settings_rects(scroll: f32) -> [D2D_RECT_F; N_CARDS] {
@@ -499,6 +498,8 @@ pub fn settings_rects(scroll: f32) -> [D2D_RECT_F; N_CARDS] {
     for (index, r) in out.iter_mut().enumerate() {
         let height = if index == CARD_DIAGNOSTICS {
             DIAGNOSTICS_H
+        } else if index == CARD_CODEX_SERVER {
+            80.0
         } else {
             CARD_H
         };
@@ -1121,27 +1122,28 @@ impl Surface {
     fn draw_footer(&self, view: &View, hover: bool, focused: bool) -> Result<()> {
         let b = self.cache();
         let r = footer_action_rect(view);
-        let div_y = r.top - GAP - CAPTION_H - FOOTER_GAP_BELOW - 1.0;
+        let div_y = r.top - FOOTER_GAP_BELOW - 1.0;
         self.fill(rect(PAD, div_y, FLYOUT_W - PAD, div_y + 1.0), &b.divider);
-        self.text(
-            &updated_caption(view),
-            &self.fmt_caption_1,
-            rect(PAD, r.top - CAPTION_H - GAP, FLYOUT_W - PAD, r.top - GAP),
-            &b.dim,
-            false,
-        )?;
         if hover {
             self.rounded(r, 4.0, &b.control_hover)?;
         }
         self.text(
-            &footer_action(
-                view,
-                crate::provider::state::SystemClock.read().unix_seconds,
-            ),
+            &updated_caption(view),
             &self.fmt_caption_1,
-            r,
-            &b.text,
+            rect(PAD, r.top + 6.0, PAD + 152.0, r.bottom),
+            &b.dim,
             false,
+        )?;
+        let action = footer_action(
+            view,
+            crate::provider::state::SystemClock.read().unix_seconds,
+        );
+        self.text(
+            &action,
+            &self.fmt_caption_1,
+            rect(PAD + 156.0, r.top + 6.0, FLYOUT_W - PAD, r.bottom),
+            &b.text,
+            true,
         )?;
         if focused {
             self.focus_ring(r, 4.0)?;
@@ -1166,7 +1168,7 @@ impl Surface {
             radiusX: 3.5,
             radiusY: 3.5,
         };
-        let border = if hover && b.key.2.is_some() {
+        let border = if on || (hover && b.key.2.is_some()) {
             &b.accent
         } else {
             &b.card_stroke
@@ -1184,7 +1186,7 @@ impl Surface {
         let text_left = r.left + 40.0;
         let text_right = r.right - 56.0; // clear of the 40px toggle + margin
         self.text(
-            "Keep computer awake",
+            "Vibecode mode",
             &self.fmt_body_1,
             rect(text_left, r.top + 4.0, text_right, r.top + 4.0 + LABEL_H),
             &b.text,
@@ -1266,7 +1268,7 @@ impl Surface {
                 st.about.as_str(),
                 "Quit Claudometer",
                 "Diagnostics",
-                "Codex app-server",
+                CODEX_SOURCE_LABEL,
                 "Color bars by current pace",
                 "Quota display",
                 "Reset format",
@@ -1320,7 +1322,7 @@ impl Surface {
                     )?;
                     self.button(card.right - 16.0, card.top + 26.0, st.diagnostics_copy)?;
                     self.text(
-                        &st.diagnostics,
+                        "Copy system and connection details.\nNo credentials are included.",
                         &self.fmt_caption,
                         rect(
                             card.left + 16.0,
@@ -1352,13 +1354,15 @@ impl Surface {
                 )?;
                 let label_right = if i == CARD_INTERVAL {
                     card.right - 200.0
+                } else if i == CARD_CODEX_SERVER {
+                    card.right - 64.0
                 } else {
                     card.right - 120.0
                 };
-                if i == CARD_ACCOUNT || i == CARD_CAPS || i == CARD_LID {
+                if i == CARD_ACCOUNT || i == CARD_CAPS || i == CARD_LID || i == CARD_CODEX_SERVER {
                     self.text(
                         labels[i],
-                        &self.fmt_body,
+                        &self.fmt_body_1,
                         rect(
                             card.left + 48.0,
                             card.top + 7.0,
@@ -1372,14 +1376,15 @@ impl Surface {
                         match i {
                             CARD_ACCOUNT => &st.account_caption,
                             CARD_CAPS => &st.caps_caption,
-                            _ => &st.lid_caption,
+                            CARD_LID => &st.lid_caption,
+                            _ => CODEX_SOURCE_CAPTION,
                         },
-                        &self.fmt_caption_1,
+                        &self.fmt_caption,
                         rect(
                             card.left + 48.0,
                             card.top + 29.0,
                             label_right,
-                            card.top + 45.0,
+                            card.bottom - 7.0,
                         ),
                         &b.dim,
                         false,
@@ -1803,10 +1808,10 @@ mod tests {
             retry_at_unix: None,
         };
         for (seconds, expected) in [
-            (1, "Next update in 1m"),
-            (60, "Next update in 1m"),
-            (61, "Next update in 2m"),
-            (240, "Next update in 4m"),
+            (1, "Next in 1m"),
+            (60, "Next in 1m"),
+            (61, "Next in 2m"),
+            (240, "Next in 4m"),
         ] {
             data.next_update_unix = Some(1000 + seconds);
             assert_eq!(footer_action(&View::Data(data.clone()), 1000), expected);
@@ -1819,7 +1824,7 @@ mod tests {
         data.next_update_unix = Some(1000);
         assert_eq!(
             footer_action(&View::Data(data.clone()), 1120),
-            "Refresh usage now"
+            "Refresh now"
         );
         for view in [
             View::Loading,

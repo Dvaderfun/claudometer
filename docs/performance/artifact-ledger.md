@@ -44,6 +44,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | ROW-01 reset/value choices, synthetic trust root provisioned | 1,163,776 | 0.00% vs PACE-01 | 1,018,368 | +0.050% vs PACE-01 |
 | FRESH-01 freshness/footer, unprovisioned | 1,071,104 | 0.00% vs ROW-01 | 978,944 | +0.052% vs ROW-01 |
 | FRESH-01 freshness/footer, synthetic trust root provisioned | 1,163,776 | 0.00% vs ROW-01 | 1,018,880 | +0.050% vs ROW-01 |
+| UI-CLARITY-01 mode/compact controls, unprovisioned | 1,071,104 | 0.00% vs FRESH-01 | 979,456 | +0.052% vs FRESH-01 |
+| UI-CLARITY-01 mode/compact controls, synthetic trust root provisioned | 1,163,264 | -0.044% vs FRESH-01 | 1,018,880 | 0.00% vs FRESH-01 |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;
@@ -427,3 +429,21 @@ Final ten-minute visible p95 private working set 4.55 MiB, idle CPU 0.0033%,
 GDI 13, no TCP; five-start median/p95 38.023/78.379 ms. Concurrent hidden
 sample acquired flyout graphics and exceeds hidden memory; it is not hidden
 baseline proof. The isolated short-check scope is documented in fresh-01.md.
+
+
+## UI-CLARITY-01 (2026-10-10)
+
+Final x64 1,071,104 / 1,163,264 bytes (unprovisioned/synthetic root);
+ARM64 979,456 / 1,018,880. Original artifact gates unchanged. Initial
+provisioned 1,165,824 failed; shared footer/Settings schedule and compact
+support/action formatting recover size without changing provider fetch gates.
+No dependency, feature, profile, schema or budget changes.
+
+192 tests, ordered gates, 59 clarity/72 freshness/52 row/19 pace/22 existing
+UIA checks, timer and both trust-root demo-safety checks pass. Short isolated
+10-second-warmup/60-second sample (8 observations): hidden/visible p95 private
+working set 1,675,264 / 4,345,856 bytes (1.60/4.14 MiB), CPU 0.0000/0.0000%,
+GDI 10/13 and no TCP. Five-start readiness median/p95 49.147/80.892 ms.
+This is short runtime proof, not a new ten-minute baseline. ARM64 cross-build
+only; physical lid-close and Narrator remain unverified.
+Evidence/rollback: verification/ui-clarity-01.md and ADR 0009.

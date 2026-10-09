@@ -184,6 +184,7 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 6. **DIAG-01 done** → **DIAG-02 done** (§8.3).
 7. **CODEX-01 done** → **CODEX-02 done** (§8.4): owner-approved ADR 0007, isolated ephemeral external auth, audited native x64 hashes, bounded private stdio, account/source-bound cache, kill-on-close job and checked cleanup. Final ten-sample live p95 2.198 s exceeds 2 s, so Settings opt-in remains off by default. Other CLI versions/ARM64 use Compatibility; no same-cycle second request. See `docs/verification/codex-01.md` and `docs/performance/codex-02.md`.
 8. **PACE-01 done** → **ROW-01 done** → **FRESH-01 done** (§10.1). If the v0.10 tail is blocked, PACE-01 and ROW-01 may start once MODEL-01 is done, and FRESH-01 once APP-01 is done.
+   - Owner-requested **UI-CLARITY-01** (2026-10-10) follows FRESH-01: unified Vibecode mode over existing journaled protections, compact freshness/Diagnostics and explained Codex source. ADR 0009 records the product change; **done locally**, 192 tests and 59 clarity + 72 freshness + 52 row + 19 pace + 22 UIA checks pass. x64 1,071,104 / 1,163,264 bytes, original gates unchanged. Evidence/rollback: `docs/verification/ui-clarity-01.md`. Normal Settings power row mirrors the mode; recovery actions remain.
 9. **A11Y-02**, **LAYOUT-01**, **LAYOUT-02**, **RENDER-01** (§9).
 10. **ONBOARD-01**, **ONBOARD-02**, **KEY-01**, **UI-TEST-01** (§9).
 11. **TRAY-01**, **TRAY-02**, **TRAY-03**, **ALERT-03**, **ALERT-04**, **PRIV-03** (§10).
@@ -417,7 +418,7 @@ Session                                   ~3% spare      ← name + optional pac
   - `Updating…` while a fetch is in flight (static text, no spinner animation).
   - `Outdated` when the last successful fetch is older than `max(2 × poll interval, 10 minutes)`. Tooltip/UIA: `Last updated 3h ago`.
   - A warning glyph plus the short error text from §5.3 when the last attempt failed.
-- Footer: the existing `Updated …` caption plus `Next update in 4m`. Activating the footer action (click, Enter, Space) refreshes all providers now. During cooldown it reads `Retry at 18:42` and does not fetch.
+- Footer: the existing `Updated …` caption plus `Next in 4m`. Activating the footer action (click, Enter, Space) refreshes all providers now. During cooldown it reads `Retry at 18:42` and does not fetch.
 - Source provenance (`Documented`/`Compatibility`) is **not** shown in the flyout. It appears in diagnostics, Settings → About/Diagnostics, and the provider's UIA description.
 
 ### 5.3 Error states (ERR-01)
@@ -577,7 +578,7 @@ Everything in `v0.8` and `v0.9` shipped in the immutable 0.9.1 release, publishe
 - [ ] **A11Y-01 — Complete the UI Automation fragment tree.**
   - Buttons: Invoke. Switches: Toggle. Interval and metric choices: Selection. Quota bars: read-only RangeValue.
   - Accessible names include provider, window, used/left value, reset, pace verdict, and freshness.
-  - Dynamic changes raise targeted property events; the ticking `Updated …` and `Next update in …` captions must not cause repeated announcements.
+  - Dynamic changes raise targeted property events; the ticking `Updated …` and `Next in …` captions must not cause repeated announcements.
   - Remaining after WIP-00 inspection: Selection for interval/metric choices, read-only RangeValue for quota bars (currently Text), richer names with freshness/pace, targeted property events (currently focus events only), and Narrator verification. Demo actions are intentionally guarded; successful Invoke/Toggle calls do not prove live setting mutations or state-change announcements.
 
 - [ ] **A11Y-02 — Non-color semantics.**
@@ -672,7 +673,7 @@ Everything in `v0.8` and `v0.9` shipped in the immutable 0.9.1 release, publishe
 - [x] **FRESH-01 — Updating, Outdated, and next-update footer.**
   - Completed locally 2026-10-10: reducer-derived Updating/Outdated/typed warning headers, same-account last-good retention, oldest-observation/cached caption and minute-granular next update. Footer click/Tab/Enter/Space/UIA shares manual refresh; any displayed cooldown blocks it until the latest deadline, while header refresh retains per-provider gates. 191 tests, ordered gates, 72 freshness checks, 52 row checks, 19 pace checks, 22 existing UIA checks and timer hide/reopen/age progression pass. x64 1,071,104 unprovisioned / 1,163,776 provisioned; ARM64 978,944 / 1,018,880, original gates unchanged. Final ten-minute visible CPU 0.0033%, p95 private working set 4.55 MiB, GDI 13, no TCP. Concurrent hidden measurement acquired flyout graphics and is not claimed as hidden-baseline proof. Evidence/rollback: `docs/verification/fresh-01.md`, `docs/performance/fresh-01.md`, artifact ledger. Narrator and actual ARM64 runtime remain unverified.
   - Implement the §5.2 header tokens and footer from the STATE-01 view states.
-  - `Next update in 4m` is minute-granular; the footer action refreshes now or shows `Retry at …` during cooldown.
+  - `Next in 4m` is minute-granular; the footer action refreshes now or shows `Retry at …` during cooldown.
   - Acceptance: demo scenarios `loading`, `stale`, `cooldown`, and `error` show the right token; UIA exposes each; idle CPU stays within budget with the flyout open for ten minutes.
 
 ### 10.2 Tray and alerts
@@ -907,7 +908,7 @@ Acceptance: an ADR records the evidence first; new-only, new+Claude, new+Codex, 
 
 Borrow ideas, not scope.
 
-- [OpenUsage](https://github.com/robinebers/openusage) (macOS, Swift): pace-verdict bar colors with an even-pace tick; click-to-flip used/left and countdown/clock; an `Outdated` tag after about two refresh cycles; a per-provider in-flight indicator and `Next update in …` footer; “Not started” sessions; specific errors for inference-only tokens and provider throttling; previous-session cache shown instantly but never treated as fresh; hide-from-screen-share; global shortcut; one behavior doc per surface and one page per provider with Troubleshooting. **Do not copy:** its token refresh and credential write-back, crash telemetry, loopback HTTP API, cloud sync, API-key providers, local-log spend analytics, or the reset-credit claim button.
+- [OpenUsage](https://github.com/robinebers/openusage) (macOS, Swift): pace-verdict bar colors with an even-pace tick; click-to-flip used/left and countdown/clock; an `Outdated` tag after about two refresh cycles; a per-provider in-flight indicator and `Next in …` footer; “Not started” sessions; specific errors for inference-only tokens and provider throttling; previous-session cache shown instantly but never treated as fresh; hide-from-screen-share; global shortcut; one behavior doc per surface and one page per provider with Troubleshooting. **Do not copy:** its token refresh and credential write-back, crash telemetry, loopback HTTP API, cloud sync, API-key providers, local-log spend analytics, or the reset-credit claim button.
 - [CodexBar](https://github.com/steipete/CodexBar): source provenance, provider contracts, diagnostics, docs structure.
 - [Win-CodexBar](https://github.com/nesszer/Win-CodexBar): Windows install, Winget, support diagnostics. Not its WebView or provider breadth.
 - [WhereMyTokens](https://github.com/jeongwookie/WhereMyTokens): account-bound normalized state, statusline-first Claude behavior.

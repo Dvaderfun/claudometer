@@ -27,7 +27,6 @@ struct ProviderSlot {
     // Legacy tray/parity presentation; the flyout uses the reducer view.
     last_error: Option<String>,
     error: Option<FetchError>,
-    manual_cooldown_notice: bool,
     detected: Option<bool>,
     last_attempt_unix: Option<i64>,
     last_success_unix: Option<i64>,
@@ -69,7 +68,6 @@ impl ProviderSlot {
             next_operation: 1,
             last_error: None,
             error: None,
-            manual_cooldown_notice: false,
             detected: None,
             last_attempt_unix: None,
             last_success_unix: None,
@@ -95,7 +93,6 @@ impl ProviderSlot {
         self.detected = None;
         self.last_attempt_unix = None;
         self.last_success_unix = None;
-        self.manual_cooldown_notice = false;
         self.state.reduce(
             if disabled {
                 ProviderEvent::Enabled(false)
@@ -121,9 +118,6 @@ impl ProviderSlot {
         } else {
             self.state.refresh_gate(trigger, clock, interval)
         };
-        if trigger == RefreshTrigger::Manual {
-            self.manual_cooldown_notice = matches!(gate, RefreshGate::Cooldown { .. });
-        }
         if gate != RefreshGate::Ready {
             return None;
         }
@@ -191,7 +185,6 @@ impl ProviderSlot {
             self.last_error = None;
             self.error = None;
             self.last_success_unix = None;
-            self.manual_cooldown_notice = false;
             let cache = load(preparation.provider, &account, clock.read().unix_seconds);
             self.state
                 .reduce(ProviderEvent::CredentialsChanged(account), clock);
@@ -203,7 +196,6 @@ impl ProviderSlot {
                 if let Some(deadline) = cache.retry_at_unix {
                     self.state
                         .reduce(ProviderEvent::RetryDeadlineLoaded(deadline), clock);
-                    self.manual_cooldown_notice = true;
                 }
             }
         }
@@ -238,7 +230,6 @@ impl ProviderSlot {
         self.last_error = Some(failure.message.to_string());
         self.error = Some(failure.error());
         if invalidates {
-            self.manual_cooldown_notice = false;
             self.last_success_unix = None;
         }
         self.state.reduce(
@@ -651,23 +642,6 @@ pub fn refresh(provider: ProviderId, trigger: RefreshTrigger, interval: Duration
     if let Some(preparation) = preparation {
         crate::poller::spawn(preparation);
     }
-}
-
-pub fn manual_cooldown_deadlines(interval: Duration) -> Vec<(ProviderId, i64)> {
-    APP.with_borrow_mut(|app| {
-        [ProviderId::Claude, ProviderId::Codex]
-            .into_iter()
-            .filter_map(|provider| {
-                let slot = &mut app.providers[provider.index()];
-                if !slot.manual_cooldown_notice {
-                    return None;
-                }
-                let deadline = slot.state.view(&SystemClock, interval).retry_at_unix;
-                slot.manual_cooldown_notice = deadline.is_some();
-                deadline.map(|deadline| (provider, deadline))
-            })
-            .collect()
-    })
 }
 
 pub fn drain_events(interval: Duration) -> bool {
