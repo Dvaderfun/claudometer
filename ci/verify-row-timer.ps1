@@ -35,7 +35,7 @@ $app = [Diagnostics.Process]::Start($start)
 try {
     winapp ui wait-for Usage0 -a $app.Id -t 5000 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'No demo rows' }
-    winapp ui wait-for FooterRefresh -a $app.Id --value 'Next update in 5m' -t 5000 | Out-Null
+    winapp ui wait-for FooterRefresh -a $app.Id --value 'Next in 5m' -t 5000 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Initial freshness deadline missing' }
     $window = @(winapp ui list-windows -a $app.Id --json | ConvertFrom-Json)[0]
     $main = [RowTimer]::Main($app.Id)
@@ -48,7 +48,7 @@ try {
     # Runtime observation, not a unit test: permit two real 30-second ticks.
     Start-Sleep -Seconds 33
     Start-Sleep -Seconds 33
-    winapp ui wait-for FooterRefresh -a $app.Id --value 'Next update in 4m' -t 5000 | Out-Null
+    winapp ui wait-for FooterRefresh -a $app.Id --value 'Next in 4m' -t 5000 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Minute-granular footer did not advance' }
     winapp ui wait-for Usage4 -a $app.Id --value 'Updated 1m ago' -t 5000 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Accessible observation age did not advance' }

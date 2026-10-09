@@ -30,6 +30,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
   is 2.198 seconds, so app-server stays opt-in under the two-second gate.
 
 ### Changed
+- Clearer Vibecode mode combines idle-sleep protection and verified lid-close
+  protection; failed enable restores the prior wake request, and disabling
+  restores lid settings. Existing recovery actions remain available.
+- Compact single-row freshness footer and Diagnostics summary; Copy retains
+  full sanitized diagnostics. The optional Codex CLI source explains extra
+  quota details and slower checks. Pace ticks have an accessible explanation.
 - Compile the fixed Retry-After date format at build time to recover size
   headroom without changing date/error handling or footprint gates.
 

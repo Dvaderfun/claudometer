@@ -37,7 +37,7 @@ foreach ($mode in @('loading', 'stale', 'cooldown', 'error', 'both', 'light', 'c
             if ($help -notmatch 'Last updated 3h ago' -or $help -notmatch 'Compatibility') { throw 'Outdated age/source missing from UIA' }
             $results.Add([pscustomobject]@{ check = "$mode UIA age and source"; result = 'pass' })
             Invoke-Check "$mode last values preserved" { winapp ui wait-for Usage1 -a $app.Id --value '36% used' --contains -t 5000 }
-            Invoke-Check "$mode next update" { winapp ui wait-for FooterRefresh -a $app.Id --value 'Next update in 4m' -t 5000 }
+            Invoke-Check "$mode next update" { winapp ui wait-for FooterRefresh -a $app.Id --value 'Next in 4m' -t 5000 }
         }
         if ($mode -eq 'cooldown') {
             Invoke-Check 'Cooldown deadline' { winapp ui wait-for FooterRefresh -a $app.Id --value 'Retry at ' --contains -t 5000 }

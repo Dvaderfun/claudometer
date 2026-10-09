@@ -48,7 +48,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `updater.rs` | GitHub-Releases self-update: daily check, verified download, rename-swap handover |
 | `config.rs` | cached validated `SettingsV1`, atomic persistence, legacy dual-read/write, and schema diagnostics |
 | `util.rs` | theme/accent detection, autostart registry, caps-LED toggle, dark menus, acrylic |
-| `vibecode.rs` | independent wake lock plus journaled Advanced lid override, conservative recovery, legacy one-shot restore, and lifecycle reconciliation |
+| `vibecode.rs` | combined Vibecode mode over wake lock and journaled lid override, conservative recovery, legacy one-shot restore, and lifecycle reconciliation |
 
 ## Rendering (`gfx::Surface`)
 
@@ -74,7 +74,7 @@ registry/update/provider failures report through fixed codes and the
 Diagnostics last-issue/log-write status. Tests use temporary log stores and
 synthetic redaction corpus; demo mode disables all diagnostic side effects.
 
-DIAG-01 adds a scrollable Diagnostics card after the existing Settings actions,
+DIAG-01 adds a Diagnostics card after the existing Settings actions; UI-CLARITY-01 makes it a compact support/Copy card,
 with Invoke/Tab/Enter/Space copy. Snapshot/provider projection is read-only;
 attempt/success metadata changes only on reserved/accepted events. The card
 renders fixed operational fields from the same text exported through UIA
@@ -186,11 +186,18 @@ One native toast per limit window that crosses **75%** (`WARN_AT`), evaluated on
 
 ## Vibecode mode (`vibecode.rs`)
 
-The flyout toggle controls only a wake lock through `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`. It is per-*thread*, so it is armed and dropped on the UI thread and disappears with the process. Wake-lock failure/state is independent from the persistent lid transaction.
+Vibecode mode (owner ADR 0009) combines the existing UI-thread wake request
+and journaled AC/DC lid override. Wake is enabled first; failed lid enable
+restores the prior wake state. Disable drops wake before lid recovery, even
+when settings persistence fails. The mode reports enabled only with both
+protections active. SetThreadExecutionState return values are checked.
+Previous independent preferences are preserved at startup. Settings mirrors
+the combined mode and retains recovery/legacy restore actions. Demo changes
+only a process-local flag for visual/Toggle verification.
 
-Ignoring lid close is a separate explicit **Advanced** Settings control. Before any system write, `power-override.v1.json` records schema, operation, exact scheme GUID, original/applied AC/DC values, `prepared` phase, time, and app version through `AtomicJsonStore`. The controller rechecks the active scheme, checks both writes and activation, reads back both values, then records `applied`. Only that verified state is displayed as active.
-
-Recovery changes the journal to `restoring`, operates only on its recorded GUID, and restores a field only while it still equals Claudometer's applied value. A field already at the original is `restored`; any other value is `relinquished_external_change`. An inactive old scheme is never activated. If the journal scheme is still active it is reactivated even on a retry where stored originals were already present, closing the crash-before-activation window. The journal and `.bak` are deleted only after both fields reach terminal verified outcomes.
+The lid transaction remains durable prepared-before-write, checked activation
+and read-back, exact-GUID recovery and conservative external-change handling.
+No safety journal schema or migration changes. See ADR 0009 for rollback.
 
 Startup recovers before applying a new override. `WM_QUERYENDSESSION`, `WM_ENDSESSION`, `WM_DESTROY`, power broadcasts, and the poll timer converge through the same idempotent recovery/reconcile path; wake lock is dropped first on exit even when persistent recovery remains. `--recover-vibecode` performs the same deterministic recovery without starting the UI, provider workers, alerts, or updater.
 
@@ -237,7 +244,7 @@ move to their own files in later slices.
 
 ## Deterministic demo mode
 
-`claudometer.exe --demo=<scenario>` renders synthetic `claude-only`, `codex-only`, `both`, `loading`, `stale`, `cooldown`, `error`, or `neither` state. `--demo-hidden` keeps only its synthetic tray icon for hidden-state measurement. The demo branch runs before single-instance/update cleanup, toast registration, settings and credential reads, provider workers, or Vibecode initialization; refresh, settings, and wake-lock actions are guarded while it is active. Appearance and data are fixed, no provider endpoint is contacted, and Escape closes a visible demo.
+`claudometer.exe --demo=<scenario>` renders synthetic `claude-only`, `codex-only`, `both`, `loading`, `stale`, `cooldown`, `error`, or `neither` state. `--demo-hidden` keeps only its synthetic tray icon for hidden-state measurement. The demo branch runs before single-instance/update cleanup, toast registration, settings and credential reads, provider workers, or Vibecode initialization; provider refresh and side effects are guarded while it is active; the Vibecode toggle is memory-only. Appearance and data are fixed, no provider endpoint is contacted, and Escape closes a visible demo.
 
 `ci/verify-demo.ps1` runs the optimized binary with an isolated empty profile and verifies no profile files, Claudometer registry changes, child processes, TCP connections, or active-power-scheme changes.
 

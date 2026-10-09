@@ -35,7 +35,8 @@ shown provider is cooling down, the footer waits until the latest deadline and
 does not fetch. The header refresh keeps the existing per-provider gates.
 The visible-only 30-second timer updates age and minute-granular copy; no new
 endpoint, persisted field, timer, credential operation or child process is added.
-Demo refresh actions remain side-effect free.
+Demo refresh actions remain side-effect free. The footer displays these values
+on one compact row; its interaction contract is unchanged.
 
 Windows, the selected provider, GitHub, the default browser, or the Claude Code
 CLI may independently keep their own network, notification, process, or crash
@@ -216,7 +217,8 @@ memory-only account digest; the token itself is not persisted.
 
 ## Registry and Windows integration
 
-Settings → Diagnostics shows a local operational snapshot: version,
+Settings → Diagnostics shows a compact support card. Explicit Copy
+retains the full sanitized operational snapshot, also available in UIA HelpText: version,
 architecture, Windows build, install channel, provider detection/sign-in
 booleans, selected source/fallback, attempt/success/observation timestamps,
 freshness/age, retry deadline, stable error code, settings, and update/power
@@ -288,23 +290,22 @@ values remain.
 
 ## Power and Caps Lock effects
 
-**Wake lock.** When enabled, Claudometer calls
-`SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED |
-ES_DISPLAY_REQUIRED)` to request that the system and display remain awake. The
-preference is stored in `settings.json`; the request is re-applied at startup
-and cleared on normal exit or Windows session shutdown. It does not rewrite a
-power plan.
+**Vibecode mode.** Explicitly enabling the flyout or Settings mode requests
+idle-sleep/display protection through SetThreadExecutionState and enables the
+existing journaled AC/DC lid-close override together. A successful mode means
+both are active. Failed enable restores the prior wake request; turning off
+drops wake first and restores lid settings. Previous independent preferences
+remain readable at startup and are not silently converted. Demo mode toggles
+memory only and never writes settings, requests wake or changes power policy.
 
-**Lid-close override.** When explicitly enabled, Claudometer reads the active
-Windows power scheme, journals its current AC and DC lid-close actions, changes
-both actions to **Do nothing**, activates that scheme, and verifies the result.
-It restores the journaled values on disable, normal exit, or session shutdown.
-On startup it first attempts recovery from an existing journal and then
-re-applies the saved preference. While active, a polling tick or power broadcast
-detecting a different active scheme restores the prior scheme's values and
-applies a newly journaled override to the new scheme. Restoration does not
-overwrite a value that another actor changed away from Claudometer's applied
-value. Failed or interrupted recovery retains an actionable journal.
+The wake request belongs to the UI thread and ends on normal exit/process
+termination. Return values are checked; failed requests do not report success.
+Lid override reads the active scheme, durably journals original/applied values,
+writes Do nothing, activates and verifies the result. Disabling/exiting/startup
+recovery restores only unchanged app-owned values on the recorded scheme;
+external changes remain intact. Failure retains actionable recovery state.
+Power broadcasts/polling retain the existing scheme reconciliation. This mode
+does not prevent explicit Sleep/shutdown, lost connectivity or battery exhaustion.
 
 **Optional Caps Lock helper.** Claudometer does not install the helper or edit
 Claude's hook configuration. If `caps-led.ps1` and a matching Claude hook are
