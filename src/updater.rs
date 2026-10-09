@@ -1801,7 +1801,7 @@ fn file_version(path: &Path) -> Option<(u16, u16, u16)> {
     }
 }
 
-fn sha256_of(path: &Path) -> Option<String> {
+pub(crate) fn sha256_of(path: &Path) -> Option<String> {
     sha256_reader(std::fs::File::open(path).ok()?)
 }
 

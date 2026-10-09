@@ -773,6 +773,7 @@ mod tests {
                 .unwrap()],
                 plan: Some("Synthetic".to_string()),
                 fetched_unix: 1000,
+                reset_credits_available: None,
             }),
             retry_at_unix: Some(1200),
         }

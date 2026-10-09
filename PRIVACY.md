@@ -68,6 +68,7 @@ reviewable update to this contract.
 | `ANTHROPIC_USAGE_URL` | `https://api.anthropic.com/api/oauth/usage` |
 | `ANTHROPIC_PROFILE_URL` | `https://api.anthropic.com/api/oauth/profile` |
 | `CODEX_USAGE_URL` | `https://chatgpt.com/backend-api/wham/usage` |
+| `CODEX_BACKEND_URL` | `https://chatgpt.com/backend-api/` — fixed app-server backend; delegated GETs include `wham/usage`, `wham/accounts/check`, and the historical business/education/enterprise `wham/config/bundle` path; the adapter supplies local plan hint `unknown` to suppress that cloud-policy path. Usage may include the read-only reset-credit summary query. |
 | `GITHUB_LATEST_RELEASE_URL` | `https://api.github.com/repos/Dvaderfun/claudometer/releases/latest` |
 | `GITHUB_REPOSITORY_URL` | `https://github.com/Dvaderfun/claudometer` |
 | `GITHUB_API_HOSTS` | Update metadata is restricted to `api.github.com` |
@@ -78,6 +79,53 @@ reviewable update to this contract.
 <!-- PRIVACY_REQUEST src/api.rs|ANTHROPIC_PROFILE_URL -->
 <!-- PRIVACY_REQUEST src/codex.rs|CODEX_USAGE_URL -->
 <!-- PRIVACY_REQUEST src/updater.rs|&current -->
+
+### Isolated Codex app-server (owner-approved ADR 0007)
+
+The `Codex app-server` Settings switch prefers the documented JSON-RPC source
+only when the native executable matches an audited hash and system Codex
+config/requirements files are absent. Unsupported/missing installations select
+Compatibility before a request. App-server errors never cause a compatibility
+HTTP request in the same cycle. Diagnostics/UIA report the selected source and
+fixed fallback reason. This preference and `reset_credits_available` are
+additive fields in local schema 1; reset credits are display only.
+
+The worker reads the existing access token/account ID and passes only those
+values through private inherited stdin. The child has ephemeral external auth,
+no refresh token/API key, a fresh `CODEX_HOME`, a cleared environment, disabled
+analytics/OTEL/plugins/remote control/runtime metrics, and a static model
+catalog. Every server request, including token refresh, ends the cycle without
+returning tokens. Managed login/logout, turns, reset-credit consumption, and
+other mutations are never requested. Generic upstream JSON-RPC error messages
+are discarded; they are not classified by text or copied to diagnostics.
+
+The child performs read-only usage and account discovery against the fixed
+ChatGPT backend. It supplies a local `unknown` plan hint to suppress enterprise
+cloud-policy loading; the displayed plan comes from the quota response.
+Requests transmit
+the existing access token, account ID, and Codex client metadata. Only one
+short-lived child runs per eligible Codex poll (30 s–5 min). Disabling this
+switch selects the direct compatibility request; disabling Show Codex stops
+both. No daemon, resident helper, Node process, or loopback server is added.
+
+Each child owns `%TEMP%\claudometer-codex-run-<random>\`, containing an
+exclusive `owner.lock`, synthetic static model catalog, Codex startup SQLite
+databases/WALs, built-in skills/helper files, installation ID, and startup
+files. The local unknown-plan hint prevents the historical cloud
+bundle/raw-account-ID cache in both audited versions. Credential files are never
+created there. Stdout is bounded to 1 MiB per frame; stderr is discarded and
+Codex logging is disabled. A kill-on-close Job Object contains the child and
+descendants from creation. Completion/failure kills the tree and removes the
+scratch profile. A crash may leave scratch files; the next normal Codex poll
+removes only unlocked owned profiles without following reparse points. Cleanup
+failure reports a fixed local error. Provider-owned configuration is never
+modified or deleted.
+
+`--measure-codex-source` is an explicit maintainer-only live measurement,
+authorized for CODEX-02. It reads local identity/state without migration,
+performs one isolated quota read, and prints only source, elapsed milliseconds,
+row count, and fixed error code. It exits before tray/windows/alerts/updates;
+automated tests never use it and never call a live provider.
 
 ## Local files
 
@@ -124,8 +172,8 @@ the user's Windows notification settings.
 
 ## Credentials
 
-Bearer tokens are held in process memory and sent only to their corresponding
-provider:
+Bearer tokens are held in worker memory and sent only to their corresponding
+provider, with the ADR 0007 private-stdio handoff to the isolated Codex child:
 
 Provider failures use fixed categories/codes and local recovery text. HTTP
 401/403 clears account-bound displayed/cache data; 429 keeps same-account

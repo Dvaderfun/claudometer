@@ -36,6 +36,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | DIAG-01 operational snapshot, synthetic trust root provisioned | 1,159,168 | +0.89% vs ERR-01 provisioned | not measured | — |
 | DIAG-02 bounded log/support commands, unprovisioned | 1,053,184 | +0.44% vs DIAG-01 unprovisioned | not measured | — |
 | DIAG-02 bounded log/support commands, synthetic trust root provisioned | 1,163,776 | +0.40% vs DIAG-01 provisioned | not measured | — |
+| CODEX-01 isolated source, unprovisioned | 1,071,104 | +1.70% vs DIAG-02 unprovisioned | not measured | — |
+| CODEX-01 isolated source, synthetic trust root provisioned | 1,163,776 | +1.61% vs local R0 provisioned | 1,017,856 | -1.09% vs local R0 provisioned |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;
@@ -343,3 +345,30 @@ ARM64 **1,026,560 bytes**; both original artifact/regression gates pass.
 The 2,560-byte difference from each local build is recorded rather than
 substituting local hashes. Published exact hashes and provenance are in
 [release evidence](../verification/r0-0.9.0.md). Downloaded x64 demo safety passes.
+
+## CODEX-01/02 (2026-10-09)
+
+Final local x64: 1,071,104 unprovisioned / 1,163,776 synthetic public trust
+root provisioned. Provisioned delta versus local R0 1,145,344 is +18,432
+bytes (+1.61%). Original x64 regression ceiling remains 1,164,134: margin
+358 bytes. Hard ceiling and unsigned soft target remain unchanged.
+
+ARM64 retains Compatibility and excludes the x64-only app-server process
+implementation. Provisioned 1,017,856 bytes, -11,264 (-1.09%) versus local
+R0 1,029,120; original ARM64 regression ceiling 1,034,598 passes. Cross-build
+only; no real ARM64 runtime claim.
+
+Initial adapter provisioned x64 reached 1,194,496 and failed the unchanged
+cumulative gate. Size report identified fixed runtime date-format parsing
+and added generic IPC/reader code. Moving Retry-After formatting to a compile-
+time macro, fixed protocol request bytes, borrowed/wiped token serialization,
+bounded pipe reads on the existing worker, and fixed environment construction
+recover headroom. No dependency version/profile/budget changes; JobObjects and
+Pipes Windows features are added, no crate added. x64-only eligibility prevents
+shipping unsupported process code in ARM64.
+
+174 tests and all required gates pass. Demo safety, 22 UIA checks/source toggle,
+synthetic native-CLI isolation, manual live credential-unchanged reads, and
+artifact/privacy/dependency/workflow checks pass. Final live p95 2,198 ms keeps
+app-server opt-in; latency includes cleanup. No new ten-minute idle/memory
+claim. Evidence/rollback: verification/codex-01.md and performance/codex-02.md.

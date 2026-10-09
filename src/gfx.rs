@@ -104,6 +104,7 @@ pub struct SettingsView {
     pub caps_control: CapsControl,
     pub autostart: bool,
     pub codex_on: bool,
+    pub codex_server_on: bool,
     pub alerts_on: bool,
     pub update_checks_on: bool,
     pub lid_label: String,
@@ -129,6 +130,7 @@ impl SettingsView {
             CARD_CODEX => Some(self.codex_on),
             CARD_ALERTS => Some(self.alerts_on),
             CARD_UPDATE_CHECKS => Some(self.update_checks_on),
+            CARD_CODEX_SERVER => Some(self.codex_server_on),
             _ => None,
         }
     }
@@ -297,7 +299,7 @@ pub const SET_W: f32 = 400.0;
 const SET_PAD: f32 = 24.0;
 const CARD_H: f32 = 56.0;
 const CARD_GAP: f32 = 4.0;
-pub const N_CARDS: usize = 12;
+pub const N_CARDS: usize = 13;
 pub const CARD_ACCOUNT: usize = 0;
 pub const CARD_CAPS: usize = 1;
 pub const CARD_AUTOSTART: usize = 2;
@@ -312,6 +314,7 @@ pub const CARD_REFRESH: usize = 8;
 pub const CARD_ABOUT: usize = 9;
 pub const CARD_QUIT: usize = 10;
 pub const CARD_DIAGNOSTICS: usize = 11;
+pub const CARD_CODEX_SERVER: usize = 12;
 const DIAGNOSTICS_H: f32 = 720.0;
 
 pub fn settings_height() -> f32 {
@@ -1043,13 +1046,14 @@ impl Surface {
                 st.about.as_str(),
                 "Quit Claudometer",
                 "Diagnostics",
+                "Codex app-server",
             ];
             // Segoe Fluent Icons: account, keyboard, power, command prompt,
             // bell (EA8F Ringer — E7ED is the muted bell), download, clock,
             // refresh, info, cancel
             let icons = [
                 "\u{E77B}", "\u{E765}", "\u{E7E8}", "\u{E756}", "\u{EA8F}", "\u{E895}", "\u{E7BA}",
-                "\u{E823}", "\u{E72C}", "\u{E946}", "\u{E711}", "\u{E9D9}",
+                "\u{E823}", "\u{E72C}", "\u{E946}", "\u{E711}", "\u{E9D9}", "\u{E756}",
             ];
             let cards = settings_rects(scroll);
             for (i, card) in cards.iter().enumerate() {
@@ -1572,6 +1576,7 @@ mod tests {
             caps_control: CapsControl::Unavailable,
             autostart: false,
             codex_on: false,
+            codex_server_on: false,
             alerts_on: false,
             update_checks_on,
             lid_label: String::new(),
@@ -1610,7 +1615,7 @@ mod tests {
             DIAGNOSTICS_H
         );
         assert!(cards[CARD_DIAGNOSTICS].top > cards[CARD_QUIT].bottom);
-        assert_eq!(settings_height(), cards[CARD_DIAGNOSTICS].bottom + SET_PAD);
+        assert_eq!(settings_height(), cards[CARD_CODEX_SERVER].bottom + SET_PAD);
         assert_eq!(
             settings_rects(100.0)[CARD_DIAGNOSTICS].top,
             cards[CARD_DIAGNOSTICS].top - 100.0

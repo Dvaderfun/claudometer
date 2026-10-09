@@ -13,7 +13,7 @@ const REDACTED: &str = "[redacted]";
 // unknown future messages, is removed as a whole rather than guessed at.
 #[inline(never)]
 fn safe_field(value: &str) -> &str {
-    const ALLOWED: &str = "none|unknown|portable|portable (demo)|managed|ambiguous|up to date|available|installing|failed|journal pending|compatibility source only|documented source not enabled|disabled|unavailable|idle|fetching|ready|backoff|preparing|credentials_missing|sign_in_expired|usage_scope_missing|provider_rate_limited|request_timeout|connection_failed|response_invalid|local_unavailable|startup|render_failed|render_init_failed|config_failed|registry_failed|provider_success|provider_failed|clipboard_failed|power_failed|update_failed|runtime_failed";
+    const ALLOWED: &str = "none|unknown|portable|portable (demo)|managed|ambiguous|up to date|available|installing|failed|journal pending|compatibility source only|documented source not enabled|app-server CLI not found|app-server version not audited|app-server machine configuration|disabled|unavailable|idle|fetching|ready|backoff|preparing|credentials_missing|sign_in_expired|usage_scope_missing|provider_rate_limited|request_timeout|connection_failed|response_invalid|local_unavailable|startup|render_failed|render_init_failed|config_failed|registry_failed|provider_success|provider_failed|clipboard_failed|power_failed|update_failed|runtime_failed";
     if ALLOWED.split('|').any(|allowed| allowed == value) {
         value
     } else {
@@ -184,7 +184,7 @@ fn support_snapshot() -> windows::core::Result<()> {
     crate::app::load_local_diagnostics();
     write_stdout(text().as_bytes())
 }
-fn write_stdout(bytes: &[u8]) -> windows::core::Result<()> {
+pub(crate) fn write_stdout(bytes: &[u8]) -> windows::core::Result<()> {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetStdHandle(kind: u32) -> *mut std::ffi::c_void;

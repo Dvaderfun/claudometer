@@ -31,14 +31,24 @@ struct Tokens {
 }
 
 pub struct PreparedRequest {
-    access_token: SecretString,
-    account_id: SecretString,
+    pub(crate) access_token: SecretString,
+    pub(crate) account_id: SecretString,
     account: AccountContext,
+    pub(crate) server: Option<crate::codex_server::Executable>,
+    pub(crate) fallback_reason: &'static str,
 }
 
 impl PreparedRequest {
     pub fn account(&self) -> &AccountContext {
         &self.account
+    }
+
+    pub fn source(&self) -> SourceProvenance {
+        if self.server.is_some() {
+            SourceProvenance::codex_app_server()
+        } else {
+            SourceProvenance::compatibility(ProviderId::Codex)
+        }
     }
 }
 
@@ -52,6 +62,7 @@ fn auth_path() -> Option<std::path::PathBuf> {
     Some(std::path::Path::new(&home).join(".codex").join("auth.json"))
 }
 
+#[inline(never)]
 pub fn prepare() -> Result<PreparedRequest, PreparationFailure> {
     let path = auth_path().ok_or(PreparationFailure {
         kind: PreparationFailureKind::Unsupported,
@@ -115,7 +126,24 @@ pub fn prepare() -> Result<PreparedRequest, PreparationFailure> {
         access_token,
         account_id,
         account,
+        server: None,
+        fallback_reason: "documented source not enabled",
     })
+}
+
+#[inline(never)]
+pub fn prepare_poll() -> Result<PreparedRequest, PreparationFailure> {
+    let mut request = prepare()?;
+    if crate::config::settings().codex_app_server_enabled {
+        match crate::codex_server::discover() {
+            Ok(server) => {
+                request.server = Some(server);
+                request.fallback_reason = "none";
+            }
+            Err(reason) => request.fallback_reason = reason,
+        }
+    }
+    Ok(request)
 }
 
 /// ChatGPT-login Codex sign-in present? API-key-only installs have no usage
@@ -145,6 +173,7 @@ struct Window {
     reset_at: Option<i64>,
 }
 
+#[inline(never)]
 pub fn fetch(request: PreparedRequest) -> FetchOutcome {
     match fetch_inner(request) {
         Ok(s) => FetchOutcome::Ok(s),
@@ -160,6 +189,10 @@ fn fetch_inner(request: PreparedRequest) -> Result<UsageSnapshot, FetchErr> {
         if now > exp {
             return Err(FetchError::new(FailureKind::Authentication));
         }
+    }
+
+    if let Some(server) = &request.server {
+        return crate::codex_server::fetch(server, &request);
     }
 
     let tls = native_tls::TlsConnector::new().map_err(|_| FetchError::new(FailureKind::Offline))?;
@@ -213,7 +246,7 @@ fn parse_usage_json(
     let plan = parsed
         .plan_type
         .as_deref()
-        .map(prettify)
+        .map(plan_label)
         .unwrap_or_default();
 
     Ok(UsageSnapshot {
@@ -223,7 +256,18 @@ fn parse_usage_json(
         rows,
         plan: (!plan.is_empty()).then(|| bounded_text(plan)),
         fetched_unix: observed_at_unix,
+        reset_credits_available: None,
     })
+}
+
+pub(crate) fn plan_label(plan: &str) -> String {
+    match plan {
+        "prolite" => "Pro 100".into(),
+        "pro" => "Pro 200".into(),
+        "promax" => "Pro 500".into(),
+        "self_serve_business_prolite" => "Business Premium".into(),
+        other => prettify(other),
+    }
 }
 
 fn push_row(rows: &mut Vec<UsageLimit>, w: &Window, fallback_kind: &str) {
@@ -312,6 +356,22 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+impl PreparedRequest {
+    pub(crate) fn synthetic() -> Self {
+        Self {
+            access_token: SecretString::new("synthetic-access-token".into()),
+            account_id: SecretString::new("synthetic-account".into()),
+            account: AccountContext {
+                key: AccountKey::from_digest([2; 32]),
+                persistence: crate::provider::model::IdentityPersistence::Persistent,
+            },
+            server: None,
+            fallback_reason: "none",
+        }
+    }
 }
 
 #[cfg(test)]

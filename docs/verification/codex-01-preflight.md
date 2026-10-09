@@ -1,6 +1,8 @@
 # CODEX-01 / CODEX-02 preflight (2026-10-09)
 
-Result: blocked on the credential contract; no adapter or source-default change.
+Historical preflight result: blocked. Superseded by owner-approved ADR 0007
+and the implemented opt-in adapter in [CODEX-01 evidence](codex-01.md).
+The investigation below remains as evidence of why managed auth is forbidden.
 The owner requested both tasks. Repository invariants require stopping when an
 implementation would refresh, exchange, or write provider credentials.
 

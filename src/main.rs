@@ -10,6 +10,26 @@ mod api;
 mod app;
 mod auth;
 mod codex;
+#[cfg(target_arch = "x86_64")]
+mod codex_server;
+#[cfg(not(target_arch = "x86_64"))]
+mod codex_server {
+    pub struct Executable;
+    pub fn discover() -> Result<Executable, &'static str> {
+        Err("app-server version not audited")
+    }
+    pub fn fetch(
+        _: &Executable,
+        _: &crate::codex::PreparedRequest,
+    ) -> Result<crate::provider::model::UsageSnapshot, crate::provider::error::FetchError> {
+        Err(crate::provider::error::FetchError::new(
+            crate::provider::error::FailureKind::Transient,
+        ))
+    }
+    pub fn measure() -> windows::core::Result<()> {
+        crate::diagnostics::write_stdout(b"{\"error\":\"app_server_unavailable\"}\n")
+    }
+}
 mod config;
 mod demo;
 mod diagnostics;
@@ -146,6 +166,15 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(result) = diagnostics::support_command(&args) {
         return result;
+    }
+    if args
+        .iter()
+        .any(|argument| argument == "--measure-codex-source")
+    {
+        if args.iter().any(|argument| argument.starts_with("--demo")) {
+            return diagnostics::write_stdout(b"{\"error\":\"demo_no_live_measurement\"}\n");
+        }
+        return codex_server::measure();
     }
     if let Some(result) = updater::run_watchdog_if_requested(&args) {
         return result.map_err(|message| Error::new(E_FAIL, message));
@@ -993,6 +1022,16 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
             let enabled = !config::settings().alerts_enabled;
             let _ = config::set_alerts_enabled(enabled);
         }
+        gfx::CARD_CODEX_SERVER => {
+            if config::set_codex_app_server_enabled(!config::settings().codex_app_server_enabled)
+                .is_ok()
+            {
+                app::invalidate(ProviderId::Codex, !config::settings().codex_enabled);
+                if config::settings().codex_enabled {
+                    spawn_fetch(ProviderId::Codex, RefreshTrigger::Manual);
+                }
+            }
+        }
         gfx::CARD_UPDATE_CHECKS => {
             let enabled = !config::settings().update_checks_enabled;
             if config::set_update_checks_enabled(enabled).is_ok() && enabled {
@@ -1386,7 +1425,11 @@ fn section(title: &'static str, s: UsageSnapshot) -> gfx::Section {
             s.provider,
             Duration::from_secs(u64::from(POLL_SECS.load(Ordering::SeqCst))),
         )
-        .map(|(short, _)| short),
+        .map(|(short, _)| short)
+        .or_else(|| {
+            s.reset_credits_available
+                .map(|count| format!("Reset credits available: {count}"))
+        }),
         body: gfx::SectionBody::Rows(s.rows.into_iter().map(gfx::LimitRow::from).collect()),
     }
 }
@@ -1947,6 +1990,7 @@ unsafe fn render_settings(hwnd: HWND) {
             caps_control,
             autostart: util::autostart_enabled(),
             codex_on: config::settings().codex_enabled,
+            codex_server_on: config::settings().codex_app_server_enabled,
             alerts_on: config::settings().alerts_enabled,
             update_checks_on: config::settings().update_checks_enabled,
             lid_label: lid_label.to_string(),

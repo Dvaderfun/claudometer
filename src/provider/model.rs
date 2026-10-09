@@ -135,6 +135,8 @@ pub struct UsageSnapshot {
     pub rows: Vec<UsageLimit>,
     pub plan: Option<String>,
     pub fetched_unix: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits_available: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -150,6 +152,13 @@ pub enum FetchOutcome {
 }
 
 impl SourceProvenance {
+    pub const fn codex_app_server() -> Self {
+        Self {
+            id: SourceId::CodexAppServer,
+            support: SourceSupport::Documented,
+        }
+    }
+
     pub fn compatibility(provider: ProviderId) -> Self {
         Self {
             id: match provider {
