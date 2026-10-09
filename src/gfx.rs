@@ -1188,19 +1188,14 @@ impl Surface {
         self.text(
             "Vibecode mode",
             &self.fmt_body_1,
-            rect(text_left, r.top + 4.0, text_right, r.top + 4.0 + LABEL_H),
+            rect(text_left, cy - 18.0, text_right, cy + 2.0),
             &b.text,
             false,
         )?;
         self.text(
             caption,
-            &self.fmt_caption,
-            rect(
-                text_left,
-                r.top + 24.0,
-                text_right,
-                r.top + 24.0 + 2.0 * CAPTION_H,
-            ),
+            &self.fmt_caption_1,
+            rect(text_left, cy + 2.0, text_right, cy + 18.0),
             &b.dim,
             false,
         )?;
