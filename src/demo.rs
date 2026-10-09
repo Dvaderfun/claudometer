@@ -47,6 +47,7 @@ pub struct Request {
 }
 
 pub struct State {
+    now_unix: i64,
     pub scenario: Scenario,
     pub view: View,
     pub fetching: bool,
@@ -136,8 +137,9 @@ fn parse_scenario(value: &str) -> Result<Scenario, String> {
 }
 
 pub fn activate(request: Request, now_unix: i64) -> Result<(), &'static str> {
+    crate::config::initialize_demo();
     ACTIVE
-        .set(build_state(request, now_unix))
+        .set(build_state(request, now_unix, now_unix))
         .map_err(|_| "demo mode already active")
 }
 
@@ -149,16 +151,44 @@ pub fn is_active() -> bool {
     active().is_some()
 }
 
-fn build_state(request: Request, now_unix: i64) -> State {
-    let claude = || provider_section("Claude", "Max", 36.0, 58.0, now_unix);
-    let codex = || provider_section("Codex", "Plus", 64.0, 41.0, now_unix);
+pub fn view() -> Option<View> {
+    use crate::provider::state::Clock;
+    let state = active()?;
+    Some(
+        build_state(
+            Request {
+                scenario: state.scenario,
+                hidden: state.hidden,
+                light: state.light,
+                contrast: state.contrast,
+                ready_event: None,
+            },
+            state.now_unix,
+            crate::provider::state::SystemClock.read().unix_seconds,
+        )
+        .view,
+    )
+}
+
+fn build_state(request: Request, now_unix: i64, render_now: i64) -> State {
+    let claude = || {
+        let mut section = provider_section("Claude", "Max", 36.0, 58.0, now_unix, render_now);
+        if request.scenario == Scenario::ClaudeOnly {
+            if let SectionBody::Rows(rows) = &mut section.body {
+                rows[0].reset_text = "Not started".into();
+                rows[0].percent = 0.0;
+            }
+        }
+        section
+    };
+    let codex = || provider_section("Codex", "Plus", 64.0, 41.0, now_unix, render_now);
 
     let (view, fetching, tray_percent, tray_tip) = match request.scenario {
         Scenario::ClaudeOnly => (
             data(vec![claude()], now_unix, None),
             false,
-            Some(0.36),
-            "Demo · Claude session 36%",
+            Some(0.0),
+            "Demo · Claude session not started",
         ),
         Scenario::CodexOnly => (
             data(vec![codex()], now_unix, None),
@@ -225,7 +255,12 @@ fn build_state(request: Request, now_unix: i64) -> State {
                         label: format!("Weekly · model {}", index + 1),
                         percent: 20.0 + (index * 4) as f64,
                         severity: None,
-                        reset_text: "resets in 4d".to_string(),
+                        reset_text: crate::api::fmt_event_unix(
+                            now_unix + 4 * 86400,
+                            "resets",
+                            render_now,
+                            crate::config::settings().reset_format,
+                        ),
                         pace: crate::provider::pace::Pace::Level,
                     });
                 }
@@ -240,6 +275,7 @@ fn build_state(request: Request, now_unix: i64) -> State {
     };
 
     State {
+        now_unix,
         scenario: request.scenario,
         view,
         fetching,
@@ -265,6 +301,8 @@ pub fn settings_view(hover: i32, focus: i32) -> SettingsView {
         codex_on: true,
         codex_server_on: false,
         pace_on: true,
+        reset_format: crate::config::settings().reset_format,
+        quota_display: crate::config::settings().quota_display,
         alerts_on: true,
         update_checks_on: false,
         lid_label: "Advanced · ignore lid close".to_string(),
@@ -295,6 +333,7 @@ fn provider_section(
     session: f64,
     weekly: f64,
     now_unix: i64,
+    render_now: i64,
 ) -> Section {
     Section {
         title,
@@ -311,22 +350,24 @@ fn provider_section(
                     label: label.into(),
                     percent: used,
                     severity: None,
-                    reset_text: String::new(),
+                    reset_text: crate::api::fmt_event_unix(
+                        now_unix + remaining,
+                        "resets",
+                        render_now,
+                        crate::config::settings().reset_format,
+                    ),
                     pace: crate::provider::pace::Pace::Level,
                 };
-                row.apply_pace(crate::provider::pace::project(
-                    used,
-                    crate::provider::model::LimitClass::Quota,
-                    Some(now_unix + remaining),
-                    Some(window),
-                    now_unix,
-                ));
-                row.reset_text = if window == 18000 {
-                    "resets in 2h 15m"
-                } else {
-                    "resets in 4d"
-                }
-                .into();
+                row.apply_pace(
+                    crate::provider::pace::project(
+                        used,
+                        crate::provider::model::LimitClass::Quota,
+                        Some(now_unix + remaining),
+                        Some(window),
+                        render_now,
+                    ),
+                    render_now,
+                );
                 row
             })
             .collect(),
@@ -410,6 +451,7 @@ mod tests {
                     contrast: false,
                     ready_event: None,
                 },
+                1_788_400_000,
                 1_788_400_000,
             );
             if let View::Data(data) = state.view {

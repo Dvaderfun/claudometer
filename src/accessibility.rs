@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetClientRect, GetWindowRect, PostMessageW, SendMessageW, WM_APP, WM_GETOBJECT,
 };
 
-use crate::{auth, config, demo, gfx, util, vibecode};
+use crate::{config, demo, gfx, vibecode};
 
 pub const WM_UIA_QUERY: u32 = WM_APP + 6;
 pub const WM_UIA_FOCUS: u32 = WM_APP + 7;
@@ -70,9 +70,7 @@ fn scrolled(mut rect: D2D_RECT_F, scroll: f32) -> D2D_RECT_F {
 }
 
 fn flyout_items(hwnd: HWND) -> Vec<Item> {
-    let view = demo::active()
-        .map(|state| state.view.clone())
-        .unwrap_or_else(crate::current_view);
+    let view = demo::view().unwrap_or_else(crate::current_view);
     let scroll = unsafe {
         f32::from_bits(SendMessageW(hwnd, WM_UIA_QUERY, WPARAM(QUERY_SCROLL), LPARAM(0)).0 as u32)
     };
@@ -127,43 +125,18 @@ fn settings_items(hwnd: HWND) -> Vec<Item> {
     };
     let rects = gfx::settings_rects(scroll);
     let mut result = Vec::with_capacity(gfx::N_CARDS);
-    let synthetic = demo::active().map(|_| demo::settings_view(-1, -1));
-    let settings = config::settings();
-    let (account_help, account_button) = if let Some(view) = &synthetic {
-        (view.account_caption.clone(), view.account_action)
-    } else {
-        let status = auth::snapshot();
-        let caption = match status.connection {
-            Some(auth::ClaudeConnection::Connected { plan }) if !plan.is_empty() => {
-                format!("Connected, {plan}")
-            }
-            Some(auth::ClaudeConnection::Connected { .. }) => "Connected".to_string(),
-            Some(auth::ClaudeConnection::Disconnected) => "Not connected".to_string(),
-            Some(auth::ClaudeConnection::CliUnavailable) => "Claude Code is required".to_string(),
-            Some(auth::ClaudeConnection::Problem(message)) => message,
-            None => "Checking connection".to_string(),
-        };
-        (caption, if status.busy { "Cancel" } else { "Connect" })
-    };
+    let view = crate::settings_view(-1, -1, "Copy");
+    let account_button = view.account_action;
     let mut account = item(
         "ClaudeAccount",
         format!("Claude account, {account_button}"),
         rects[gfx::CARD_ACCOUNT],
         Role::Button,
     );
-    account.help = account_help;
+    account.help = view.account_caption;
     result.push(account);
 
-    let caps = if let Some(view) = &synthetic {
-        view.caps_control
-    } else {
-        match util::caps_led_state() {
-            util::CapsLedState::InstalledEnabled => gfx::CapsControl::Toggle(true),
-            util::CapsLedState::InstalledDisabled => gfx::CapsControl::Toggle(false),
-            util::CapsLedState::Error(_) => gfx::CapsControl::Retry,
-            util::CapsLedState::Unavailable => gfx::CapsControl::Unavailable,
-        }
-    };
+    let caps = view.caps_control;
     let mut caps_item = item(
         "CapsStatusLight",
         "Caps Lock status light",
@@ -181,48 +154,33 @@ fn settings_items(hwnd: HWND) -> Vec<Item> {
             gfx::CARD_AUTOSTART,
             "Autostart",
             "Start with Windows",
-            synthetic
-                .as_ref()
-                .map_or_else(util::autostart_enabled, |view| view.autostart),
+            view.autostart,
         ),
         (
             gfx::CARD_CODEX,
             "ShowCodex",
             "Show Codex usage",
-            synthetic
-                .as_ref()
-                .map_or(settings.codex_enabled, |view| view.codex_on),
+            view.codex_on,
         ),
         (
             gfx::CARD_ALERTS,
             "UsageAlerts",
             "Alert at 75% usage",
-            synthetic
-                .as_ref()
-                .map_or(settings.alerts_enabled, |view| view.alerts_on),
+            view.alerts_on,
         ),
         (
             gfx::CARD_UPDATE_CHECKS,
             "UpdateChecks",
             gfx::UPDATE_CHECKS_LABEL,
-            synthetic
-                .as_ref()
-                .map_or(settings.update_checks_enabled, |view| view.update_checks_on),
+            view.update_checks_on,
         ),
     ] {
         result.push(item(id, name, rects[index], Role::Toggle(on)));
     }
-
-    let lid_status = vibecode::persistent_status();
-    let lid_role = if let Some(view) = &synthetic {
-        Role::Toggle(view.lid_on)
-    } else if matches!(
-        lid_status,
-        vibecode::PersistentStatus::Disabled | vibecode::PersistentStatus::Applied
-    ) {
-        Role::Toggle(lid_status == vibecode::PersistentStatus::Applied)
-    } else {
+    let lid_role = if view.lid_action.is_some() {
         Role::Button
+    } else {
+        Role::Toggle(view.lid_on)
     };
     let mut lid = item(
         "LidOverride",
@@ -230,25 +188,16 @@ fn settings_items(hwnd: HWND) -> Vec<Item> {
         rects[gfx::CARD_LID],
         lid_role,
     );
-    lid.help = synthetic.as_ref().map_or_else(
-        || "Restores on exit when enabled".to_string(),
-        |view| view.lid_caption.clone(),
-    );
+    lid.help = view.lid_caption;
     result.push(lid);
-
-    let interval = synthetic
-        .as_ref()
-        .map_or(settings.poll_interval_seconds, |view| view.poll_secs);
+    let interval = view.poll_secs;
     let mut refresh_interval = item(
         "RefreshInterval",
-        format!(
-            "Auto-refresh, every {}",
-            match interval {
-                30 => "30 seconds".to_string(),
-                60 => "1 minute".to_string(),
-                seconds => format!("{} minutes", seconds / 60),
-            }
-        ),
+        match interval {
+            30 => "Auto-refresh, every 30 seconds".to_string(),
+            60 => "Auto-refresh, every 1 minute".to_string(),
+            seconds => format!("Auto-refresh, every {} minutes", seconds / 60),
+        },
         rects[gfx::CARD_INTERVAL],
         Role::Button,
     );
@@ -262,7 +211,7 @@ fn settings_items(hwnd: HWND) -> Vec<Item> {
     ));
     result.push(item(
         "About",
-        format!("About Claudometer {}", env!("CARGO_PKG_VERSION")),
+        concat!("About Claudometer ", env!("CARGO_PKG_VERSION")),
         rects[gfx::CARD_ABOUT],
         Role::Button,
     ));
@@ -278,19 +227,13 @@ fn settings_items(hwnd: HWND) -> Vec<Item> {
         rects[gfx::CARD_DIAGNOSTICS],
         Role::Button,
     );
-    diagnostics.help = crate::diagnostics::text();
+    diagnostics.help = view.diagnostics;
     result.push(diagnostics);
     let mut source = item(
         "CodexAppServer",
         "Codex app-server",
         rects[gfx::CARD_CODEX_SERVER],
-        Role::Toggle(
-            synthetic
-                .as_ref()
-                .map_or(settings.codex_app_server_enabled, |view| {
-                    view.codex_server_on
-                }),
-        ),
+        Role::Toggle(view.codex_server_on),
     );
     source.help = "Prefer the documented source when the installed CLI is audited. Turn off to use Compatibility.".into();
     result.push(source);
@@ -298,13 +241,23 @@ fn settings_items(hwnd: HWND) -> Vec<Item> {
         "PaceColors",
         "Color bars by current pace",
         rects[gfx::CARD_PACE],
-        Role::Toggle(
-            synthetic
-                .as_ref()
-                .map_or(settings.pace_colors_enabled, |view| view.pace_on),
-        ),
+        Role::Toggle(view.pace_on),
     );
     result.push(pace);
+    for (id, label, card) in [
+        ("QuotaDisplay", "Quota display", gfx::CARD_QUOTA_DISPLAY),
+        ("ResetFormat", "Reset format", gfx::CARD_RESET_FORMAT),
+    ] {
+        let choice = if card == gfx::CARD_RESET_FORMAT {
+            view.reset_format.label()
+        } else {
+            view.quota_display.label()
+        };
+        let mut name = label.to_string();
+        name.push_str(", ");
+        name.push_str(choice);
+        result.push(item(id, name, rects[card], Role::Button));
+    }
     result
 }
 

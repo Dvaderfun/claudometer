@@ -50,25 +50,36 @@ impl From<UsageLimit> for LimitRow {
 }
 
 impl LimitRow {
-    pub fn with_pace(row: UsageLimit, now_unix: i64, enabled: bool) -> Self {
+    pub fn with_pace(
+        row: UsageLimit,
+        provider: crate::provider::model::ProviderId,
+        now_unix: i64,
+        enabled: bool,
+    ) -> Self {
+        let not_started = provider == crate::provider::model::ProviderId::Claude
+            && row.kind == crate::provider::model::LimitKind::Session
+            && row.resets_unix.is_none();
         let verdict = if enabled {
             pace(&row, now_unix)
         } else {
             Pace::Level
         };
         let mut result = Self::from(row);
-        result.apply_pace(verdict);
+        if not_started {
+            result.reset_text = "Not started".into();
+        }
+        result.apply_pace(verdict, now_unix);
         result
     }
 
-    pub fn apply_pace(&mut self, verdict: Pace) {
+    pub fn apply_pace(&mut self, verdict: Pace, now_unix: i64) {
         self.pace = verdict;
         let note: std::borrow::Cow<'static, str> = match verdict {
             Pace::LimitReached => "Limit reached".into(),
             Pace::Over {
                 limit_at_unix: Some(at),
                 ..
-            } => crate::api::fmt_limit_unix(at).into(),
+            } => crate::api::fmt_limit_unix(at, now_unix).into(),
             Pace::Over {
                 limit_at_unix: None,
                 ..
@@ -143,6 +154,8 @@ pub struct SettingsView {
     pub codex_on: bool,
     pub codex_server_on: bool,
     pub pace_on: bool,
+    pub reset_format: crate::config::ResetFormat,
+    pub quota_display: crate::config::QuotaDisplay,
     pub alerts_on: bool,
     pub update_checks_on: bool,
     pub lid_label: String,
@@ -159,6 +172,31 @@ pub struct SettingsView {
     pub refresh_label: String,
     pub hover: i32, // card index, -1 = none
     pub focus: i32, // keyboard focus card index, -1 = none
+}
+
+impl SettingsView {
+    pub fn row_choice(&self, card: usize) -> &'static str {
+        if card == CARD_RESET_FORMAT {
+            self.reset_format.label()
+        } else {
+            self.quota_display.label()
+        }
+    }
+}
+
+pub fn quota_value(percent: f64) -> String {
+    format_quota_value(percent, crate::config::settings().quota_display)
+}
+
+fn format_quota_value(percent: f64, display: crate::config::QuotaDisplay) -> String {
+    let (value, word) = if display == crate::config::QuotaDisplay::Left {
+        (100.0 - percent, "left")
+    } else {
+        (percent, "used")
+    };
+    let mut text = format!("{value:.0}% ");
+    text.push_str(word);
+    text
 }
 
 impl SettingsView {
@@ -290,13 +328,15 @@ pub fn accessible_rows(view: &View) -> Vec<(D2D_RECT_F, String)> {
                     if index > 0 {
                         y += ROW_GAP;
                     }
-                    let mut name = format!(
-                        "{}, {}, {:.0}% used",
-                        section.title, limit.label, limit.percent
-                    );
+                    let mut name = format!("{}, {}", section.title, limit.label);
+                    name.push_str(", ");
+                    name.push_str(&quota_value(limit.percent));
                     if !limit.reset_text.is_empty() {
                         name.push_str(", ");
                         name.push_str(&limit.reset_text);
+                        if limit.reset_text == "Not started" {
+                            name.push_str(". The session starts with your first message.");
+                        }
                     }
                     if !matches!(limit.pace, Pace::Level) {
                         name.push_str(", ");
@@ -325,6 +365,45 @@ pub fn accessible_rows(view: &View) -> Vec<(D2D_RECT_F, String)> {
     rows
 }
 
+/// Mouse-only shortcuts use the same row bounds as UIA, with scroll applied by the caller.
+pub fn row_shortcut(view: &View, x: f32, y: f32) -> Option<usize> {
+    let View::Data(data) = view else {
+        return None;
+    };
+    if !(PAD..FLYOUT_W - PAD).contains(&x) {
+        return None;
+    }
+    let mut top = PAD;
+    for (index, section) in data.sections.iter().enumerate() {
+        if index > 0 {
+            top += SEC_GAP + 1.0 + SEC_GAP;
+        }
+        top += TITLE_H + SECTION_GAP;
+        if section.status.is_some() {
+            top += CAPTION_H + GAP;
+        }
+        match &section.body {
+            SectionBody::Rows(rows) => {
+                for (index, row) in rows.iter().enumerate() {
+                    if index > 0 {
+                        top += ROW_GAP;
+                    }
+                    if (top + ROW_BLOCK - CAPTION_H..top + ROW_BLOCK).contains(&y) {
+                        return if x < PAD + 96.0 {
+                            Some(CARD_QUOTA_DISPLAY)
+                        } else {
+                            (!row.reset_text.is_empty()).then_some(CARD_RESET_FORMAT)
+                        };
+                    }
+                    top += ROW_BLOCK;
+                }
+            }
+            SectionBody::Note(_) => top += CAPTION_H,
+        }
+    }
+    None
+}
+
 /// Header icon buttons (refresh, gear) in flyout DIP coords.
 pub fn fly_btns() -> (D2D_RECT_F, D2D_RECT_F) {
     let top = PAD + (TITLE_H - BTN) / 2.0;
@@ -339,7 +418,7 @@ pub const SET_W: f32 = 400.0;
 const SET_PAD: f32 = 24.0;
 const CARD_H: f32 = 56.0;
 const CARD_GAP: f32 = 4.0;
-pub const N_CARDS: usize = 14;
+pub const N_CARDS: usize = 16;
 pub const CARD_ACCOUNT: usize = 0;
 pub const CARD_CAPS: usize = 1;
 pub const CARD_AUTOSTART: usize = 2;
@@ -356,6 +435,8 @@ pub const CARD_QUIT: usize = 10;
 pub const CARD_DIAGNOSTICS: usize = 11;
 pub const CARD_CODEX_SERVER: usize = 12;
 pub const CARD_PACE: usize = 13;
+pub const CARD_QUOTA_DISPLAY: usize = 14;
+pub const CARD_RESET_FORMAT: usize = 15;
 const DIAGNOSTICS_H: f32 = 720.0;
 
 pub fn settings_height() -> f32 {
@@ -432,19 +513,65 @@ pub struct Surface {
     fmt_body_sb: IDWriteTextFormat,
     fmt_body_1: IDWriteTextFormat,
     fmt_caption: IDWriteTextFormat,
-    /// Caption that must stay on one line — ellipsized instead of wrapping out
-    /// of its card. `fmt_caption` wraps on purpose (footer notes rely on it).
     fmt_caption_1: IDWriteTextFormat,
-    _ellipsis: IDWriteInlineObject,
-    _body_ellipsis: IDWriteInlineObject,
     fmt_glyph: IDWriteTextFormat,
     fmt_glyph_lg: IDWriteTextFormat,
+    _ellipsis: IDWriteInlineObject,
+    _body_ellipsis: IDWriteInlineObject,
     brushes: Option<BrushCache>,
     w: u32,
     h: u32,
 }
 
 impl Surface {
+    #[inline(never)]
+    fn create_formats(dwrite: &IDWriteFactory) -> Result<[IDWriteTextFormat; 7]> {
+        unsafe {
+            let mut formats = Vec::with_capacity(7);
+            for (family, size, weight) in [
+                (
+                    w!("Segoe UI Variable Text"),
+                    SIZE_BODY,
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                ),
+                (
+                    w!("Segoe UI Variable Text"),
+                    SIZE_BODY,
+                    DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                ),
+                (
+                    w!("Segoe UI Variable Text"),
+                    SIZE_BODY,
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                ),
+                (
+                    w!("Segoe UI Variable Small"),
+                    SIZE_CAPTION,
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                ),
+                (
+                    w!("Segoe UI Variable Small"),
+                    SIZE_CAPTION,
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                ),
+                (w!("Segoe Fluent Icons"), 13.0, DWRITE_FONT_WEIGHT_NORMAL),
+                (w!("Segoe Fluent Icons"), 16.0, DWRITE_FONT_WEIGHT_NORMAL),
+            ] {
+                formats.push(dwrite.CreateTextFormat(
+                    family,
+                    None,
+                    weight,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    size,
+                    w!("en-us"),
+                )?);
+            }
+
+            formats.try_into().map_err(|_| Error::from(E_UNEXPECTED))
+        }
+    }
+
     pub fn new(hwnd: HWND) -> Result<Self> {
         unsafe {
             // WARP, not hardware: the HW driver's user-mode heaps cost ~40 MB
@@ -498,65 +625,24 @@ impl Surface {
             dcomp.Commit()?;
 
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let mk = |family: PCWSTR,
-                      size: f32,
-                      weight: DWRITE_FONT_WEIGHT|
-             -> Result<IDWriteTextFormat> {
-                dwrite.CreateTextFormat(
-                    family,
-                    None,
-                    weight,
-                    DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    size,
-                    w!("en-us"),
-                )
-            };
-            let fmt_body = mk(
-                w!("Segoe UI Variable Text"),
-                SIZE_BODY,
-                DWRITE_FONT_WEIGHT_NORMAL,
-            )?;
-            let fmt_body_sb = mk(
-                w!("Segoe UI Variable Text"),
-                SIZE_BODY,
-                DWRITE_FONT_WEIGHT_SEMI_BOLD,
-            )?;
-            let fmt_body_1 = mk(
-                w!("Segoe UI Variable Text"),
-                SIZE_BODY,
-                DWRITE_FONT_WEIGHT_NORMAL,
-            )?;
-            fmt_body_1.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            let body_ellipsis = dwrite.CreateEllipsisTrimmingSign(&fmt_body_1)?;
-            fmt_body_1.SetTrimming(
-                &DWRITE_TRIMMING {
-                    granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-                    delimiter: 0,
-                    delimiterCount: 0,
-                },
-                &body_ellipsis,
-            )?;
-            let fmt_caption = mk(
-                w!("Segoe UI Variable Small"),
-                SIZE_CAPTION,
-                DWRITE_FONT_WEIGHT_NORMAL,
-            )?;
-            let fmt_caption_1 = mk(
-                w!("Segoe UI Variable Small"),
-                SIZE_CAPTION,
-                DWRITE_FONT_WEIGHT_NORMAL,
-            )?;
-            fmt_caption_1.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            let ellipsis = dwrite.CreateEllipsisTrimmingSign(&fmt_caption_1)?;
-            fmt_caption_1.SetTrimming(
-                &DWRITE_TRIMMING {
-                    granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-                    delimiter: 0,
-                    delimiterCount: 0,
-                },
-                &ellipsis,
-            )?;
+            let [fmt_body, fmt_body_sb, fmt_body_1, fmt_caption, fmt_caption_1, fmt_glyph, fmt_glyph_lg] =
+                Self::create_formats(&dwrite)?;
+            let mut signs = Vec::with_capacity(2);
+            for format in [&fmt_body_1, &fmt_caption_1] {
+                format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                let sign = dwrite.CreateEllipsisTrimmingSign(format)?;
+                format.SetTrimming(
+                    &DWRITE_TRIMMING {
+                        granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                        delimiter: 0,
+                        delimiterCount: 0,
+                    },
+                    &sign,
+                )?;
+                signs.push(sign);
+            }
+            let [body_ellipsis, ellipsis]: [_; 2] =
+                signs.try_into().map_err(|_| Error::from(E_UNEXPECTED))?;
             fmt_caption.SetTrimming(
                 &DWRITE_TRIMMING {
                     granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
@@ -565,8 +651,6 @@ impl Surface {
                 },
                 &ellipsis,
             )?;
-            let fmt_glyph = mk(w!("Segoe Fluent Icons"), 13.0, DWRITE_FONT_WEIGHT_NORMAL)?;
-            let fmt_glyph_lg = mk(w!("Segoe Fluent Icons"), 16.0, DWRITE_FONT_WEIGHT_NORMAL)?;
 
             Ok(Self {
                 swap,
@@ -581,10 +665,10 @@ impl Surface {
                 fmt_body_1,
                 fmt_caption,
                 fmt_caption_1,
-                _ellipsis: ellipsis,
-                _body_ellipsis: body_ellipsis,
                 fmt_glyph,
                 fmt_glyph_lg,
+                _ellipsis: ellipsis,
+                _body_ellipsis: body_ellipsis,
                 brushes: None,
                 w: 0,
                 h: 0,
@@ -643,29 +727,58 @@ impl Surface {
         let p = Palette::new(dark, contrast);
         let accent_rgb = contrast.map_or(accent, |colors| colors.accent);
         let accent_text = contrast.map_or((255, 255, 255), |colors| colors.accent_text);
-        let mk = |c: D2D1_COLOR_F| -> Result<ID2D1SolidColorBrush> {
-            unsafe { self.rt.CreateSolidColorBrush(&c, None) }
-        };
+        let colors = [
+            p.text,
+            p.dim,
+            p.track,
+            p.divider,
+            p.stroke,
+            p.card_bg,
+            p.card_hover,
+            p.card_stroke,
+            p.control_fill,
+            p.control_hover,
+            p.control_stroke,
+            p.strong_stroke,
+            col_rgb(accent_rgb, 1.0),
+            col_rgb(AMBER, 1.0),
+            col_rgb(RED, 1.0),
+            col_rgb(accent_text, 1.0),
+        ];
+        let [text, dim, track, divider, stroke, card_bg, card_hover, card_stroke, control_fill, control_hover, control_stroke, strong_stroke, accent, amber, red, white] =
+            Self::create_brushes(&self.rt, colors)?;
         self.brushes = Some(BrushCache {
             key,
-            text: mk(p.text)?,
-            dim: mk(p.dim)?,
-            track: mk(p.track)?,
-            divider: mk(p.divider)?,
-            stroke: mk(p.stroke)?,
-            card_bg: mk(p.card_bg)?,
-            card_hover: mk(p.card_hover)?,
-            card_stroke: mk(p.card_stroke)?,
-            control_fill: mk(p.control_fill)?,
-            control_hover: mk(p.control_hover)?,
-            control_stroke: mk(p.control_stroke)?,
-            strong_stroke: mk(p.strong_stroke)?,
-            accent: mk(col_rgb(accent_rgb, 1.0))?,
-            amber: mk(col_rgb(AMBER, 1.0))?,
-            red: mk(col_rgb(RED, 1.0))?,
-            white: mk(col_rgb(accent_text, 1.0))?,
+            text,
+            dim,
+            track,
+            divider,
+            stroke,
+            card_bg,
+            card_hover,
+            card_stroke,
+            control_fill,
+            control_hover,
+            control_stroke,
+            strong_stroke,
+            accent,
+            amber,
+            red,
+            white,
         });
         Ok(())
+    }
+
+    #[inline(never)]
+    fn create_brushes(
+        rt: &ID2D1RenderTarget,
+        colors: [D2D1_COLOR_F; 16],
+    ) -> Result<[ID2D1SolidColorBrush; 16]> {
+        let mut brushes = Vec::with_capacity(colors.len());
+        for color in colors {
+            brushes.push(unsafe { rt.CreateSolidColorBrush(&color, None)? });
+        }
+        brushes.try_into().map_err(|_| Error::from(E_UNEXPECTED))
     }
 
     fn cache(&self) -> &BrushCache {
@@ -692,6 +805,7 @@ impl Surface {
     // ---------- flyout ----------
 
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     pub fn render_flyout(
         &mut self,
         w_px: u32,
@@ -891,17 +1005,9 @@ impl Surface {
                             } else {
                                 &self.fmt_caption_1
                             },
-                            rect(PAD, y, w - PAD - 56.0, y + LABEL_H),
+                            rect(PAD, y, w - PAD, y + LABEL_H),
                             &b.text,
                             false,
-                        )?;
-                        let pct_str = format!("{:.0}%", row.percent);
-                        self.text(
-                            &pct_str,
-                            &self.fmt_body_sb,
-                            rect(w - PAD - 56.0, y, w - PAD, y + LABEL_H),
-                            &b.text,
-                            true,
                         )?;
 
                         let bar_y = y + LABEL_H + GAP;
@@ -929,14 +1035,21 @@ impl Surface {
                             );
                         }
 
+                        let cap_y = bar_y + BAR_H + GAP;
+                        self.text(
+                            &quota_value(row.percent),
+                            &self.fmt_caption_1,
+                            rect(PAD, cap_y, PAD + 96.0, cap_y + CAPTION_H),
+                            &b.text,
+                            false,
+                        )?;
                         if !row.reset_text.is_empty() {
-                            let cap_y = bar_y + BAR_H + GAP;
                             self.text(
                                 &row.reset_text,
                                 &self.fmt_caption_1,
-                                rect(PAD, cap_y, w - PAD, cap_y + CAPTION_H),
+                                rect(PAD + 96.0, cap_y, w - PAD, cap_y + CAPTION_H),
                                 &b.dim,
-                                false,
+                                true,
                             )?;
                         }
                         y += ROW_BLOCK;
@@ -1107,6 +1220,8 @@ impl Surface {
                 "Diagnostics",
                 "Codex app-server",
                 "Color bars by current pace",
+                "Quota display",
+                "Reset format",
             ];
             // Segoe Fluent Icons: account, keyboard, power, command prompt,
             // bell (EA8F Ringer — E7ED is the muted bell), download, clock,
@@ -1114,6 +1229,7 @@ impl Surface {
             let icons = [
                 "\u{E77B}", "\u{E765}", "\u{E7E8}", "\u{E756}", "\u{EA8F}", "\u{E895}", "\u{E7BA}",
                 "\u{E823}", "\u{E72C}", "\u{E946}", "\u{E711}", "\u{E9D9}", "\u{E756}", "\u{E9D9}",
+                "\u{E9D9}", "\u{E823}",
             ];
             let cards = settings_rects(scroll);
             for (i, card) in cards.iter().enumerate() {
@@ -1233,25 +1349,36 @@ impl Surface {
                 if let Some(on) = st.toggle_for(i) {
                     self.toggle(card.right - 16.0, cy, on)?;
                 } else {
-                    match i {
-                        CARD_ACCOUNT => self.button(card.right - 16.0, cy, st.account_action)?,
+                    let label = match i {
+                        CARD_ACCOUNT => Some(st.account_action),
                         CARD_CAPS => match st.caps_control {
-                            CapsControl::Unavailable => {}
-                            CapsControl::Toggle(on) => self.toggle(card.right - 16.0, cy, on)?,
-                            CapsControl::Retry => self.button(card.right - 16.0, cy, "Retry")?,
+                            CapsControl::Unavailable => None,
+                            CapsControl::Toggle(on) => {
+                                self.toggle(card.right - 16.0, cy, on)?;
+                                None
+                            }
+                            CapsControl::Retry => Some("Retry"),
                         },
                         CARD_LID => {
                             if let Some(action) = st.lid_action {
-                                self.button(card.right - 16.0, cy, action)?;
+                                Some(action)
                             } else {
                                 self.toggle(card.right - 16.0, cy, st.lid_on)?;
+                                None
                             }
                         }
-                        CARD_INTERVAL => self.interval_row(card, st.poll_secs)?,
-                        CARD_REFRESH => self.button(card.right - 16.0, cy, "Refresh")?,
-                        CARD_ABOUT => self.button(card.right - 16.0, cy, st.about_btn)?,
-                        CARD_QUIT => self.button(card.right - 16.0, cy, "Quit")?,
-                        _ => {}
+                        CARD_INTERVAL => {
+                            self.interval_row(card, st.poll_secs)?;
+                            None
+                        }
+                        CARD_REFRESH => Some("Refresh"),
+                        CARD_ABOUT => Some(st.about_btn),
+                        CARD_QUIT => Some("Quit"),
+                        CARD_QUOTA_DISPLAY | CARD_RESET_FORMAT => Some(st.row_choice(i)),
+                        _ => None,
+                    };
+                    if let Some(label) = label {
+                        self.button(card.right - 16.0, cy, label)?;
                     }
                 }
 
@@ -1286,8 +1413,6 @@ impl Surface {
             let pills = interval_pills(card);
             let b = self.cache();
             let f = &self.fmt_caption;
-            f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             for (i, pill) in pills.iter().enumerate() {
                 let (secs, label) = INTERVALS[i];
                 let selected = secs == poll_secs;
@@ -1309,15 +1434,14 @@ impl Surface {
                         .DrawRoundedRectangle(&rr, &b.control_stroke, 1.0, None);
                 }
                 let brush = if selected { &b.white } else { &b.text };
-                let wide: Vec<u16> = label.encode_utf16().collect();
-                self.dc.DrawText(
-                    &wide,
+                self.draw_text(
+                    label,
                     f,
-                    pill,
+                    *pill,
                     brush,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+                    DWRITE_TEXT_ALIGNMENT_CENTER,
+                    DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+                )?;
             }
             Ok(())
         }
@@ -1378,19 +1502,7 @@ impl Surface {
             };
             self.dc
                 .DrawRoundedRectangle(&rr, &b.control_stroke, 1.0, None);
-            let f = &self.fmt_body;
-            f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            let wide: Vec<u16> = label.encode_utf16().collect();
-            self.dc.DrawText(
-                &wide,
-                f,
-                &r,
-                &b.text,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-            Ok(())
+            self.glyph_with(&self.fmt_body, label, r, &b.text)
         }
     }
 
@@ -1426,20 +1538,14 @@ impl Surface {
         r: D2D_RECT_F,
         brush: &ID2D1SolidColorBrush,
     ) -> Result<()> {
-        unsafe {
-            f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            let wide: Vec<u16> = s.encode_utf16().collect();
-            self.dc.DrawText(
-                &wide,
-                f,
-                &r,
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-            Ok(())
-        }
+        self.draw_text(
+            s,
+            f,
+            r,
+            brush,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+        )
     }
 
     fn text(
@@ -1450,24 +1556,18 @@ impl Surface {
         brush: &ID2D1SolidColorBrush,
         trailing: bool,
     ) -> Result<()> {
-        unsafe {
-            f.SetTextAlignment(if trailing {
+        self.draw_text(
+            s,
+            f,
+            r,
+            brush,
+            if trailing {
                 DWRITE_TEXT_ALIGNMENT_TRAILING
             } else {
                 DWRITE_TEXT_ALIGNMENT_LEADING
-            })?;
-            f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
-            let wide: Vec<u16> = s.encode_utf16().collect();
-            self.dc.DrawText(
-                &wide,
-                f,
-                &r,
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-            Ok(())
-        }
+            },
+            DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+        )
     }
 
     /// vertically-centered text
@@ -1478,9 +1578,29 @@ impl Surface {
         r: D2D_RECT_F,
         brush: &ID2D1SolidColorBrush,
     ) -> Result<()> {
+        self.draw_text(
+            s,
+            f,
+            r,
+            brush,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+        )
+    }
+
+    #[inline(never)]
+    fn draw_text(
+        &self,
+        s: &str,
+        f: &IDWriteTextFormat,
+        r: D2D_RECT_F,
+        brush: &ID2D1SolidColorBrush,
+        alignment: DWRITE_TEXT_ALIGNMENT,
+        paragraph: DWRITE_PARAGRAPH_ALIGNMENT,
+    ) -> Result<()> {
         unsafe {
-            f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
-            f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            f.SetTextAlignment(alignment)?;
+            f.SetParagraphAlignment(paragraph)?;
             let wide: Vec<u16> = s.encode_utf16().collect();
             self.dc.DrawText(
                 &wide,
@@ -1624,6 +1744,78 @@ fn relative_time(unix: i64) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn quota_display_complements_value_without_changing_severity() {
+        for (used, expected) in [
+            (0.0, "100% left"),
+            (48.0, "52% left"),
+            (99.5, "0% left"),
+            (100.0, "0% left"),
+        ] {
+            assert_eq!(
+                format_quota_value(used, crate::config::QuotaDisplay::Left),
+                expected
+            );
+            assert_eq!(
+                format_quota_value(used, crate::config::QuotaDisplay::Used),
+                format!("{used:.0}% used")
+            );
+        }
+    }
+    #[test]
+    fn not_started_is_only_a_claude_session_and_shortcuts_follow_scrolled_row_bounds() {
+        use crate::provider::model::{LimitKind, ProviderId};
+        for provider in [ProviderId::Claude, ProviderId::Codex] {
+            for kind in [LimitKind::Session, LimitKind::Weekly] {
+                let limit = UsageLimit::from_adapter(
+                    "limit".into(),
+                    kind.clone(),
+                    "Limit".into(),
+                    0.0,
+                    None,
+                    None,
+                    Some(18000),
+                )
+                .unwrap();
+                let row = LimitRow::with_pace(limit, provider, 9000, true);
+                let started = provider == ProviderId::Claude && kind == LimitKind::Session;
+                assert_eq!(row.reset_text, if started { "Not started" } else { "" });
+                let view = View::Data(FlyoutData {
+                    sections: vec![Section {
+                        title: if provider == ProviderId::Claude {
+                            "Claude"
+                        } else {
+                            "Codex"
+                        },
+                        plan: String::new(),
+                        status: Some("Outdated".into()),
+                        body: SectionBody::Rows(vec![row]),
+                    }],
+                    fetched_unix: Some(9000),
+                    note: None,
+                });
+                let rows = accessible_rows(&view);
+                assert_eq!(
+                    rows[1]
+                        .1
+                        .contains("The session starts with your first message."),
+                    started
+                );
+                let bounds = rows[1].0;
+                assert_eq!(
+                    row_shortcut(&view, PAD, bounds.bottom - 1.0),
+                    Some(CARD_QUOTA_DISPLAY)
+                );
+                assert_eq!(
+                    row_shortcut(&view, FLYOUT_W - PAD - 1.0, bounds.bottom - 1.0),
+                    started.then_some(CARD_RESET_FORMAT)
+                );
+                assert_eq!(row_shortcut(&view, PAD, bounds.top), None);
+                assert_eq!(row_shortcut(&view, PAD - 1.0, bounds.bottom - 1.0), None);
+                assert_eq!(row_shortcut(&view, PAD, rows[0].0.bottom - 1.0), None);
+            }
+        }
+    }
+    #[test]
     fn pace_presentation_changes_only_flyout_and_toggle_restores_level() {
         let limit = crate::provider::model::UsageLimit::from_adapter(
             "session".into(),
@@ -1636,11 +1828,21 @@ mod tests {
         )
         .unwrap();
         let original = limit.clone();
-        let level = LimitRow::with_pace(limit.clone(), 9000, false);
+        let level = LimitRow::with_pace(
+            limit.clone(),
+            crate::provider::model::ProviderId::Claude,
+            9000,
+            false,
+        );
         assert_eq!(level.pace, Pace::Level);
         assert_eq!(level.label, "Session");
         assert_eq!(level.pace.severity(level.severity), None);
-        let projected = LimitRow::with_pace(limit.clone(), 9000, true);
+        let projected = LimitRow::with_pace(
+            limit.clone(),
+            crate::provider::model::ProviderId::Claude,
+            9000,
+            true,
+        );
         let projected_label = projected.label.clone();
         assert!(matches!(projected.pace, Pace::Over { .. }));
         assert!(projected.label.contains(" · Limit "));
@@ -1709,6 +1911,8 @@ mod tests {
             codex_on: false,
             codex_server_on: false,
             pace_on: true,
+            reset_format: crate::config::ResetFormat::Clock,
+            quota_display: crate::config::QuotaDisplay::Used,
             alerts_on: false,
             update_checks_on,
             lid_label: String::new(),
@@ -1747,7 +1951,7 @@ mod tests {
             DIAGNOSTICS_H
         );
         assert!(cards[CARD_DIAGNOSTICS].top > cards[CARD_QUIT].bottom);
-        assert_eq!(settings_height(), cards[CARD_PACE].bottom + SET_PAD);
+        assert_eq!(settings_height(), cards[CARD_RESET_FORMAT].bottom + SET_PAD);
         assert_eq!(
             settings_rects(100.0)[CARD_DIAGNOSTICS].top,
             cards[CARD_DIAGNOSTICS].top - 100.0

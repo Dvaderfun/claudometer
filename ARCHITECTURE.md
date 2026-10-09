@@ -52,6 +52,18 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 
 ## Rendering (`gfx::Surface`)
 
+ROW-01 formats quota values as used/left and reset/run-out text as local clock
+or countdown. Both preferences are additive fields in settings schema 1 and
+share Settings actions with mouse-only row shortcuts. Row captions display
+value on the left and reset on the right below the unchanged used-% bar.
+Only a Claude Session with no reset displays Not started, with the first-message
+explanation in UIA. The existing visible-only 30-second timer updates countdown
+and pace; demo views regenerate from fixed synthetic timestamps, with row
+choices held only in memory. Provider snapshots and alert dedup stay unchanged.
+Live/demo rendering shares the same draw dispatch; UIA Settings names/help
+reuse the displayed Settings view. Font/brush creation loops retain cached
+resource ownership and checked COM failures while limiting executable size.
+
 DIAG-02 logs only fixed code vocabulary plus UTC time, with whole-field
 redaction of unknown input and three 256 KiB generations. Normal startup
 enables logging; repeated failure codes do not perform repeated writes.

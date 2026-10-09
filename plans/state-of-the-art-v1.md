@@ -143,7 +143,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 
 ---
 
-## 2. Status board (2026-10-09)
+## 2. Status board (2026-10-10)
 
 ### 2.1 Milestones
 
@@ -155,7 +155,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | R0 | Ship the trust-root release | **Shipped 0.9.1 on 2026-10-09**; signed manifests/provenance verified, Windows signing deferred to v1.0 (ADR 0006) |
 | `v0.10` | State core, diagnostics, Codex documented source | **Local implementation complete**; CODEX-01/02 isolated source and measurement gate on `feat/codex-isolated-app-server`; app-server remains opt-in (2.198 s p95) |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
-| `v0.12` | Glanceable status, tray, and alerts | **In progress**; PACE-01 stateless flyout pace implemented locally |
+| `v0.12` | Glanceable status, tray, and alerts | **In progress**; PACE-01 and ROW-01 implemented locally; FRESH-01 next |
 | `v1.0` | Signed distribution | Not started |
 | `v1.1` | History-refined pacing | **Gated** on field evidence |
 | `v1.2` | One gated provider | Not started |
@@ -183,7 +183,7 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 5. **ERR-01 done** — actionable error states (§8.2).
 6. **DIAG-01 done** → **DIAG-02 done** (§8.3).
 7. **CODEX-01 done** → **CODEX-02 done** (§8.4): owner-approved ADR 0007, isolated ephemeral external auth, audited native x64 hashes, bounded private stdio, account/source-bound cache, kill-on-close job and checked cleanup. Final ten-sample live p95 2.198 s exceeds 2 s, so Settings opt-in remains off by default. Other CLI versions/ARM64 use Compatibility; no same-cycle second request. See `docs/verification/codex-01.md` and `docs/performance/codex-02.md`.
-8. **PACE-01 done** → **ROW-01** → **FRESH-01** (§10.1). If the v0.10 tail is blocked, PACE-01 and ROW-01 may start once MODEL-01 is done, and FRESH-01 once APP-01 is done.
+8. **PACE-01 done** → **ROW-01 done** → **FRESH-01** (§10.1). If the v0.10 tail is blocked, PACE-01 and ROW-01 may start once MODEL-01 is done, and FRESH-01 once APP-01 is done.
 9. **A11Y-02**, **LAYOUT-01**, **LAYOUT-02**, **RENDER-01** (§9).
 10. **ONBOARD-01**, **ONBOARD-02**, **KEY-01**, **UI-TEST-01** (§9).
 11. **TRAY-01**, **TRAY-02**, **TRAY-03**, **ALERT-03**, **ALERT-04**, **PRIV-03** (§10).
@@ -661,11 +661,13 @@ Everything in `v0.8` and `v0.9` shipped in the immutable 0.9.1 release, publishe
   - Scope: pace changes **only** flyout bar color, the note, and the UIA name. The tray icon and alerts keep using used-% thresholds (decision D-06).
   - Acceptance: table tests for every verdict boundary (`p` = 90, 90.01, 99.99, 100), `u = 0`, missing reset, missing window, `e` just below and at the minimum, `R ≤ t`, clock skew (`S > t`), a Spend-class limit, and DST weeks (pure Unix arithmetic must make DST irrelevant; prove it).
 
-- [ ] **ROW-01 — Reset format, “Not started”, and click shortcuts.**
+- [x] **ROW-01 — Reset format, “Not started”, and click shortcuts.**
+  - Completed locally 2026-10-10: additive Clock/Countdown and Used/Left choices, shared Settings/row-click dispatch, below-bar value/reset captions, Claude-only Session Not started and UIA first-message explanation. Reset/run-out formatting follows the same preference; the existing visible-only timer remains 30 seconds. 187 tests, ordered gates, demo safety, 52 focused row checks (including scrolled shortcuts), 22 existing UIA and 19 pace checks pass. x64 1,071,104 unprovisioned / 1,163,776 provisioned; ARM64 978,432 / 1,018,368. Original artifact gates unchanged. Shared rendering/resources and Settings/UIA view recover size. Runtime evidence/rollback: `docs/verification/row-01.md`, `docs/performance/row-01.md`, artifact ledger. Narrator and actual ARM64 runtime remain unverified.
   - Setting `reset_format`: `clock` (default; today's behavior) or `countdown`. Formats per §5.1.
   - Claude session with no reset timestamp shows `Not started` (§5.1).
   - Mouse shortcuts: clicking a row's value flips `quota_display`; clicking a reset label flips `reset_format`. Both apply everywhere and persist. The keyboard path for both is the Settings control (no extra Tab stops per row).
   - Countdown text repaints at most once per 30 s, only while the flyout is visible.
+  - Final controlled ten-minute hidden/visible p95 private working set: 1.61/4.95 MiB; idle CPU 0.0000/0.0013%, GDI 10/13, no TCP. Five-start tray median/p95 37.531/67.446 ms. No live provider or ARM64 runtime claim.
 
 - [ ] **FRESH-01 — Updating, Outdated, and next-update footer.**
   - Implement the §5.2 header tokens and footer from the STATE-01 view states.

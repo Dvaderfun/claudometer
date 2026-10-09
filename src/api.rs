@@ -642,7 +642,7 @@ pub fn fmt_unix_hhmm(unix: i64) -> String {
     let Some(local) = windows_local_time(dt, None) else {
         return String::new();
     };
-    format!("{:02}:{:02}", local.wHour, local.wMinute)
+    fmt_hhmm(&local)
 }
 
 pub(crate) fn prettify(s: &str) -> String {
@@ -678,17 +678,40 @@ pub(crate) fn read_bounded(reader: impl Read) -> Result<Vec<u8>, FetchErr> {
 
 /// Same formatting for unix-seconds reset stamps (Codex API shape).
 pub(crate) fn fmt_reset_unix(unix: i64) -> String {
-    fmt_event_unix(unix, "resets")
+    use crate::provider::state::Clock;
+    fmt_event_unix(
+        unix,
+        "resets",
+        crate::provider::state::SystemClock.read().unix_seconds,
+        crate::config::settings().reset_format,
+    )
 }
 
-pub(crate) fn fmt_limit_unix(unix: i64) -> String {
-    fmt_event_unix(unix, "Limit")
+pub(crate) fn fmt_limit_unix(unix: i64, now: i64) -> String {
+    fmt_event_unix(unix, "Limit", now, crate::config::settings().reset_format)
 }
 
-fn fmt_event_unix(unix: i64, verb: &str) -> String {
+pub(crate) fn fmt_event_unix(
+    unix: i64,
+    verb: &str,
+    now: i64,
+    format: crate::config::ResetFormat,
+) -> String {
     let Ok(dt) = OffsetDateTime::from_unix_timestamp(unix) else {
         return String::new();
     };
+    if format == crate::config::ResetFormat::Countdown {
+        let minutes = unix.saturating_sub(now).max(0) / 60;
+        let (major, minor, units) = if minutes >= 1440 {
+            (minutes / 1440, minutes % 1440 / 60, ("d", "h"))
+        } else {
+            (minutes / 60, minutes % 60, ("h", "m"))
+        };
+        let mut text = verb.to_string();
+        text.push_str(" in ");
+        text.push_str(&format!("{major}{} {minor}{}", units.0, units.1));
+        return text;
+    }
     fmt_event_dt(dt, verb)
 }
 
@@ -703,6 +726,10 @@ fn fmt_event_dt(dt: OffsetDateTime, verb: &str) -> String {
     }
     let mut today = SYSTEMTIME::default();
     unsafe { GetLocalTime(&mut today) };
+    fmt_clock(&local, &today, verb)
+}
+
+fn fmt_clock(local: &SYSTEMTIME, today: &SYSTEMTIME, verb: &str) -> String {
     let day = if (local.wYear, local.wMonth, local.wDay) == (today.wYear, today.wMonth, today.wDay)
     {
         ""
@@ -713,7 +740,16 @@ fn fmt_event_dt(dt: OffsetDateTime, verb: &str) -> String {
             .copied()
             .unwrap_or("")
     };
-    format!("{verb} {day}{:02}:{:02}", local.wHour, local.wMinute)
+    let mut text = verb.to_string();
+    text.push(' ');
+    text.push_str(day);
+    text.push_str(&fmt_hhmm(local));
+    text
+}
+
+#[inline(never)]
+fn fmt_hhmm(local: &SYSTEMTIME) -> String {
+    format!("{:02}:{:02}", local.wHour, local.wMinute)
 }
 
 fn windows_local_time(
@@ -750,6 +786,60 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn reset_clock_preserves_today_and_weekday_copy() {
+        let local = SYSTEMTIME {
+            wYear: 2026,
+            wMonth: 10,
+            wDay: 9,
+            wDayOfWeek: 5,
+            wHour: 18,
+            wMinute: 59,
+            ..Default::default()
+        };
+        assert_eq!(fmt_clock(&local, &local, "resets"), "resets 18:59");
+        let today = SYSTEMTIME { wDay: 8, ..local };
+        assert_eq!(fmt_clock(&local, &today, "resets"), "resets Fri 18:59");
+        assert_eq!(
+            fmt_event_unix(i64::MAX, "resets", 0, crate::config::ResetFormat::Clock),
+            ""
+        );
+    }
+
+    #[test]
+    fn countdown_boundaries_and_pace_notes_use_unix_time() {
+        use crate::config::ResetFormat::Countdown;
+        let now = time::macros::datetime!(2026-03-08 09:00 UTC).unix_timestamp();
+        for (seconds, expected) in [
+            (0, "0h 0m"),
+            (-1, "0h 0m"),
+            (59, "0h 0m"),
+            (60, "0h 1m"),
+            (12300, "3h 25m"),
+            (86399, "23h 59m"),
+            (86400, "1d 0h"),
+            (187200, "2d 4h"),
+        ] {
+            assert_eq!(
+                fmt_event_unix(now + seconds, "resets", now, Countdown),
+                format!("resets in {expected}")
+            );
+            assert_eq!(
+                fmt_event_unix(now + seconds, "Limit", now, Countdown),
+                format!("Limit in {expected}")
+            );
+        }
+        assert_eq!(
+            fmt_event_unix(now + 604800, "resets", now, Countdown),
+            "resets in 7d 0h"
+        );
+        assert_eq!(fmt_event_unix(i64::MAX, "resets", now, Countdown), "");
+        assert_eq!(
+            fmt_event_unix(now, "resets", i64::MAX, Countdown),
+            "resets in 0h 0m"
+        );
+    }
 
     fn pacific_timezone() -> DYNAMIC_TIME_ZONE_INFORMATION {
         for index in 0.. {

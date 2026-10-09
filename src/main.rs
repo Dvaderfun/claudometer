@@ -162,6 +162,22 @@ thread_local! {
     };
 }
 
+#[inline(never)]
+unsafe fn create_window(
+    exstyle: WINDOW_EX_STYLE,
+    class: PCWSTR,
+    title: PCWSTR,
+    style: WINDOW_STYLE,
+    bounds: [i32; 4],
+    parent: HWND,
+    instance: HINSTANCE,
+) -> Result<HWND> {
+    CreateWindowExW(
+        exstyle, class, title, style, bounds[0], bounds[1], bounds[2], bounds[3], parent, None,
+        instance, None,
+    )
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(result) = diagnostics::support_command(&args) {
@@ -263,22 +279,18 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         RegisterClassExW(&wc);
-        let main = CreateWindowExW(
+        let main = create_window(
             WINDOW_EX_STYLE(0),
             cls,
             w!("Claudometer"),
             WS_POPUP,
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
+            [0, 0, 0, 0],
+            HWND::default(),
             hinst,
-            None,
         )?;
         MAIN_HWND.store(main.0 as isize, Ordering::SeqCst);
 
+        let arrow_cursor = LoadCursorW(None, IDC_ARROW)?;
         // flyout window
         let fcls = w!("Claudometer.Flyout");
         let fwc = WNDCLASSEXW {
@@ -286,24 +298,19 @@ fn main() -> Result<()> {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(flyout_wndproc),
             hInstance: hinst,
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hCursor: arrow_cursor,
             lpszClassName: fcls,
             ..Default::default()
         };
         RegisterClassExW(&fwc);
-        let flyout = CreateWindowExW(
+        let flyout = create_window(
             WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST,
             fcls,
             w!("Claude usage"),
             WS_POPUP,
-            0,
-            0,
-            10,
-            10,
-            None,
-            None,
+            [0, 0, 10, 10],
+            HWND::default(),
             hinst,
-            None,
         )?;
         FLYOUT_HWND.store(flyout.0 as isize, Ordering::SeqCst);
         style_flyout(flyout);
@@ -318,7 +325,7 @@ fn main() -> Result<()> {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(settings_wndproc),
             hInstance: hinst,
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hCursor: arrow_cursor,
             hIcon: app_icon,
             lpszClassName: scls,
             ..Default::default()
@@ -662,7 +669,18 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     gfx::FlyHover::Vibe => 2,
                     gfx::FlyHover::None => -1,
                 };
-                activate_flyout_control(control);
+                if control >= 0 {
+                    activate_flyout_control(control);
+                } else {
+                    let view = demo::view().unwrap_or_else(current_view);
+                    let scroll = UI.with(|ui| ui.borrow().fly_scroll);
+                    if let Some(card) = gfx::row_shortcut(&view, x, y + scroll) {
+                        activate_settings_card(
+                            HWND(SETTINGS_HWND.load(Ordering::SeqCst) as *mut _),
+                            card,
+                        );
+                    }
+                }
                 LRESULT(0)
             }
             WM_MOUSEWHEEL => {
@@ -760,7 +778,11 @@ extern "system" fn settings_wndproc(
                         hit as usize,
                     );
                 }
-                if demo::is_active() && hit != gfx::CARD_DIAGNOSTICS as i32 {
+                if demo::is_active()
+                    && hit != gfx::CARD_DIAGNOSTICS as i32
+                    && hit != gfx::CARD_QUOTA_DISPLAY as i32
+                    && hit != gfx::CARD_RESET_FORMAT as i32
+                {
                     render_settings(hwnd);
                     return LRESULT(0);
                 }
@@ -989,6 +1011,15 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
         render_settings(hwnd);
         return;
     }
+    if i == gfx::CARD_QUOTA_DISPLAY || i == gfx::CARD_RESET_FORMAT {
+        if config::toggle_row_format(i == gfx::CARD_RESET_FORMAT).is_ok() {
+            render_flyout_current();
+        }
+        if !hwnd.is_invalid() && IsWindowVisible(hwnd).as_bool() {
+            render_settings(hwnd);
+        }
+        return;
+    }
     if demo::is_active() {
         return;
     }
@@ -1150,9 +1181,7 @@ unsafe fn flyout_viewport_height(hwnd: HWND) -> f32 {
 }
 
 unsafe fn flyout_scroll_limit(hwnd: HWND) -> f32 {
-    let view = demo::active()
-        .map(|state| state.view.clone())
-        .unwrap_or_else(current_view);
+    let view = demo::view().unwrap_or_else(current_view);
     (gfx::flyout_height(&view) - flyout_viewport_height(hwnd)).max(0.0)
 }
 
@@ -1170,9 +1199,7 @@ unsafe fn scroll_flyout_focus_into_view(hwnd: HWND) {
     let viewport = flyout_viewport_height(hwnd);
     let limit = flyout_scroll_limit(hwnd);
     let (refresh, settings) = gfx::fly_btns();
-    let view = demo::active()
-        .map(|state| state.view.clone())
-        .unwrap_or_else(current_view);
+    let view = demo::view().unwrap_or_else(current_view);
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
         let rect = match ui.fly_focus {
@@ -1440,7 +1467,7 @@ fn section(title: &'static str, s: UsageSnapshot) -> gfx::Section {
         body: gfx::SectionBody::Rows(
             s.rows
                 .into_iter()
-                .map(|row| gfx::LimitRow::with_pace(row, now, pace_enabled))
+                .map(|row| gfx::LimitRow::with_pace(row, s.provider, now, pace_enabled))
                 .collect(),
         ),
     }
@@ -1569,6 +1596,12 @@ unsafe fn show_demo_flyout(fh: HWND, state: &demo::State) {
     render_demo_flyout(fh, state, width as u32, height as u32, dpi);
     let _ = ShowWindow(fh, SW_SHOW);
     let _ = SetForegroundWindow(fh);
+    SetTimer(
+        HWND(MAIN_HWND.load(Ordering::SeqCst) as *mut _),
+        TIMER_TICK,
+        30_000,
+        None,
+    );
 }
 
 unsafe fn signal_demo_ready(state: &demo::State) {
@@ -1582,47 +1615,24 @@ unsafe fn signal_demo_ready(state: &demo::State) {
     }
 }
 
-unsafe fn render_demo_flyout(fh: HWND, state: &demo::State, width: u32, height: u32, dpi: f32) {
-    update_error_tooltip(fh);
-    UI.with(|ui| {
-        let mut ui = ui.borrow_mut();
-        if ui.fly.is_none() {
-            ui.fly = diagnostics::observe(gfx::Surface::new(fh), "render_init_failed").ok();
-        }
-        ui.fly_vibe_top = gfx::vibe_row(&state.view).top;
-        let hover = ui.fly_hover;
-        let focus = ui.fly_focus;
-        let scroll = ui.fly_scroll;
-        if let Some(surface) = ui.fly.as_mut() {
-            let _ = diagnostics::observe(
-                surface.render_flyout(
-                    width,
-                    height,
-                    dpi,
-                    &state.view,
-                    !state.light,
-                    (96, 159, 255),
-                    ui_contrast(),
-                    scroll,
-                    hover,
-                    focus,
-                    state.fetching,
-                    false,
-                    false,
-                    "Off · demo mode makes no system changes",
-                ),
-                "render_failed",
-            );
-        }
-    });
+unsafe fn render_demo_flyout(fh: HWND, _state: &demo::State, width: u32, height: u32, dpi: f32) {
+    let view = demo::view().expect("active demo view");
+    render_flyout(fh, &view, width, height, dpi);
 }
 
 unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f32) {
-    let dark = util::is_dark_theme();
-    let accent = util::accent_rgb();
+    let demo = demo::active();
+    let dark = demo.map_or_else(util::is_dark_theme, |state| !state.light);
+    let accent = demo.map_or_else(util::accent_rgb, |_| (96, 159, 255));
     let contrast = ui_contrast();
-    let fetching = any_fetching();
-    let vibe_on = vibecode::is_on();
+    let fetching = demo.map_or_else(any_fetching, |state| state.fetching);
+    let vibe_on = demo.is_none() && vibecode::is_on();
+    let update_dot = demo.is_none() && updater::has_update();
+    let caption = if demo.is_some() {
+        "Off · demo mode makes no system changes"
+    } else {
+        vibecode::flyout_caption()
+    };
     update_error_tooltip(fh);
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
@@ -1636,20 +1646,8 @@ unsafe fn render_flyout(fh: HWND, view: &gfx::View, w_px: u32, h_px: u32, dpi: f
         if let Some(fx) = ui.fly.as_mut() {
             let _ = diagnostics::observe(
                 fx.render_flyout(
-                    w_px,
-                    h_px,
-                    dpi,
-                    view,
-                    dark,
-                    accent,
-                    contrast,
-                    scroll,
-                    hover,
-                    focus,
-                    fetching,
-                    updater::has_update(),
-                    vibe_on,
-                    vibecode::flyout_caption(),
+                    w_px, h_px, dpi, view, dark, accent, contrast, scroll, hover, focus, fetching,
+                    update_dot, vibe_on, caption,
                 ),
                 "render_failed",
             );
@@ -1670,19 +1668,14 @@ unsafe fn update_error_tooltip(flyout: HWND) {
         ui.error_tooltip_text = text;
         let newly_created = ui.error_tooltip.is_none();
         if newly_created && !detail.is_empty() {
-            ui.error_tooltip = CreateWindowExW(
+            ui.error_tooltip = create_window(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                 TOOLTIPS_CLASSW,
                 PCWSTR::null(),
                 WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
-                0,
-                0,
-                0,
-                0,
+                [0, 0, 0, 0],
                 flyout,
-                None,
-                None,
-                None,
+                HINSTANCE::default(),
             )
             .ok();
         }
@@ -1797,19 +1790,14 @@ unsafe fn open_settings() {
     let x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2;
     let y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - h) / 2;
 
-    let Ok(hwnd) = CreateWindowExW(
+    let Ok(hwnd) = create_window(
         WS_EX_NOREDIRECTIONBITMAP,
         w!("Claudometer.Settings"),
         w!("Claudometer"),
         style,
-        x,
-        y,
-        w,
-        h,
-        None,
-        None,
+        [x, y, w, h],
+        HWND::default(),
         hinst,
-        None,
     ) else {
         return;
     };
@@ -1864,165 +1852,21 @@ unsafe fn render_settings(hwnd: HWND) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
     let dpi = GetDpiForWindow(hwnd) as f32;
-    if demo::is_active() {
-        UI.with(|ui| {
-            let mut ui = ui.borrow_mut();
-            if ui.set.is_none() {
-                ui.set = diagnostics::observe(gfx::Surface::new(hwnd), "render_init_failed").ok();
-            }
-            let mut st = demo::settings_view(ui.set_hover, ui.set_focus);
-            st.diagnostics_copy = ui.diagnostics_copy;
-            let scroll = ui.set_scroll;
-            if let Some(surface) = ui.set.as_mut() {
-                let _ = diagnostics::observe(
-                    surface.render_settings(
-                        (rc.right - rc.left) as u32,
-                        (rc.bottom - rc.top) as u32,
-                        dpi,
-                        &st,
-                        !demo::active().is_some_and(|state| state.light),
-                        (96, 159, 255),
-                        ui_contrast(),
-                        scroll,
-                    ),
-                    "render_failed",
-                );
-            }
-        });
-        return;
-    }
-    let dark = util::is_dark_theme();
-    let accent = util::accent_rgb();
+    let demo = demo::active();
+    let dark = demo.map_or_else(util::is_dark_theme, |state| !state.light);
+    let accent = demo.map_or_else(util::accent_rgb, |_| (96, 159, 255));
     let contrast = ui_contrast();
     UI.with(|ui| {
         let mut ui = ui.borrow_mut();
         if ui.set.is_none() {
             ui.set = diagnostics::observe(gfx::Surface::new(hwnd), "render_init_failed").ok();
         }
-        let (mut about, about_btn) = match updater::status() {
-            updater::Status::UpToDate => (
-                concat!("Claudometer ", env!("CARGO_PKG_VERSION")).to_string(),
-                "GitHub",
-            ),
-            updater::Status::Available(r) if updater::can_self_update() => {
-                (format!("Update {} available", r.tag), "Install")
-            }
-            updater::Status::Available(r) => (
-                format!("Update {} — use signed installer/Winget", r.tag),
-                "Release",
-            ),
-            updater::Status::Installing => ("Installing update…".to_string(), "…"),
-            updater::Status::Failed(msg, _) => (format!("Update failed — {msg}"), "Release"),
-        };
-        if let Some(diagnostic) = config::diagnostic()
-            .or_else(runtime_state::diagnostic)
-            .or_else(vibecode::diagnostic)
-        {
-            about = diagnostic;
-        }
-        let (lid_label, lid_caption, lid_action) = match vibecode::persistent_status() {
-            vibecode::PersistentStatus::LegacyRecoveryPending => (
-                "Advanced · restore legacy lid values",
-                "Saved values ready to restore",
-                Some("Restore"),
-            ),
-            vibecode::PersistentStatus::RecoveryRequired => (
-                "Advanced · lid recovery required",
-                "Restore previous settings to continue",
-                Some("Recover"),
-            ),
-            vibecode::PersistentStatus::Error => (
-                "Advanced · lid override unavailable",
-                "No lid override is active",
-                Some(if vibecode::persistent_preference_enabled() {
-                    "Disable"
-                } else {
-                    "Retry"
-                }),
-            ),
-            vibecode::PersistentStatus::Applied => (
-                "Advanced · ignore lid close",
-                "Active · restores on exit",
-                None,
-            ),
-            vibecode::PersistentStatus::Disabled => (
-                "Advanced · ignore lid close",
-                "Restores on exit when enabled",
-                None,
-            ),
-        };
-        let account = auth::snapshot();
-        let (account_caption, account_action, account_connected) = if account.busy {
-            ("Finish sign-in in the console".to_string(), "Cancel", false)
-        } else {
-            match account.connection {
-                Some(auth::ClaudeConnection::Connected { plan }) => {
-                    let caption = if plan.is_empty() {
-                        "Connected account".to_string()
-                    } else {
-                        format!("Connected account · {plan}")
-                    };
-                    (caption, "Reconnect", true)
-                }
-                Some(auth::ClaudeConnection::Disconnected) => {
-                    ("Not connected".to_string(), "Connect", false)
-                }
-                Some(auth::ClaudeConnection::CliUnavailable) => {
-                    ("Claude Code is required".to_string(), "Install", false)
-                }
-                Some(auth::ClaudeConnection::Problem(msg)) => (msg, "Reconnect", false),
-                None => ("Checking connection…".to_string(), "…", false),
-            }
-        };
-        let (caps_caption, caps_control) = match util::caps_led_state() {
-            util::CapsLedState::Unavailable => (
-                "Unavailable · hook isn't installed".to_string(),
-                gfx::CapsControl::Unavailable,
-            ),
-            util::CapsLedState::InstalledDisabled => (
-                "Installed · disabled".to_string(),
-                gfx::CapsControl::Toggle(false),
-            ),
-            util::CapsLedState::InstalledEnabled => (
-                "Installed · enabled".to_string(),
-                gfx::CapsControl::Toggle(true),
-            ),
-            util::CapsLedState::Error(error) => (
-                format!("Error · {}", error.message()),
-                gfx::CapsControl::Retry,
-            ),
-        };
-        let settings = config::settings();
-        let st = gfx::SettingsView {
-            diagnostics: diagnostics::text(),
-            diagnostics_copy: ui.diagnostics_copy,
-            account_caption,
-            account_action,
-            account_connected,
-            caps_caption,
-            caps_control,
-            autostart: util::autostart_enabled(),
-            codex_on: settings.codex_enabled,
-            codex_server_on: settings.codex_app_server_enabled,
-            pace_on: settings.pace_colors_enabled,
-            alerts_on: settings.alerts_enabled,
-            update_checks_on: settings.update_checks_enabled,
-            lid_label: lid_label.to_string(),
-            lid_caption: lid_caption.to_string(),
-            lid_on: vibecode::persistent_status() == vibecode::PersistentStatus::Applied,
-            lid_action,
-            about,
-            about_btn,
-            update_ready: updater::has_update(),
-            poll_secs: POLL_SECS.load(Ordering::SeqCst),
-            refresh_label: manual_refresh_label(),
-            hover: ui.set_hover,
-            focus: ui.set_focus,
-        };
+        let mut st = settings_view(ui.set_hover, ui.set_focus, ui.diagnostics_copy);
+        st.diagnostics_copy = ui.diagnostics_copy;
         let scroll = ui.set_scroll;
-        if let Some(sx) = ui.set.as_mut() {
+        if let Some(surface) = ui.set.as_mut() {
             let _ = diagnostics::observe(
-                sx.render_settings(
+                surface.render_settings(
                     (rc.right - rc.left) as u32,
                     (rc.bottom - rc.top) as u32,
                     dpi,
@@ -2036,6 +1880,140 @@ unsafe fn render_settings(hwnd: HWND) {
             );
         }
     });
+}
+
+#[inline(never)]
+fn settings_view(hover: i32, focus: i32, copy: &'static str) -> gfx::SettingsView {
+    if demo::is_active() {
+        demo::settings_view(hover, focus)
+    } else {
+        live_settings_view(hover, focus, copy)
+    }
+}
+
+fn live_settings_view(hover: i32, focus: i32, copy: &'static str) -> gfx::SettingsView {
+    let (mut about, about_btn) = match updater::status() {
+        updater::Status::UpToDate => (
+            concat!("Claudometer ", env!("CARGO_PKG_VERSION")).to_string(),
+            "GitHub",
+        ),
+        updater::Status::Available(r) if updater::can_self_update() => {
+            (format!("Update {} available", r.tag), "Install")
+        }
+        updater::Status::Available(r) => (
+            format!("Update {} — use signed installer/Winget", r.tag),
+            "Release",
+        ),
+        updater::Status::Installing => ("Installing update…".to_string(), "…"),
+        updater::Status::Failed(msg, _) => (format!("Update failed — {msg}"), "Release"),
+    };
+    if let Some(diagnostic) = config::diagnostic()
+        .or_else(runtime_state::diagnostic)
+        .or_else(vibecode::diagnostic)
+    {
+        about = diagnostic;
+    }
+    let (lid_label, lid_caption, lid_action) = match vibecode::persistent_status() {
+        vibecode::PersistentStatus::LegacyRecoveryPending => (
+            "Advanced · restore legacy lid values",
+            "Saved values ready to restore",
+            Some("Restore"),
+        ),
+        vibecode::PersistentStatus::RecoveryRequired => (
+            "Advanced · lid recovery required",
+            "Restore previous settings to continue",
+            Some("Recover"),
+        ),
+        vibecode::PersistentStatus::Error => (
+            "Advanced · lid override unavailable",
+            "No lid override is active",
+            Some(if vibecode::persistent_preference_enabled() {
+                "Disable"
+            } else {
+                "Retry"
+            }),
+        ),
+        vibecode::PersistentStatus::Applied => (
+            "Advanced · ignore lid close",
+            "Active · restores on exit",
+            None,
+        ),
+        vibecode::PersistentStatus::Disabled => (
+            "Advanced · ignore lid close",
+            "Restores on exit when enabled",
+            None,
+        ),
+    };
+    let account = auth::snapshot();
+    let (account_caption, account_action, account_connected) = if account.busy {
+        ("Finish sign-in in the console".to_string(), "Cancel", false)
+    } else {
+        match account.connection {
+            Some(auth::ClaudeConnection::Connected { plan }) => {
+                let caption = if plan.is_empty() {
+                    "Connected account".to_string()
+                } else {
+                    format!("Connected account · {plan}")
+                };
+                (caption, "Reconnect", true)
+            }
+            Some(auth::ClaudeConnection::Disconnected) => {
+                ("Not connected".to_string(), "Connect", false)
+            }
+            Some(auth::ClaudeConnection::CliUnavailable) => {
+                ("Claude Code is required".to_string(), "Install", false)
+            }
+            Some(auth::ClaudeConnection::Problem(msg)) => (msg, "Reconnect", false),
+            None => ("Checking connection…".to_string(), "…", false),
+        }
+    };
+    let (caps_caption, caps_control) = match util::caps_led_state() {
+        util::CapsLedState::Unavailable => (
+            "Unavailable · hook isn't installed".to_string(),
+            gfx::CapsControl::Unavailable,
+        ),
+        util::CapsLedState::InstalledDisabled => (
+            "Installed · disabled".to_string(),
+            gfx::CapsControl::Toggle(false),
+        ),
+        util::CapsLedState::InstalledEnabled => (
+            "Installed · enabled".to_string(),
+            gfx::CapsControl::Toggle(true),
+        ),
+        util::CapsLedState::Error(error) => (
+            format!("Error · {}", error.message()),
+            gfx::CapsControl::Retry,
+        ),
+    };
+    let settings = config::settings();
+    gfx::SettingsView {
+        diagnostics: diagnostics::text(),
+        diagnostics_copy: copy,
+        account_caption,
+        account_action,
+        account_connected,
+        caps_caption,
+        caps_control,
+        autostart: util::autostart_enabled(),
+        codex_on: settings.codex_enabled,
+        codex_server_on: settings.codex_app_server_enabled,
+        pace_on: settings.pace_colors_enabled,
+        reset_format: settings.reset_format,
+        quota_display: settings.quota_display,
+        alerts_on: settings.alerts_enabled,
+        update_checks_on: settings.update_checks_enabled,
+        lid_label: lid_label.to_string(),
+        lid_caption: lid_caption.to_string(),
+        lid_on: vibecode::persistent_status() == vibecode::PersistentStatus::Applied,
+        lid_action,
+        about,
+        about_btn,
+        update_ready: updater::has_update(),
+        poll_secs: POLL_SECS.load(Ordering::SeqCst),
+        refresh_label: manual_refresh_label(),
+        hover,
+        focus,
+    }
 }
 
 fn spawn_claude_account(login: bool) {
