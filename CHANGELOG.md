@@ -5,6 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 ## [Unreleased]
 
 ### Added
+- Persistent Clock/Countdown reset formatting and Used/Left quota display,
+  reachable through Settings, keyboard, UIA, and row-value/reset clicks. Reset
+  and pace run-out times share the preference; countdown updates only while
+  the flyout is visible. Claude sessions without a reset show **Not started**
+  with an accessible first-message explanation.
 - Stateless quota pace in the flyout: projected bar severity, spare/run-out
   notes, even-pace ticks, and accessible verdicts. The persisted **Color bars by
   current pace** switch defaults on; turning it off restores used-percentage

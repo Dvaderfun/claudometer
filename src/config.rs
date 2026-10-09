@@ -17,6 +17,8 @@ const KEY_POLL: &str = "poll_interval_seconds";
 const KEY_CODEX: &str = "codex_enabled";
 const KEY_CODEX_SERVER: &str = "codex_app_server_enabled";
 const KEY_PACE: &str = "pace_colors_enabled";
+const KEY_RESET_FORMAT: &str = "reset_format";
+const KEY_QUOTA_DISPLAY: &str = "quota_display";
 const KEY_ALERTS: &str = "alerts_enabled";
 const KEY_UPDATE_CHECKS: &str = "update_checks_enabled";
 const KEY_WAKE_LOCK: &str = "wake_lock_enabled";
@@ -29,16 +31,51 @@ const LEGACY_WAKE_LOCK: &str = "vibecode";
 const LEGACY_LID_RECOVERY: &str = "vibecode_lid";
 const LEGACY_ALERT_RECEIPTS: &str = "alerted";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResetFormat {
+    #[default]
+    Clock,
+    Countdown,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QuotaDisplay {
+    #[default]
+    Used,
+    Left,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SettingsV1 {
     pub poll_interval_seconds: u32,
     pub codex_enabled: bool,
     pub codex_app_server_enabled: bool,
     pub pace_colors_enabled: bool,
+    pub reset_format: ResetFormat,
+    pub quota_display: QuotaDisplay,
     pub alerts_enabled: bool,
     pub update_checks_enabled: bool,
     pub wake_lock_enabled: bool,
     pub persistent_lid_override_enabled: bool,
+}
+
+impl ResetFormat {
+    pub fn label(self) -> &'static str {
+        if self == Self::Clock {
+            "Clock"
+        } else {
+            "Countdown"
+        }
+    }
+}
+impl QuotaDisplay {
+    pub fn label(self) -> &'static str {
+        if self == Self::Used {
+            "Used"
+        } else {
+            "Left"
+        }
+    }
 }
 
 impl Default for SettingsV1 {
@@ -48,6 +85,8 @@ impl Default for SettingsV1 {
             codex_enabled: true,
             codex_app_server_enabled: false,
             pace_colors_enabled: true,
+            reset_format: ResetFormat::Clock,
+            quota_display: QuotaDisplay::Used,
             alerts_enabled: true,
             update_checks_enabled: false,
             wake_lock_enabled: false,
@@ -57,6 +96,21 @@ impl Default for SettingsV1 {
 }
 
 impl SettingsV1 {
+    pub fn toggle_row_format(&mut self, reset: bool) {
+        if reset {
+            self.reset_format = if self.reset_format == ResetFormat::Clock {
+                ResetFormat::Countdown
+            } else {
+                ResetFormat::Clock
+            };
+        } else {
+            self.quota_display = if self.quota_display == QuotaDisplay::Used {
+                QuotaDisplay::Left
+            } else {
+                QuotaDisplay::Used
+            };
+        }
+    }
     fn validated(mut self) -> Self {
         self.poll_interval_seconds = self
             .poll_interval_seconds
@@ -257,6 +311,20 @@ pub fn set_alerts_enabled(enabled: bool) -> Result<(), ConfigError> {
 
 pub fn set_pace_colors_enabled(enabled: bool) -> Result<(), ConfigError> {
     update_bool_setting(|settings| &mut settings.pace_colors_enabled, enabled)
+}
+
+pub fn toggle_row_format(reset: bool) -> Result<(), ConfigError> {
+    let runtime = RUNTIME.get().ok_or(ConfigError::NotInitialized)?;
+    let mut runtime = runtime.lock().unwrap();
+    if crate::demo::is_active() {
+        runtime.state.settings.toggle_row_format(reset);
+        return Ok(());
+    }
+    runtime.update_settings(|settings| settings.toggle_row_format(reset))
+}
+
+pub fn initialize_demo() {
+    RUNTIME.get_or_init(|| Mutex::new(Runtime::load_with_migrations(Backend::Unavailable, false)));
 }
 
 pub fn set_update_checks_enabled(enabled: bool) -> Result<(), ConfigError> {
@@ -487,6 +555,16 @@ fn decode(raw: Map<String, Value>, existing_install: bool) -> Decoded {
             .unwrap_or(true),
         codex_app_server_enabled: bool_value(raw.get(KEY_CODEX_SERVER)).unwrap_or(false),
         pace_colors_enabled: bool_value(raw.get(KEY_PACE)).unwrap_or(true),
+        reset_format: if raw.get(KEY_RESET_FORMAT).and_then(Value::as_str) == Some("countdown") {
+            ResetFormat::Countdown
+        } else {
+            ResetFormat::Clock
+        },
+        quota_display: if raw.get(KEY_QUOTA_DISPLAY).and_then(Value::as_str) == Some("left") {
+            QuotaDisplay::Left
+        } else {
+            QuotaDisplay::Used
+        },
         alerts_enabled: bool_value(raw.get(KEY_ALERTS))
             .or_else(|| bool_value(raw.get(LEGACY_ALERTS)))
             .unwrap_or(true),
@@ -514,9 +592,30 @@ fn decode(raw: Map<String, Value>, existing_install: bool) -> Decoded {
 
 fn encode(raw: &Map<String, Value>, settings: &SettingsV1) -> Map<String, Value> {
     let mut encoded = raw.clone();
-    encoded.insert(KEY_SCHEMA.to_string(), Value::from(SCHEMA_VERSION));
-    encoded.insert(
-        KEY_POLL.to_string(),
+    encode_field(&mut encoded, KEY_SCHEMA, Value::from(SCHEMA_VERSION));
+    for (key, value) in [
+        (
+            KEY_RESET_FORMAT,
+            if settings.reset_format == ResetFormat::Clock {
+                "clock"
+            } else {
+                "countdown"
+            },
+        ),
+        (
+            KEY_QUOTA_DISPLAY,
+            if settings.quota_display == QuotaDisplay::Used {
+                "used"
+            } else {
+                "left"
+            },
+        ),
+    ] {
+        encode_field(&mut encoded, key, Value::from(value));
+    }
+    encode_field(
+        &mut encoded,
+        KEY_POLL,
         Value::from(settings.poll_interval_seconds),
     );
     for (key, enabled) in [
@@ -534,16 +633,21 @@ fn encode(raw: &Map<String, Value>, settings: &SettingsV1) -> Map<String, Value>
         (LEGACY_ALERTS, settings.alerts_enabled),
         (LEGACY_WAKE_LOCK, settings.wake_lock_enabled),
     ] {
-        encoded.insert(key.to_string(), Value::from(enabled));
+        encode_field(&mut encoded, key, Value::from(enabled));
     }
 
     // Compatibility window: v0.7.x and two following releases keep reading
     // these exact unversioned keys. Do not contract them implicitly.
-    encoded.insert(
-        LEGACY_POLL.to_string(),
+    encode_field(
+        &mut encoded,
+        LEGACY_POLL,
         Value::from(settings.poll_interval_seconds),
     );
     encoded
+}
+
+fn encode_field(encoded: &mut Map<String, Value>, key: &str, value: Value) {
+    encoded.insert(key.to_string(), value);
 }
 
 fn status_for_access(access: AccessMode, source: ConfigStatus) -> ConfigStatus {
@@ -581,6 +685,92 @@ fn legacy_alerts_from_raw(raw: &Map<String, Value>) -> HashMap<String, i64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_row_choice_write_preserves_disk_and_memory() {
+        for reset in [true, false] {
+            let directory = TestDirectory::new();
+            let path = directory.settings_path();
+            AtomicJsonStore::new(&path)
+                .save(&encode(&Map::new(), &SettingsV1::default()))
+                .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let faults = OneFault(Mutex::new(Some((
+                FailurePoint::WriteTemporary,
+                io::ErrorKind::StorageFull,
+            ))));
+            let mut runtime = Runtime::load_with_migrations(
+                Backend::Store(AtomicJsonStore::with_fault_injector(&path, faults)),
+                true,
+            );
+            let settings = runtime.state.settings.clone();
+            assert!(runtime
+                .update_settings(|settings| settings.toggle_row_format(reset))
+                .is_err());
+            assert_eq!(runtime.state.settings, settings);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+    #[test]
+    fn row_choices_default_validate_persist_and_survive_older_writes() {
+        let defaults = decode(Map::new(), false).settings;
+        assert_eq!(defaults.reset_format, ResetFormat::Clock);
+        assert_eq!(defaults.quota_display, QuotaDisplay::Used);
+        for invalid in [Value::Null, Value::Bool(true), Value::from("unknown")] {
+            let mut raw = Map::new();
+            raw.insert(KEY_RESET_FORMAT.into(), invalid.clone());
+            raw.insert(KEY_QUOTA_DISPLAY.into(), invalid);
+            let settings = decode(raw, true).settings;
+            assert_eq!(settings.reset_format, ResetFormat::Clock);
+            assert_eq!(settings.quota_display, QuotaDisplay::Used);
+        }
+        let directory = TestDirectory::new();
+        let path = directory.settings_path();
+        let mut runtime = load_runtime(&path);
+        runtime
+            .update_settings(|settings| settings.toggle_row_format(true))
+            .unwrap();
+        runtime
+            .update_settings(|settings| settings.toggle_row_format(false))
+            .unwrap();
+        let mut restarted = load_runtime(&path);
+        assert_eq!(
+            restarted.state.settings.reset_format,
+            ResetFormat::Countdown
+        );
+        assert_eq!(restarted.state.settings.quota_display, QuotaDisplay::Left);
+        restarted
+            .update_settings(|settings| settings.alerts_enabled = false)
+            .unwrap();
+        let mut old: Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old.insert(LEGACY_POLL.into(), Value::from(120));
+        old.insert("unknown".into(), Value::from("preserved"));
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let mut restarted = load_runtime(&path);
+        assert_eq!(
+            restarted.state.settings.reset_format,
+            ResetFormat::Countdown
+        );
+        assert_eq!(restarted.state.settings.quota_display, QuotaDisplay::Left);
+        restarted
+            .update_settings(|settings| {
+                settings.toggle_row_format(true);
+                settings.toggle_row_format(false);
+            })
+            .unwrap();
+        assert_eq!(
+            load_runtime(&path).state.settings.reset_format,
+            ResetFormat::Clock
+        );
+        assert_eq!(
+            load_runtime(&path).state.settings.quota_display,
+            QuotaDisplay::Used
+        );
+        assert_eq!(
+            load_runtime(&path).state.raw.get("unknown"),
+            Some(&Value::from("preserved"))
+        );
+    }
     #[test]
     fn pace_defaults_on_and_disabled_preference_survives_restart_and_downgrade() {
         use super::*;
@@ -700,6 +890,8 @@ mod tests {
                 codex_enabled: false,
                 codex_app_server_enabled: false,
                 pace_colors_enabled: true,
+                reset_format: ResetFormat::Clock,
+                quota_display: QuotaDisplay::Used,
                 alerts_enabled: false,
                 update_checks_enabled: true,
                 wake_lock_enabled: true,

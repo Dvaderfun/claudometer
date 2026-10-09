@@ -40,6 +40,8 @@ alongside this ledger. The hard 1.25 MiB ceiling never advances.
 | CODEX-01 isolated source, synthetic trust root provisioned | 1,163,776 | +1.61% vs local R0 provisioned | 1,017,856 | -1.09% vs local R0 provisioned |
 | PACE-01 stateless flyout pace, unprovisioned | 1,071,616 | +0.048% vs CODEX-01 unprovisioned | 978,432 | no matching CODEX-01 unprovisioned row |
 | PACE-01 stateless flyout pace, synthetic trust root provisioned | 1,163,776 | 0.00% vs CODEX-01 provisioned | 1,017,856 | 0.00% vs CODEX-01 provisioned |
+| ROW-01 reset/value choices, unprovisioned | 1,071,104 | -0.048% vs PACE-01 | 978,432 | 0.00% vs PACE-01 |
+| ROW-01 reset/value choices, synthetic trust root provisioned | 1,163,776 | 0.00% vs PACE-01 | 1,018,368 | +0.050% vs PACE-01 |
 
 PR 8 crossed the stale v0.7.3-relative 10% CI threshold cumulatively, but not
 the roadmap's per-slice investigation threshold. Its x64 delta is 51,712 bytes;
@@ -388,3 +390,18 @@ Final ten-minute controlled hidden/visible run: p95 private working set
 readiness median/p95 59.688/97.351 ms. All 181 tests, required gates,
 demo safety, 22 existing UIA checks, and 19 pace/theme checks pass.
 Evidence/rollback: verification/pace-01.md and performance/pace-01.md.
+
+## ROW-01 (2026-10-10)
+
+Final x64 1,071,104 unprovisioned / 1,163,776 synthetic-root provisioned;
+ARM64 978,432 / 1,018,368. Original cumulative gates and the hard ceiling
+remain unchanged. The initial resumed 1,168,384-byte x64 candidate failed;
+shared rendering/resource creation and Settings/UIA view ownership recover
+headroom. No dependency, Windows feature, profile or baseline changed.
+
+187 tests, required gates, demo safety, 52 row/theme/keyboard/scroll checks,
+22 existing UIA checks and 19 pace checks pass. Runtime timer captures show
+countdown progression; source checks pin visible-only 30-second ticks.
+Evidence/runtime/rollback: verification/row-01.md and performance/row-01.md.
+Final ten-minute p95 private working set 1.61/4.95 MiB, idle CPU
+0.0000/0.0013%, GDI 10/13, zero TCP. Five-start median/p95 37.531/67.446 ms.
