@@ -337,3 +337,9 @@ publication on a missing SBOM output directory. The immutable tag remains.
 v0.9.1 creates the directory and uses sequence 2 with the same key. The Syft
 1.51.1 scan was reproduced locally and identifies exactly one claudometer
 package at canonical version 0.9.1. Artifact size gates remain unchanged.
+
+Final GitHub artifacts (v0.9.1, source 680f494): x64 **1,142,784 bytes**,
+ARM64 **1,026,560 bytes**; both original artifact/regression gates pass.
+The 2,560-byte difference from each local build is recorded rather than
+substituting local hashes. Published exact hashes and provenance are in
+[release evidence](../verification/r0-0.9.0.md). Downloaded x64 demo safety passes.

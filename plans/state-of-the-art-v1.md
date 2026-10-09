@@ -149,9 +149,9 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | Milestone | Theme | State |
 |---|---|---|
 | Foundation | Baseline and required gates | **Done**; SIZE-01 profile audit complete on `chore/size-audit` |
-| `v0.8` | Trustworthy state and system safety | **Done on `main`; included in prepared 0.9.1 release** |
-| `v0.9` | Authenticated, crash-safe updates | **Done on `main`; included in prepared 0.9.1 release** |
-| R0 | Ship the trust-root release | **0.9.1 preparation authorized**; GitHub manifest policy provisioned, Windows signing deferred to v1.0 (ADR 0006) |
+| `v0.8` | Trustworthy state and system safety | **Shipped in 0.9.1** |
+| `v0.9` | Authenticated, crash-safe updates | **Shipped in 0.9.1** |
+| R0 | Ship the trust-root release | **Shipped 0.9.1 on 2026-10-09**; signed manifests/provenance verified, Windows signing deferred to v1.0 (ADR 0006) |
 | `v0.10` | State core, diagnostics, Codex documented source | **In progress** (model/state/cache/errors/diagnostics committed on `main`; CODEX-01 blocked on the app-server credential contract) |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
 | `v0.12` | Glanceable status, tray, and alerts | Not started |
@@ -159,7 +159,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | `v1.1` | History-refined pacing | **Gated** on field evidence |
 | `v1.2` | One gated provider | Not started |
 
-`Cargo.toml` says `0.9.1`. Everything since `5b735ce` ships in the first R0 release, including the completed state/cache/error/diagnostic slices.
+`Cargo.toml` says `0.9.1`. R0 is published with all work since `5b735ce`, including the completed state/cache/error/diagnostic slices. v0.9.0 remains an immutable failed/unreleased tag.
 
 ### 2.2 Facts an executor needs now
 
@@ -456,7 +456,7 @@ Abort a rollout immediately if: cross-account data is rendered, cached, alerted,
 
 Owner decision 2026-10-09 (ADR 0006) supersedes the historical human-only/Authenticode prerequisites below for 0.9.1: agent setup and publication are authorized, Windows signing stays SIGN-01/v1.0, and bootstrap uses hashes plus GitHub source/workflow provenance. Narrator and real ARM64 runtime remain disclosed as unverified. All existing source, artifact, signature, manifest, and repository-protection gates remain required.
 
-Everything in `v0.8` and `v0.9` is on `main` and included in the prepared 0.9.1 release. The first authenticated release is also the trust-root bootstrap (UPD-02): existing users must install it manually and verify it independently; the old updater cannot authenticate it.
+Everything in `v0.8` and `v0.9` shipped in the immutable 0.9.1 release, published 2026-10-09T00:09:00Z. Both published architectures, signatures, hashes, SBOM and GitHub attestations verify; downloaded x64 demo safety passes. See `docs/verification/r0-0.9.0.md`. The first authenticated release is also the trust-root bootstrap (UPD-02): existing users must install it manually and verify it independently; the old updater cannot authenticate it.
 
 - [x] **REL-03 — Prepare the trust-root release (agent prepares; human publishes).**
   - Prepare notes after WIP-00 local verification. The owner deferred Narrator on 2026-10-08 and authorized proceeding; notes must disclose incomplete A11Y-01 and do not authorize publishing or claim screen-reader support.

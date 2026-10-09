@@ -155,7 +155,7 @@ and exact sizes; the public key below authenticates subsequent updates.
 
 | Field | Recorded value |
 |---|---|
-| Status | Production public policy provisioned; release prepared for GitHub |
+| Status | Published immutable v0.9.1 at 2026-10-09T00:09:00Z |
 | Provisioned at (UTC) | 2026-10-08T23:33:54Z |
 | Bootstrap version and tag | 0.9.1 / v0.9.1 |
 | Ed25519 public key (lowercase hex) | 5741ac7eec5c56c96c5dcf12e7be47a2586b2739ec1f309f26b52527578660f9 |
