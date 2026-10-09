@@ -280,6 +280,20 @@ fn settings_items(hwnd: HWND) -> Vec<Item> {
     );
     diagnostics.help = crate::diagnostics::text();
     result.push(diagnostics);
+    let mut source = item(
+        "CodexAppServer",
+        "Codex app-server",
+        rects[gfx::CARD_CODEX_SERVER],
+        Role::Toggle(
+            synthetic
+                .as_ref()
+                .map_or(settings.codex_app_server_enabled, |view| {
+                    view.codex_server_on
+                }),
+        ),
+    );
+    source.help = "Prefer the documented source when the installed CLI is audited. Turn off to use Compatibility.".into();
+    result.push(source);
     result
 }
 

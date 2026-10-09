@@ -396,6 +396,7 @@ mod state_characterization_tests {
 
     fn snapshot(fetched_unix: i64) -> UsageSnapshot {
         UsageSnapshot {
+            reset_credits_available: None,
             provider: ProviderId::Claude,
             account: AccountKey::from_digest([1; 32]),
             source: SourceProvenance::compatibility(ProviderId::Claude),

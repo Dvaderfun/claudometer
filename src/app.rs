@@ -32,9 +32,37 @@ struct ProviderSlot {
     detected: Option<bool>,
     last_attempt_unix: Option<i64>,
     last_success_unix: Option<i64>,
+    source: SourceProvenance,
+    fallback_reason: &'static str,
 }
 
 impl ProviderSlot {
+    fn prepared_selection(
+        &mut self,
+        mut preparation: Preparation,
+        account: AccountContext,
+        selection: (SourceProvenance, &'static str),
+        clock: &impl Clock,
+        interval: Duration,
+    ) -> Option<FetchCompletion<()>> {
+        if !self.matches_preparation(preparation) {
+            return None;
+        }
+        if self.source != selection.0 {
+            self.state.reduce(
+                ProviderEvent::Unavailable(UnavailableReason::MissingCredentials),
+                clock,
+            );
+            preparation.generation = self.state.generation();
+            self.pending = Some(preparation);
+            self.last_error = None;
+            self.error = None;
+            self.last_success_unix = None;
+        }
+        self.source = selection.0;
+        self.fallback_reason = selection.1;
+        self.prepared(preparation, account, clock, interval)
+    }
     const fn new(provider: ProviderId) -> Self {
         Self {
             state: ProviderState::new(provider),
@@ -46,6 +74,18 @@ impl ProviderSlot {
             detected: None,
             last_attempt_unix: None,
             last_success_unix: None,
+            source: if matches!(provider, ProviderId::Codex) {
+                SourceProvenance {
+                    id: crate::provider::model::SourceId::CodexWhamCompatibility,
+                    support: crate::provider::model::SourceSupport::Compatibility,
+                }
+            } else {
+                SourceProvenance {
+                    id: crate::provider::model::SourceId::ClaudeOAuthCompatibility,
+                    support: crate::provider::model::SourceSupport::Compatibility,
+                }
+            },
+            fallback_reason: "none",
         }
     }
 
@@ -115,18 +155,14 @@ impl ProviderSlot {
         clock: &impl Clock,
         interval: Duration,
     ) -> Option<FetchCompletion<()>> {
+        let source = self.source;
         self.prepared_with_cache(
             preparation,
             account,
             clock,
             interval,
             |provider, account, now| {
-                crate::runtime_state::cached_provider(
-                    provider,
-                    account,
-                    SourceProvenance::compatibility(provider),
-                    now,
-                )
+                crate::runtime_state::cached_provider(provider, account, source, now)
             },
         )
     }
@@ -297,14 +333,11 @@ pub fn provider_diagnostics(interval: Duration) -> [crate::diagnostics::Provider
                 enabled: provider != ProviderId::Codex || crate::config::settings().codex_enabled,
                 detected: slot.detected,
                 authenticated: slot.state.account().is_some(),
-                source: slot.state.snapshot().map_or_else(
-                    || SourceProvenance::compatibility(provider),
-                    |snapshot| snapshot.source,
-                ),
+                source: slot.source,
                 fallback_reason: if provider == ProviderId::Claude {
                     "compatibility source only"
                 } else {
-                    "documented source not enabled"
+                    slot.fallback_reason
                 },
                 phase: if slot.pending.is_some() {
                     "preparing"
@@ -346,18 +379,32 @@ pub fn load_local_diagnostics() {
         }
         // Support mode prepares local credentials only; execute is never called.
         let identity = match provider {
-            ProviderId::Claude => crate::api::prepare().map(|request| request.account().clone()),
-            ProviderId::Codex => crate::codex::prepare().map(|request| request.account().clone()),
+            ProviderId::Claude => crate::api::prepare().map(|request| {
+                (
+                    request.account().clone(),
+                    SourceProvenance::compatibility(provider),
+                    "compatibility source only",
+                )
+            }),
+            ProviderId::Codex => crate::codex::prepare_poll().map(|request| {
+                (
+                    request.account().clone(),
+                    request.source(),
+                    request.fallback_reason,
+                )
+            }),
         };
         APP.with_borrow_mut(|app| {
             let slot = &mut app.providers[provider.index()];
             match identity {
-                Ok(account) => {
+                Ok((account, source, fallback_reason)) => {
+                    slot.source = source;
+                    slot.fallback_reason = fallback_reason;
                     slot.detected = Some(true);
                     let cache = crate::runtime_state::cached_provider(
                         provider,
                         &account,
-                        SourceProvenance::compatibility(provider),
+                        source,
                         SystemClock.read().unix_seconds,
                     );
                     slot.state
@@ -519,13 +566,20 @@ pub fn drain_events(interval: Duration) -> bool {
             crate::poller::AppEvent::Prepared {
                 preparation,
                 account,
+                source,
+                fallback_reason,
                 reply,
             } => {
                 let (ticket, account_changed) = APP.with_borrow_mut(|app| {
                     let slot = &mut app.providers[preparation.provider.index()];
                     let generation = slot.state.generation();
-                    let ticket =
-                        slot.prepared(preparation, account.clone(), &SystemClock, interval);
+                    let ticket = slot.prepared_selection(
+                        preparation,
+                        account.clone(),
+                        (source, fallback_reason),
+                        &SystemClock,
+                        interval,
+                    );
                     let account_changed = generation != slot.state.generation();
                     (ticket, account_changed)
                 });
@@ -591,10 +645,7 @@ pub fn drain_events(interval: Duration) -> bool {
                     };
                     if !matches!(transition, Transition::Ignored) {
                         if let Some(account) = slot.state.account() {
-                            let source = slot.state.snapshot().map_or_else(
-                                || SourceProvenance::compatibility(provider),
-                                |snapshot| snapshot.source,
-                            );
+                            let source = slot.source;
                             let retry_at_unix =
                                 slot.state.view(&SystemClock, interval).retry_at_unix;
                             let _ = crate::runtime_state::persist_provider_cache(
@@ -639,6 +690,47 @@ mod tests {
     use crate::provider::model::{AccountKey, IdentityPersistence, SourceProvenance};
     use std::time::Instant;
 
+    #[test]
+    fn source_selection_is_account_bound_and_obsolete_preparation_cannot_change_it() {
+        let clock = FakeClock::new();
+        let mut slot = ProviderSlot::new(ProviderId::Codex);
+        let preparation = slot
+            .reserve(
+                ProviderId::Codex,
+                RefreshTrigger::Manual,
+                &clock,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        let source = SourceProvenance::codex_app_server();
+        let ticket = slot
+            .prepared_selection(
+                preparation,
+                account(2),
+                (source, "none"),
+                &clock,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(slot.source, source);
+        assert!(ticket.account == account(2).key);
+        assert!(slot
+            .prepared_selection(
+                preparation,
+                account(1),
+                (
+                    SourceProvenance::compatibility(ProviderId::Codex),
+                    "app-server CLI not found"
+                ),
+                &clock,
+                Duration::from_secs(60)
+            )
+            .is_none());
+        assert_eq!(slot.source, source);
+        assert_eq!(slot.fallback_reason, "none");
+        assert!(slot.state.snapshot().is_none());
+    }
+
     struct FakeClock(ClockReading);
     impl Clock for FakeClock {
         fn read(&self) -> ClockReading {
@@ -673,6 +765,7 @@ mod tests {
             rows: vec![],
             plan: Some("Synthetic".to_string()),
             fetched_unix: time,
+            reset_credits_available: None,
         }
     }
 

@@ -629,6 +629,7 @@ fn parse_usage(
         rows,
         plan: (!plan.is_empty()).then(|| bounded_text(plan)),
         fetched_unix: observed_at_unix,
+        reset_credits_available: None,
     })
 }
 

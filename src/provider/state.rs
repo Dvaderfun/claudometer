@@ -762,6 +762,7 @@ mod tests {
 
     fn snapshot(byte: u8, fetched_unix: i64) -> UsageSnapshot {
         UsageSnapshot {
+            reset_credits_available: None,
             provider: ProviderId::Claude,
             account: account(byte).key,
             source: SourceProvenance::compatibility(ProviderId::Claude),

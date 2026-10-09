@@ -15,6 +15,7 @@ const MAX_POLL_INTERVAL_SECONDS: u32 = 300;
 const KEY_SCHEMA: &str = "schema_version";
 const KEY_POLL: &str = "poll_interval_seconds";
 const KEY_CODEX: &str = "codex_enabled";
+const KEY_CODEX_SERVER: &str = "codex_app_server_enabled";
 const KEY_ALERTS: &str = "alerts_enabled";
 const KEY_UPDATE_CHECKS: &str = "update_checks_enabled";
 const KEY_WAKE_LOCK: &str = "wake_lock_enabled";
@@ -31,6 +32,7 @@ const LEGACY_ALERT_RECEIPTS: &str = "alerted";
 pub struct SettingsV1 {
     pub poll_interval_seconds: u32,
     pub codex_enabled: bool,
+    pub codex_app_server_enabled: bool,
     pub alerts_enabled: bool,
     pub update_checks_enabled: bool,
     pub wake_lock_enabled: bool,
@@ -42,6 +44,7 @@ impl Default for SettingsV1 {
         Self {
             poll_interval_seconds: DEFAULT_POLL_INTERVAL_SECONDS,
             codex_enabled: true,
+            codex_app_server_enabled: false,
             alerts_enabled: true,
             update_checks_enabled: false,
             wake_lock_enabled: false,
@@ -235,6 +238,10 @@ pub fn set_poll_interval_seconds(seconds: u32) -> Result<(), ConfigError> {
 
 pub fn set_codex_enabled(enabled: bool) -> Result<(), ConfigError> {
     update_settings(|settings| settings.codex_enabled = enabled)
+}
+
+pub fn set_codex_app_server_enabled(enabled: bool) -> Result<(), ConfigError> {
+    update_settings(|settings| settings.codex_app_server_enabled = enabled)
 }
 
 pub fn set_alerts_enabled(enabled: bool) -> Result<(), ConfigError> {
@@ -452,6 +459,7 @@ fn decode(raw: Map<String, Value>, existing_install: bool) -> Decoded {
         codex_enabled: bool_value(raw.get(KEY_CODEX))
             .or_else(|| bool_value(raw.get(LEGACY_CODEX)))
             .unwrap_or(true),
+        codex_app_server_enabled: bool_value(raw.get(KEY_CODEX_SERVER)).unwrap_or(false),
         alerts_enabled: bool_value(raw.get(KEY_ALERTS))
             .or_else(|| bool_value(raw.get(LEGACY_ALERTS)))
             .unwrap_or(true),
@@ -485,6 +493,10 @@ fn encode(raw: &Map<String, Value>, settings: &SettingsV1) -> Map<String, Value>
         Value::from(settings.poll_interval_seconds),
     );
     encoded.insert(KEY_CODEX.to_string(), Value::from(settings.codex_enabled));
+    encoded.insert(
+        KEY_CODEX_SERVER.to_string(),
+        Value::from(settings.codex_app_server_enabled),
+    );
     encoded.insert(KEY_ALERTS.to_string(), Value::from(settings.alerts_enabled));
     encoded.insert(
         KEY_UPDATE_CHECKS.to_string(),
@@ -562,6 +574,18 @@ mod tests {
     use crate::store::{FailurePoint, StoreErrorKind};
 
     use super::*;
+    #[test]
+    fn app_server_preference_is_additive_and_preserved_for_downgrade() {
+        let legacy = decode(Map::new(), false);
+        assert!(!legacy.settings.codex_app_server_enabled);
+        let mut settings = legacy.settings;
+        settings.codex_app_server_enabled = true;
+        let raw = encode(&Map::new(), &settings);
+        assert!(decode(raw.clone(), true).settings.codex_app_server_enabled);
+        let mut old = raw;
+        old.insert("poll_secs".into(), Value::from(120));
+        assert!(decode(old, true).settings.codex_app_server_enabled);
+    }
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -636,6 +660,7 @@ mod tests {
             SettingsV1 {
                 poll_interval_seconds: 120,
                 codex_enabled: false,
+                codex_app_server_enabled: false,
                 alerts_enabled: false,
                 update_checks_enabled: true,
                 wake_lock_enabled: true,

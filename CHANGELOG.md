@@ -4,13 +4,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 
 ## [Unreleased]
 
+### Added
+- Optional documented Codex app-server source with isolated ephemeral external
+  auth, audited native x64 executables, bounded private stdio, account/source
+  matching, and process-tree/scratch cleanup. It never receives a refresh token
+  or writes provider credentials. Settings/UIA exposes the source switch;
+  unsupported CLI versions and ARM64 retain Compatibility.
+- Dynamic Codex model quotas, spend-limit rows, updated plan labels, and
+  display-only reset-credit availability through the documented source.
+- Explicit maintainer `--measure-codex-source` timing command. Final live p95
+  is 2.198 seconds, so app-server stays opt-in under the two-second gate.
+
+### Changed
+- Compile the fixed Retry-After date format at build time to recover size
+  headroom without changing date/error handling or footprint gates.
+
 ### Known gaps
-- CODEX-01/02 remain blocked after an isolated external-token audit of Codex
-  0.159.1 and 0.160.0. Synthetic local-backend probes confirm no access-token
-  file, but external login performs account discovery; business login also
-  downloads cloud configuration and persists raw account identifiers. A manual
-  probe reproduces the findings without real credentials or provider traffic.
-  See [CODEX-01 preflight](docs/verification/codex-01-preflight.md).
+- Generic app-server RPC errors discard raw provider messages and expose
+  `response_invalid`; upstream does not retain typed HTTP status/retry metadata
+  in this RPC. Expired JWTs and external refresh requests still produce the
+  actionable sign-in-expired state. No same-cycle compatibility retry.
 
 ## [0.9.1] — 2026-10-09
 

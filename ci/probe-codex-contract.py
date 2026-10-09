@@ -18,7 +18,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-def probe(executable, plan, unauthorized):
+def probe(executable, plan, unauthorized, unknown_hint=False):
     paths = []
     lock = threading.Lock()
 
@@ -166,7 +166,7 @@ def probe(executable, plan, unauthorized):
                 token = "e30." + payload + ".c3ludGhldGlj"
                 login = rpc(2, "account/login/start", {
                     "type": "chatgptAuthTokens", "accessToken": token,
-                    "chatgptAccountId": "synthetic-account", "chatgptPlanType": plan,
+                    "chatgptAccountId": "synthetic-account", "chatgptPlanType": "unknown" if unknown_hint else plan,
                 })
                 if login.get("result", {}).get("type") != "chatgptAuthTokens":
                     raise RuntimeError("external token mode rejected")
@@ -191,6 +191,7 @@ def probe(executable, plan, unauthorized):
             files = [file for file in home.rglob("*") if file.is_file()]
             return {
                 "plan_fixture": plan,
+                "unknown_plan_hint": unknown_hint,
                 "usage_status_fixture": 401 if unauthorized else 200,
                 "login_completed_success": login_completed,
                 "limits_success": "result" in limits,
@@ -216,6 +217,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", required=True, type=Path)
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--unknown-plan-hint", action="store_true", help="Suppress cloud policy as in the production adapter")
     args = parser.parse_args()
     executable = args.exe.resolve(strict=True)
     if os.name != "nt" or executable.suffix.lower() != ".exe":
@@ -228,7 +230,7 @@ def main():
     system_config = Path(program_data.value) / "OpenAI/Codex"
     if any((system_config / name).exists() for name in ("config.toml", "requirements.toml")):
         parser.error("machine Codex configuration exists; refusing possible network overrides")
-    report = [probe(executable, plan, unauthorized)
+    report = [probe(executable, plan, unauthorized, args.unknown_plan_hint)
               for plan, unauthorized in (("pro", False), ("business", False), ("pro", True))]
     text = json.dumps(report, indent=2)
     if args.report:

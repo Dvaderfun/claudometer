@@ -1,0 +1,17 @@
+{
+  "accountId": "synthetic-account",
+  "rateLimitsByLimitId": {
+    "model-bucket": {
+      "limitId": "model-bucket", "limitName": "Synthetic model", "planType": "pro",
+      "primary": { "usedPercent": 18, "windowDurationMins": 300, "resetsAt": 1900000000 }
+    },
+    "codex": {
+      "limitId": "codex", "planType": "pro",
+      "primary": { "usedPercent": 42, "windowDurationMins": 10080, "resetsAt": 1900000000 },
+      "secondary": { "usedPercent": 25, "windowDurationMins": 300, "resetsAt": null },
+      "individualLimit": { "remainingPercent": 80, "resetsAt": 1900000000 },
+      "spendControlReached": true
+    }
+  },
+  "rateLimitResetCredits": { "availableCount": 2 }
+}

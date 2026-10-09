@@ -6,12 +6,16 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::app::Preparation;
-use crate::provider::model::{AccountContext, FetchCompletion, FetchOutcome, ProviderId};
+use crate::provider::model::{
+    AccountContext, FetchCompletion, FetchOutcome, ProviderId, SourceProvenance,
+};
 
 pub enum AppEvent {
     Prepared {
         preparation: Preparation,
         account: AccountContext,
+        source: SourceProvenance,
+        fallback_reason: &'static str,
         reply: mpsc::Sender<Option<FetchCompletion<()>>>,
     },
     PreparationFailed {
@@ -54,6 +58,15 @@ enum PreparedFetch {
 }
 
 impl PreparedFetch {
+    fn selection(&self) -> (SourceProvenance, &'static str) {
+        match self {
+            Self::Claude(_) => (
+                SourceProvenance::compatibility(ProviderId::Claude),
+                "compatibility source only",
+            ),
+            Self::Codex(request) => (request.source(), request.fallback_reason),
+        }
+    }
     fn account(&self) -> &AccountContext {
         match self {
             Self::Claude(request) => request.account(),
@@ -72,7 +85,7 @@ impl PreparedFetch {
 fn prepare(provider: ProviderId) -> Result<PreparedFetch, crate::api::PreparationFailure> {
     match provider {
         ProviderId::Claude => crate::api::prepare().map(PreparedFetch::Claude),
-        ProviderId::Codex => crate::codex::prepare().map(PreparedFetch::Codex),
+        ProviderId::Codex => crate::codex::prepare_poll().map(PreparedFetch::Codex),
     }
 }
 
@@ -88,9 +101,11 @@ pub fn spawn(preparation: Preparation) {
                 return;
             }
         };
+        let selection = prepared.selection();
         run_prepared(
             preparation,
             prepared.account().clone(),
+            selection,
             || prepared.execute(),
             post,
         );
@@ -109,6 +124,7 @@ pub fn spawn(preparation: Preparation) {
 fn run_prepared(
     preparation: Preparation,
     account: AccountContext,
+    selection: (SourceProvenance, &'static str),
     execute: impl FnOnce() -> FetchOutcome,
     mut publish: impl FnMut(AppEvent) -> bool,
 ) {
@@ -116,6 +132,8 @@ fn run_prepared(
     if !publish(AppEvent::Prepared {
         preparation,
         account,
+        source: selection.0,
+        fallback_reason: selection.1,
         reply,
     }) {
         return;
@@ -156,6 +174,7 @@ mod tests {
             run_prepared(
                 preparation,
                 account.clone(),
+                (SourceProvenance::compatibility(ProviderId::Claude), "none"),
                 || {
                     executed = true;
                     FetchOutcome::Err {
@@ -170,6 +189,7 @@ mod tests {
                             preparation: event,
                             account: identity,
                             reply,
+                            ..
                         } => {
                             assert_eq!(event.operation, preparation.operation);
                             assert!(identity.key == account.key);
@@ -213,6 +233,7 @@ mod tests {
                     key: AccountKey::from_digest([1; 32]),
                     persistence: IdentityPersistence::Persistent,
                 },
+                (SourceProvenance::compatibility(ProviderId::Claude), "none"),
                 || panic!("must not execute without UI ticket"),
                 |_| posted,
             );

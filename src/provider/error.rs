@@ -22,6 +22,7 @@ pub struct FetchError {
 }
 
 impl FetchError {
+    #[inline(never)]
     pub fn new(kind: FailureKind) -> Self {
         let message = match kind {
             FailureKind::MissingCredentials => "Not signed in",
@@ -113,11 +114,10 @@ pub(crate) fn request_error(error: ureq::Error, now_unix: i64) -> FetchError {
 fn retry_after(value: &str, now_unix: i64) -> Option<u64> {
     let value = value.trim();
     value.parse().ok().or_else(|| {
-        let format = time::format_description::parse_borrowed::<2>(
-            "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT",
-        )
-        .ok()?;
-        let timestamp = time::PrimitiveDateTime::parse(value, &format)
+        let format = time::macros::format_description!(
+            "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+        );
+        let timestamp = time::PrimitiveDateTime::parse(value, format)
             .ok()?
             .assume_utc()
             .unix_timestamp();

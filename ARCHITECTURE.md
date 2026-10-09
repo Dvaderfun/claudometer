@@ -225,3 +225,23 @@ move to their own files in later slices.
 - UI Automation fragment trees expose named buttons, switches, and quota text. Narrator speech is unverified; Selection/RangeValue and targeted property events remain incomplete. See `docs/verification/wip-00.md`.
 - Unofficial endpoint can change shape any day; failure mode is a visible parse error, not a crash.
 - Unsigned exe (SmartScreen warning on first run).
+
+## CODEX-01 isolated documented source
+
+`codex_server.rs` owns native executable hash eligibility, cleared scratch
+profile/environment, private stdio JSON-RPC, process Job Object containment,
+bounded pipe reads on the existing worker, and checked tree/scratch cleanup.
+No resident helper or extra reader thread. `chatgptAuthTokens` receives only
+the existing access token/account and local plan hint `unknown`; no refresh
+token or managed auth file is supplied. The hint suppresses enterprise cloud
+policy; quota plan names come from the response. Any server request ends the
+cycle. Only audited exact x64 images run; missing/unsupported/system-config
+cases choose Compatibility before polling. Failures never poll a second source.
+
+`poller.rs` publishes selected source/fallback with the account-bound UI ticket.
+`app.rs` validates preparation before changing source and drops data from a
+previous source before matching cache restore. Settings has a keyboard/UIA
+app-server switch. Dynamic buckets normalize model rows, spend rows, and a
+display-only reset-credit count. Optional fields remain additive in schema 1.
+`--measure-codex-source` is an explicit one-shot maintainer live measurement
+that exits before normal app startup and reports only operational timing.

@@ -115,6 +115,7 @@ Claudometer competes on trust, native Windows quality, footprint, and **one-glan
 - Claude Code and Codex alone own login, refresh-token rotation, and durable credentials.
 - Claudometer never stores refresh tokens, access tokens, browser cookies, or user-entered API keys.
 - Secret material stays worker-local, is never in `Debug` output, and is never serialized or logged.
+  - Owner exception 2026-10-09 (ADR 0007): the prepared Codex access token/account ID may cross private stdio to an audited, isolated, short-lived native app-server using ephemeral external auth. No refresh token, token exchange, or credential-file write. Read-only account/cloud discovery and a temporary account-ID cache are allowed only in its removable scratch profile; manual live CODEX-02 measurements are authorized. Other secret/logging restrictions remain binding.
 - Every displayed snapshot belongs to an opaque account identity that matches the current credential identity.
 - No telemetry, analytics, cloud sync, prompt collection, response-body logging, or automatic crash upload.
 - Every network destination, file, registry key, child process, and system mutation is documented in `PRIVACY.md` with its trigger and user control. `ci/check-privacy.ps1` enforces the network allowlist.
@@ -152,7 +153,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | `v0.8` | Trustworthy state and system safety | **Shipped in 0.9.1** |
 | `v0.9` | Authenticated, crash-safe updates | **Shipped in 0.9.1** |
 | R0 | Ship the trust-root release | **Shipped 0.9.1 on 2026-10-09**; signed manifests/provenance verified, Windows signing deferred to v1.0 (ADR 0006) |
-| `v0.10` | State core, diagnostics, Codex documented source | **In progress** (model/state/cache/errors/diagnostics committed on `main`; CODEX-01 blocked on the app-server credential contract) |
+| `v0.10` | State core, diagnostics, Codex documented source | **Local implementation complete**; CODEX-01/02 isolated source and measurement gate on `feat/codex-isolated-app-server`; app-server remains opt-in (2.198 s p95) |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
 | `v0.12` | Glanceable status, tray, and alerts | Not started |
 | `v1.0` | Signed distribution | Not started |
@@ -181,7 +182,7 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 4. **MODEL-01 done** → **STATE-01 done** → **APP-01 done** → **CACHE-01 done** (§8.1).
 5. **ERR-01 done** — actionable error states (§8.2).
 6. **DIAG-01 done** → **DIAG-02 done** (§8.3).
-7. **CODEX-01 blocked** → **CODEX-02** (§8.4): installed Codex 0.159.1 can proactively refresh and persist managed credentials during a limits read. `refreshToken: false` does not disable this path. Isolated external-token probes on 0.159.1 and 0.160.0 avoid token files but expose account discovery and business cloud configuration/raw-ID persistence; private-stdio secret sharing also needs an explicit §1.2 exception. Resolve these contracts before implementing or measuring live app-server polling; see `docs/verification/codex-01-preflight.md` and `ci/probe-codex-contract.py`.
+7. **CODEX-01 done** → **CODEX-02 done** (§8.4): owner-approved ADR 0007, isolated ephemeral external auth, audited native x64 hashes, bounded private stdio, account/source-bound cache, kill-on-close job and checked cleanup. Final ten-sample live p95 2.198 s exceeds 2 s, so Settings opt-in remains off by default. Other CLI versions/ARM64 use Compatibility; no same-cycle second request. See `docs/verification/codex-01.md` and `docs/performance/codex-02.md`.
 8. **PACE-01** → **ROW-01** → **FRESH-01** (§10.1). If the v0.10 tail is blocked, PACE-01 and ROW-01 may start once MODEL-01 is done, and FRESH-01 once APP-01 is done.
 9. **A11Y-02**, **LAYOUT-01**, **LAYOUT-02**, **RENDER-01** (§9).
 10. **ONBOARD-01**, **ONBOARD-02**, **KEY-01**, **UI-TEST-01** (§9).
@@ -532,7 +533,8 @@ Everything in `v0.8` and `v0.9` shipped in the immutable 0.9.1 release, publishe
 
 ### 8.4 Codex documented source
 
-- [ ] **CODEX-01 — Codex app-server adapter.**
+- [x] **CODEX-01 — Codex app-server adapter.**
+  - Completed locally 2026-10-09 under owner-approved ADR 0007: ephemeral external auth in isolated scratch/environment; local plan hint `unknown` suppresses cloud policy, authoritative plan from quota response; exact audited 0.159.1/0.160.0 x64 images only. UI-account/source ticket/cache binding, Settings/UIA toggle, dynamic model and Spend limits, reset-credit count display only, bounded frames/deadline, pre-creation kill-on-close job, `taskkill /T` and checked cleanup. Fake success/malformed/missing/refresh/timeout/hung-descendant tests, local real-CLI synthetic isolation, live read-only measurements, and demo/UIA checks pass. Rollback: select Compatibility/revert; additive settings/cache fields remain schema 1. Evidence: `docs/verification/codex-01.md`.
   - Preflight 2026-10-09: the installed 0.159.1 source calls `auth_with_http_client_factory()` → `auth()` → proactive refresh → token persistence during `account/rateLimits/read`. This conflicts with §1.2 and the binding credential gotcha; the managed adapter remains unimplemented. The documented experimental external-token mode requires a separate design decision and isolation proof before use. CODEX-02 cannot measure/promote an unsafe adapter. Evidence and unblock conditions: `docs/verification/codex-01-preflight.md`.
   - Follow-up 2026-10-09: synthetic external-token probes on both installed versions produce successful normalized limits without access-token persistence. Waiting for login completion also observes `wham/accounts/check` for personal/business profiles and `wham/config/bundle` plus raw account-ID cache for business. A 401 becomes generic JSON-RPC `-32603`, without a refresh request in this tested path. The manual local-only probe and synthetic static model catalog are committed as investigation evidence, not an eligible runtime adapter. CODEX-01/02 remain unchecked.
   - Prefer the documented `codex app-server` JSON-RPC `account/rateLimits/read`. Request account state without forcing a token refresh.
@@ -543,9 +545,10 @@ Everything in `v0.8` and `v0.9` shipped in the immutable 0.9.1 release, publishe
   - Keep `wham/usage` as the separately labeled compatibility fallback.
   - Acceptance: fake app-server fixtures for success, missing fields, malformed JSON-RPC, timeout, hung descendant; no leaked process.
 
-- [ ] **CODEX-02 — Gate the default source on measured behavior.**
-  - App-server success makes no `chatgpt.com` request in that cycle.
+- [x] **CODEX-02 — Gate the default source on measured behavior.**
+  - App-server success makes no direct compatibility request in that cycle. The official app-server itself contacts the ChatGPT backend; owner-approved ADR 0007 permits its read-only discovery/usage calls.
   - It becomes the default only at ≤ 2 s p95 on the reference machine with no leaked child; otherwise it stays opt-in.
+  - Completed locally 2026-10-09: final ten fresh-profile live reads all succeed, median 1.7695 s / nearest-rank p95 2.198 s; credentials byte-for-byte unchanged, no child or scratch left. Default remains Compatibility; explicit app-server toggle is available. Earlier reader-thread series was 1.7155 s median / 2.730 s p95 and is retained as preliminary evidence. No real ARM64 latency or Narrator claim. See `docs/performance/codex-02.md`.
 
 ### `v0.10` acceptance
 

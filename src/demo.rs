@@ -262,6 +262,7 @@ pub fn settings_view(hover: i32, focus: i32) -> SettingsView {
         caps_control: CapsControl::Toggle(true),
         autostart: true,
         codex_on: true,
+        codex_server_on: false,
         alerts_on: true,
         update_checks_on: false,
         lid_label: "Advanced · ignore lid close".to_string(),
