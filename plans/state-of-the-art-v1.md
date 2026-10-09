@@ -155,7 +155,7 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | R0 | Ship the trust-root release | **Shipped 0.9.1 on 2026-10-09**; signed manifests/provenance verified, Windows signing deferred to v1.0 (ADR 0006) |
 | `v0.10` | State core, diagnostics, Codex documented source | **Local implementation complete**; CODEX-01/02 isolated source and measurement gate on `feat/codex-isolated-app-server`; app-server remains opt-in (2.198 s p95) |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
-| `v0.12` | Glanceable status, tray, and alerts | Not started |
+| `v0.12` | Glanceable status, tray, and alerts | **In progress**; PACE-01 stateless flyout pace implemented locally |
 | `v1.0` | Signed distribution | Not started |
 | `v1.1` | History-refined pacing | **Gated** on field evidence |
 | `v1.2` | One gated provider | Not started |
@@ -183,7 +183,7 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 5. **ERR-01 done** — actionable error states (§8.2).
 6. **DIAG-01 done** → **DIAG-02 done** (§8.3).
 7. **CODEX-01 done** → **CODEX-02 done** (§8.4): owner-approved ADR 0007, isolated ephemeral external auth, audited native x64 hashes, bounded private stdio, account/source-bound cache, kill-on-close job and checked cleanup. Final ten-sample live p95 2.198 s exceeds 2 s, so Settings opt-in remains off by default. Other CLI versions/ARM64 use Compatibility; no same-cycle second request. See `docs/verification/codex-01.md` and `docs/performance/codex-02.md`.
-8. **PACE-01** → **ROW-01** → **FRESH-01** (§10.1). If the v0.10 tail is blocked, PACE-01 and ROW-01 may start once MODEL-01 is done, and FRESH-01 once APP-01 is done.
+8. **PACE-01 done** → **ROW-01** → **FRESH-01** (§10.1). If the v0.10 tail is blocked, PACE-01 and ROW-01 may start once MODEL-01 is done, and FRESH-01 once APP-01 is done.
 9. **A11Y-02**, **LAYOUT-01**, **LAYOUT-02**, **RENDER-01** (§9).
 10. **ONBOARD-01**, **ONBOARD-02**, **KEY-01**, **UI-TEST-01** (§9).
 11. **TRAY-01**, **TRAY-02**, **TRAY-03**, **ALERT-03**, **ALERT-04**, **PRIV-03** (§10).
@@ -638,7 +638,9 @@ Everything in `v0.8` and `v0.9` shipped in the immutable 0.9.1 release, publishe
 
 ### 10.1 Glanceable rows
 
-- [ ] **PACE-01 — Stateless pace verdict.** Needs no history file.
+- [x] **PACE-01 — Stateless pace verdict.** Needs no history file.
+  - Completed locally 2026-10-09: pure provider-window projection and all verdict boundaries, flyout colors/notes/even-pace ticks, Settings Toggle with keyboard focus, and accessible verdicts. Existing used-% tray/alerts and provider snapshots stay unchanged. Notes share the label's single text span to recover size; run-out uses today's clock format, with countdown deferred to ROW-01 because `reset_format` does not exist yet. Settings persistence and reset formatting are consolidated without changing atomic writes or schema. 181 tests, required gates, demo safety, 22 existing UIA checks and 19 focused pace/theme checks pass. x64 1,071,616 unprovisioned / 1,163,776 provisioned; original artifact gates unchanged. Runtime evidence and rollback: `docs/verification/pace-01.md`, `docs/performance/pace-01.md`, ADR 0008, and artifact ledger. Narrator and real ARM64 runtime remain unverified.
+  - Final ten-minute controlled hidden/visible p95: 1.64/4.01 MiB private working set, 0.0000/0.0006% idle CPU, GDI 10/13, no TCP; five-start tray p95 97.351 ms. Both architectures/trust-root variants pass original artifact gates.
   - Pure function in `provider/pace.rs`: `fn pace(limit: &UsageLimit, now_unix: i64) -> Pace`.
   - Inputs: used `u` (0–100), reset `R`, window length `W` seconds, now `t`. Window start `S = R − W`; elapsed `e = t − S`.
   - **Projectable** only if: class is `Quota`; `R` and `W` are known; `R > t`; `S ≤ t`; `u > 0`; and `e ≥ max(0.05 × W, 900)` seconds.

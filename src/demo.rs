@@ -226,6 +226,7 @@ fn build_state(request: Request, now_unix: i64) -> State {
                         percent: 20.0 + (index * 4) as f64,
                         severity: None,
                         reset_text: "resets in 4d".to_string(),
+                        pace: crate::provider::pace::Pace::Level,
                     });
                 }
             }
@@ -263,6 +264,7 @@ pub fn settings_view(hover: i32, focus: i32) -> SettingsView {
         autostart: true,
         codex_on: true,
         codex_server_on: false,
+        pace_on: true,
         alerts_on: true,
         update_checks_on: false,
         lid_label: "Advanced · ignore lid close".to_string(),
@@ -292,26 +294,43 @@ fn provider_section(
     plan: &str,
     session: f64,
     weekly: f64,
-    _now_unix: i64,
+    now_unix: i64,
 ) -> Section {
     Section {
         title,
         plan: plan.to_string(),
         status: None,
-        body: SectionBody::Rows(vec![
-            LimitRow {
-                label: "Session (5h)".to_string(),
-                percent: session,
-                severity: None,
-                reset_text: "resets in 2h 15m".to_string(),
-            },
-            LimitRow {
-                label: "Weekly · all models".to_string(),
-                percent: weekly,
-                severity: None,
-                reset_text: "resets in 4d".to_string(),
-            },
-        ]),
+        body: SectionBody::Rows(
+            [
+                ("Session (5h)", session, 18000, 8100),
+                ("Weekly · all models", weekly, 604800, 238000),
+            ]
+            .into_iter()
+            .map(|(label, used, window, remaining)| {
+                let mut row = LimitRow {
+                    label: label.into(),
+                    percent: used,
+                    severity: None,
+                    reset_text: String::new(),
+                    pace: crate::provider::pace::Pace::Level,
+                };
+                row.apply_pace(crate::provider::pace::project(
+                    used,
+                    crate::provider::model::LimitClass::Quota,
+                    Some(now_unix + remaining),
+                    Some(window),
+                    now_unix,
+                ));
+                row.reset_text = if window == 18000 {
+                    "resets in 2h 15m"
+                } else {
+                    "resets in 4d"
+                }
+                .into();
+                row
+            })
+            .collect(),
+        ),
     }
 }
 

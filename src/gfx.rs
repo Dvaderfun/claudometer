@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
 use crate::provider::model::{ProviderSeverity, UsageLimit};
+use crate::provider::pace::{pace, Pace};
 
 #[derive(Clone)]
 pub struct LimitRow {
@@ -30,6 +31,7 @@ pub struct LimitRow {
     pub percent: f64,
     pub severity: Option<ProviderSeverity>,
     pub reset_text: String,
+    pub pace: Pace,
 }
 
 impl From<UsageLimit> for LimitRow {
@@ -42,6 +44,41 @@ impl From<UsageLimit> for LimitRow {
                 .resets_unix
                 .map(crate::api::fmt_reset_unix)
                 .unwrap_or_default(),
+            pace: Pace::Level,
+        }
+    }
+}
+
+impl LimitRow {
+    pub fn with_pace(row: UsageLimit, now_unix: i64, enabled: bool) -> Self {
+        let verdict = if enabled {
+            pace(&row, now_unix)
+        } else {
+            Pace::Level
+        };
+        let mut result = Self::from(row);
+        result.apply_pace(verdict);
+        result
+    }
+
+    pub fn apply_pace(&mut self, verdict: Pace) {
+        self.pace = verdict;
+        let note: std::borrow::Cow<'static, str> = match verdict {
+            Pace::LimitReached => "Limit reached".into(),
+            Pace::Over {
+                limit_at_unix: Some(at),
+                ..
+            } => crate::api::fmt_limit_unix(at).into(),
+            Pace::Over {
+                limit_at_unix: None,
+                ..
+            } => "At limit by reset".into(),
+            Pace::Tight { spare_percent, .. } => format!("~{spare_percent}% spare").into(),
+            _ => "".into(),
+        };
+        if !note.is_empty() {
+            self.label.push_str(" · ");
+            self.label.push_str(&note);
         }
     }
 }
@@ -105,6 +142,7 @@ pub struct SettingsView {
     pub autostart: bool,
     pub codex_on: bool,
     pub codex_server_on: bool,
+    pub pace_on: bool,
     pub alerts_on: bool,
     pub update_checks_on: bool,
     pub lid_label: String,
@@ -131,6 +169,7 @@ impl SettingsView {
             CARD_ALERTS => Some(self.alerts_on),
             CARD_UPDATE_CHECKS => Some(self.update_checks_on),
             CARD_CODEX_SERVER => Some(self.codex_server_on),
+            CARD_PACE => Some(self.pace_on),
             _ => None,
         }
     }
@@ -251,18 +290,19 @@ pub fn accessible_rows(view: &View) -> Vec<(D2D_RECT_F, String)> {
                     if index > 0 {
                         y += ROW_GAP;
                     }
-                    let reset = if limit.reset_text.is_empty() {
-                        String::new()
-                    } else {
-                        format!(", {}", limit.reset_text)
-                    };
-                    rows.push((
-                        rect(PAD, y, FLYOUT_W - PAD, y + ROW_BLOCK),
-                        format!(
-                            "{}, {}, {:.0}% used{}",
-                            section.title, limit.label, limit.percent, reset
-                        ),
-                    ));
+                    let mut name = format!(
+                        "{}, {}, {:.0}% used",
+                        section.title, limit.label, limit.percent
+                    );
+                    if !limit.reset_text.is_empty() {
+                        name.push_str(", ");
+                        name.push_str(&limit.reset_text);
+                    }
+                    if !matches!(limit.pace, Pace::Level) {
+                        name.push_str(", ");
+                        name.push_str(limit.pace.name());
+                    }
+                    rows.push((rect(PAD, y, FLYOUT_W - PAD, y + ROW_BLOCK), name));
                     y += ROW_BLOCK;
                 }
             }
@@ -299,7 +339,7 @@ pub const SET_W: f32 = 400.0;
 const SET_PAD: f32 = 24.0;
 const CARD_H: f32 = 56.0;
 const CARD_GAP: f32 = 4.0;
-pub const N_CARDS: usize = 13;
+pub const N_CARDS: usize = 14;
 pub const CARD_ACCOUNT: usize = 0;
 pub const CARD_CAPS: usize = 1;
 pub const CARD_AUTOSTART: usize = 2;
@@ -315,6 +355,7 @@ pub const CARD_ABOUT: usize = 9;
 pub const CARD_QUIT: usize = 10;
 pub const CARD_DIAGNOSTICS: usize = 11;
 pub const CARD_CODEX_SERVER: usize = 12;
+pub const CARD_PACE: usize = 13;
 const DIAGNOSTICS_H: f32 = 720.0;
 
 pub fn settings_height() -> f32 {
@@ -835,11 +876,21 @@ impl Surface {
                         if i > 0 {
                             y += ROW_GAP;
                         }
-                        let fill = self.sev_brush(&row.severity, row.percent);
-
+                        let fill = self.sev_brush(
+                            &row.pace.severity(row.severity),
+                            if matches!(row.pace, Pace::Level) {
+                                row.percent
+                            } else {
+                                0.0
+                            },
+                        );
                         self.text(
                             &row.label,
-                            &self.fmt_body_1,
+                            if matches!(row.pace, Pace::Level | Pace::OnTrack) {
+                                &self.fmt_body_1
+                            } else {
+                                &self.fmt_caption_1
+                            },
                             rect(PAD, y, w - PAD - 56.0, y + LABEL_H),
                             &b.text,
                             false,
@@ -868,6 +919,14 @@ impl Surface {
                                 BAR_H / 2.0,
                                 fill,
                             )?;
+                        }
+
+                        if let Some(even) = row.pace.even_fraction() {
+                            let x = PAD + bar_w * even;
+                            self.fill(
+                                rect(x - 0.5, bar_y - 2.0, x + 0.5, bar_y + BAR_H + 2.0),
+                                &b.text,
+                            );
                         }
 
                         if !row.reset_text.is_empty() {
@@ -1047,13 +1106,14 @@ impl Surface {
                 "Quit Claudometer",
                 "Diagnostics",
                 "Codex app-server",
+                "Color bars by current pace",
             ];
             // Segoe Fluent Icons: account, keyboard, power, command prompt,
             // bell (EA8F Ringer — E7ED is the muted bell), download, clock,
             // refresh, info, cancel
             let icons = [
                 "\u{E77B}", "\u{E765}", "\u{E7E8}", "\u{E756}", "\u{EA8F}", "\u{E895}", "\u{E7BA}",
-                "\u{E823}", "\u{E72C}", "\u{E946}", "\u{E711}", "\u{E9D9}", "\u{E756}",
+                "\u{E823}", "\u{E72C}", "\u{E946}", "\u{E711}", "\u{E9D9}", "\u{E756}", "\u{E9D9}",
             ];
             let cards = settings_rects(scroll);
             for (i, card) in cards.iter().enumerate() {
@@ -1563,6 +1623,77 @@ fn relative_time(unix: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pace_presentation_changes_only_flyout_and_toggle_restores_level() {
+        let limit = crate::provider::model::UsageLimit::from_adapter(
+            "session".into(),
+            crate::provider::model::LimitKind::Session,
+            "Session".into(),
+            60.0,
+            None,
+            Some(18000),
+            Some(18000),
+        )
+        .unwrap();
+        let original = limit.clone();
+        let level = LimitRow::with_pace(limit.clone(), 9000, false);
+        assert_eq!(level.pace, Pace::Level);
+        assert_eq!(level.label, "Session");
+        assert_eq!(level.pace.severity(level.severity), None);
+        let projected = LimitRow::with_pace(limit.clone(), 9000, true);
+        let projected_label = projected.label.clone();
+        assert!(matches!(projected.pace, Pace::Over { .. }));
+        assert!(projected.label.contains(" · Limit "));
+        assert_eq!(
+            projected.pace.severity(projected.severity),
+            Some(ProviderSeverity::Critical)
+        );
+        assert_eq!(projected.pace.even_fraction(), Some(0.5));
+        let view = View::Data(FlyoutData {
+            sections: vec![Section {
+                title: "Claude",
+                plan: String::new(),
+                status: None,
+                body: SectionBody::Rows(vec![projected]),
+            }],
+            fetched_unix: Some(9000),
+            note: None,
+        });
+        let name = &accessible_rows(&view)[0].1;
+        assert!(name.starts_with(&format!("Claude, {projected_label}, 60% used")));
+        assert!(name.contains("Over at current pace"));
+        assert_eq!(limit.percent, original.percent);
+        assert_eq!(limit.severity, original.severity);
+        assert_eq!(
+            util::severity_rgb(&limit.severity, limit.percent.get(), (1, 2, 3)),
+            (1, 2, 3)
+        );
+        assert_eq!(
+            Pace::OnTrack.severity(Some(ProviderSeverity::Critical)),
+            Some(ProviderSeverity::Normal)
+        );
+    }
+    #[test]
+    fn unprojected_row_preserves_adapter_severity_value_and_missing_reset() {
+        let limit = crate::provider::model::UsageLimit::from_adapter(
+            "session".into(),
+            crate::provider::model::LimitKind::Session,
+            "Session".into(),
+            64.0,
+            Some(crate::provider::model::ProviderSeverity::Warning),
+            None,
+            Some(18000),
+        )
+        .unwrap();
+        let row = super::LimitRow::from(limit);
+        assert_eq!(row.label, "Session");
+        assert_eq!(row.percent, 64.0);
+        assert_eq!(
+            row.severity,
+            Some(crate::provider::model::ProviderSeverity::Warning)
+        );
+        assert!(row.reset_text.is_empty());
+    }
     use super::*;
 
     fn settings_view(update_checks_on: bool) -> SettingsView {
@@ -1577,6 +1708,7 @@ mod tests {
             autostart: false,
             codex_on: false,
             codex_server_on: false,
+            pace_on: true,
             alerts_on: false,
             update_checks_on,
             lid_label: String::new(),
@@ -1615,7 +1747,7 @@ mod tests {
             DIAGNOSTICS_H
         );
         assert!(cards[CARD_DIAGNOSTICS].top > cards[CARD_QUIT].bottom);
-        assert_eq!(settings_height(), cards[CARD_CODEX_SERVER].bottom + SET_PAD);
+        assert_eq!(settings_height(), cards[CARD_PACE].bottom + SET_PAD);
         assert_eq!(
             settings_rects(100.0)[CARD_DIAGNOSTICS].top,
             cards[CARD_DIAGNOSTICS].top - 100.0
@@ -1636,6 +1768,7 @@ mod tests {
                     percent: 50.0,
                     severity: None,
                     reset_text: String::new(),
+                    pace: Pace::Level,
                 }]),
             }],
         };

@@ -18,6 +18,10 @@ deduplication receipts, and bounded normalized usage snapshots locally.
 Snapshots include selected source, optional plan, observation time, and a
 provider retry deadline. It never stores provider access tokens in its files.
 
+Flyout pace projections use the existing quota percentage, reset, window length,
+and local clock in memory. The pace-color preference is stored in settings;
+pace adds no history file, endpoint, or polling request.
+
 Windows, the selected provider, GitHub, the default browser, or the Claude Code
 CLI may independently keep their own network, notification, process, or crash
 records. Those records are governed by those components rather than by
@@ -135,7 +139,7 @@ delete-data command or remove all application data on exit.
 
 | Path | Reads and writes | Retention and deletion behavior |
 | --- | --- | --- |
-| `%APPDATA%\Claudometer\settings.json` | Reads preferences and legacy migration data. Writes the refresh interval; Codex, alert, automatic update-check, wake-lock, and lid-override settings; and legacy alert receipts. Unknown JSON fields are preserved. | Retained until manually deleted. A new installation may have no settings file until a setting or legacy receipt is first saved. |
+| `%APPDATA%\Claudometer\settings.json` | Reads preferences and legacy migration data. Writes the refresh interval; Codex, pace-color, alert, automatic update-check, wake-lock, and lid-override settings; and legacy alert receipts. Unknown JSON fields are preserved. | Retained until manually deleted. A new installation may have no settings file until a setting or legacy receipt is first saved. |
 | `%APPDATA%\Claudometer\state.json` | Created on first normal startup. Stores a random 32-byte installation salt, salted SHA-256 account digests, alert receipts/migration markers, and a versioned `provider_cache`: at most two providers with selected source, optional plan, observation time, up to 64 normalized quota rows each (stable ID/kind/class, label, percentage, severity, reset/duration), and the accepted 429 retry deadline. Cache writes follow accepted fetches; authentication/preparation invalidation clears the provider's cache. It stores no access token, raw provider account ID, or response body. | Retained until manually deleted. Snapshots older than eight days, future observations, and reset-expired limit values are ignored on restore. Provider/source/account identity must match a locally prepared credential identity; token-fingerprint accounts never persist. Cached values are never fresh and do not trigger alerts. A valid future retry deadline blocks requests after restart. Deleting primary and backup resets cache/salt/receipts; a surviving verified backup may be recovered. |
 | `settings.json.bak`, `state.json.bak` | Verified previous versions maintained by the atomic JSON writer. | At most one normal backup per primary file; replaced by later successful writes. Retained until manually deleted. |
 | `%APPDATA%\Claudometer\diagnostics.log`, `.log.1`, `.log.2` | Normal startup and operational failures/successes append a UTC timestamp and a fixed sanitized event code. Rendering/configuration/registry/update/provider/clipboard failures are visible locally. Unknown strings are replaced by `[redacted]`; credentials, identifiers, response bodies and personal paths are never accepted as log fields. | At most three files of 256 KiB each, oldest replaced on rotation; repeated identical failure codes are suppressed. Safe to delete; deletion loses support history only. Log write failure is reported in Diagnostics. Demo and support commands do not create or append logs. |

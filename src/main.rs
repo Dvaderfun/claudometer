@@ -1022,6 +1022,11 @@ unsafe fn activate_settings_card(hwnd: HWND, i: usize) {
             let enabled = !config::settings().alerts_enabled;
             let _ = config::set_alerts_enabled(enabled);
         }
+        gfx::CARD_PACE => {
+            if config::set_pace_colors_enabled(!config::settings().pace_colors_enabled).is_ok() {
+                render_flyout_current();
+            }
+        }
         gfx::CARD_CODEX_SERVER => {
             if config::set_codex_app_server_enabled(!config::settings().codex_app_server_enabled)
                 .is_ok()
@@ -1418,6 +1423,8 @@ fn manual_refresh_label() -> String {
 }
 
 fn section(title: &'static str, s: UsageSnapshot) -> gfx::Section {
+    let now = SystemClock.read().unix_seconds;
+    let pace_enabled = config::settings().pace_colors_enabled;
     gfx::Section {
         title,
         plan: s.plan.unwrap_or_default(),
@@ -1430,7 +1437,12 @@ fn section(title: &'static str, s: UsageSnapshot) -> gfx::Section {
             s.reset_credits_available
                 .map(|count| format!("Reset credits available: {count}"))
         }),
-        body: gfx::SectionBody::Rows(s.rows.into_iter().map(gfx::LimitRow::from).collect()),
+        body: gfx::SectionBody::Rows(
+            s.rows
+                .into_iter()
+                .map(|row| gfx::LimitRow::with_pace(row, now, pace_enabled))
+                .collect(),
+        ),
     }
 }
 
@@ -1980,6 +1992,7 @@ unsafe fn render_settings(hwnd: HWND) {
                 gfx::CapsControl::Retry,
             ),
         };
+        let settings = config::settings();
         let st = gfx::SettingsView {
             diagnostics: diagnostics::text(),
             diagnostics_copy: ui.diagnostics_copy,
@@ -1989,10 +2002,11 @@ unsafe fn render_settings(hwnd: HWND) {
             caps_caption,
             caps_control,
             autostart: util::autostart_enabled(),
-            codex_on: config::settings().codex_enabled,
-            codex_server_on: config::settings().codex_app_server_enabled,
-            alerts_on: config::settings().alerts_enabled,
-            update_checks_on: config::settings().update_checks_enabled,
+            codex_on: settings.codex_enabled,
+            codex_server_on: settings.codex_app_server_enabled,
+            pace_on: settings.pace_colors_enabled,
+            alerts_on: settings.alerts_enabled,
+            update_checks_on: settings.update_checks_enabled,
             lid_label: lid_label.to_string(),
             lid_caption: lid_caption.to_string(),
             lid_on: vibecode::persistent_status() == vibecode::PersistentStatus::Applied,

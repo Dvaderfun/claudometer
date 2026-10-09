@@ -678,30 +678,42 @@ pub(crate) fn read_bounded(reader: impl Read) -> Result<Vec<u8>, FetchErr> {
 
 /// Same formatting for unix-seconds reset stamps (Codex API shape).
 pub(crate) fn fmt_reset_unix(unix: i64) -> String {
+    fmt_event_unix(unix, "resets")
+}
+
+pub(crate) fn fmt_limit_unix(unix: i64) -> String {
+    fmt_event_unix(unix, "Limit")
+}
+
+fn fmt_event_unix(unix: i64, verb: &str) -> String {
     let Ok(dt) = OffsetDateTime::from_unix_timestamp(unix) else {
         return String::new();
     };
-    fmt_reset_dt(dt)
+    fmt_event_dt(dt, verb)
 }
 
-/// "resets 18:59" if today (local), otherwise "resets Sat 19:59"
-fn fmt_reset_dt(dt: OffsetDateTime) -> String {
+/// Local clock today, otherwise weekday and clock.
+fn fmt_event_dt(dt: OffsetDateTime, verb: &str) -> String {
     let Some(local) = windows_local_time(dt, None) else {
         return String::new();
     };
-    let today = windows_local_time(OffsetDateTime::now_utc(), None);
-    if today.is_some_and(|today| {
-        (local.wYear, local.wMonth, local.wDay) == (today.wYear, today.wMonth, today.wDay)
-    }) {
-        format!("resets {:02}:{:02}", local.wHour, local.wMinute)
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocalTime(time: *mut SYSTEMTIME);
+    }
+    let mut today = SYSTEMTIME::default();
+    unsafe { GetLocalTime(&mut today) };
+    let day = if (local.wYear, local.wMonth, local.wDay) == (today.wYear, today.wMonth, today.wDay)
+    {
+        ""
     } else {
-        const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-        let weekday = WEEKDAYS
+        const WEEKDAYS: [&str; 7] = ["Sun ", "Mon ", "Tue ", "Wed ", "Thu ", "Fri ", "Sat "];
+        WEEKDAYS
             .get(usize::from(local.wDayOfWeek))
             .copied()
-            .unwrap_or("");
-        format!("resets {} {:02}:{:02}", weekday, local.wHour, local.wMinute)
-    }
+            .unwrap_or("")
+    };
+    format!("{verb} {day}{:02}:{:02}", local.wHour, local.wMinute)
 }
 
 fn windows_local_time(

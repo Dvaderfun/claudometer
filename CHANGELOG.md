@@ -5,6 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions: [Sem
 ## [Unreleased]
 
 ### Added
+- Stateless quota pace in the flyout: projected bar severity, spare/run-out
+  notes, even-pace ticks, and accessible verdicts. The persisted **Color bars by
+  current pace** switch defaults on; turning it off restores used-percentage
+  colors. Tray and alert thresholds retain their existing behavior. No history
+  file or additional polling is introduced.
 - Optional documented Codex app-server source with isolated ephemeral external
   auth, audited native x64 executables, bounded private stdio, account/source
   matching, and process-tree/scratch cleanup. It never receives a refresh token

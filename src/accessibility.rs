@@ -294,6 +294,17 @@ fn settings_items(hwnd: HWND) -> Vec<Item> {
     );
     source.help = "Prefer the documented source when the installed CLI is audited. Turn off to use Compatibility.".into();
     result.push(source);
+    let pace = item(
+        "PaceColors",
+        "Color bars by current pace",
+        rects[gfx::CARD_PACE],
+        Role::Toggle(
+            synthetic
+                .as_ref()
+                .map_or(settings.pace_colors_enabled, |view| view.pace_on),
+        ),
+    );
+    result.push(pace);
     result
 }
 

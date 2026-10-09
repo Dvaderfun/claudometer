@@ -38,6 +38,7 @@ Claudometer.Main (hidden WS_POPUP)          ← owns tray, timers, broadcasts
 | `provider/model.rs` | provider/account/source/limit/request identities, normalized snapshots, typed kind/class/severity/Percent/window duration, and completion envelope |
 | `runtime_state.rs` | atomic optional `state.json` envelope, CNG install salt, account-scoped receipts, bounded normalized provider cache and retry deadlines |
 | `provider/state.rs` | pure provider reducer, identity-checked fetch tickets, derived freshness/views, and injected-clock debounce/429 policy |
+| `provider/pace.rs` | pure stateless window projection for flyout colors, notes, even-pace ticks, and UIA; never used by tray or alerts |
 | `provider/error.rs` | stable failure categories/codes, generated recovery copy, HTTP/IO mapping, and numeric/date Retry-After parsing |
 | `store.rs` | typed atomic JSON commit, verified `.bak` generation, corruption preservation, and failure injection |
 | `demo.rs` | deterministic provider/view scenarios and guarded no-side-effect launch mode |
