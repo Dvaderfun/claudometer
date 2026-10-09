@@ -181,7 +181,7 @@ Work strictly top to bottom, skipping only tasks whose dependencies are not done
 4. **MODEL-01 done** → **STATE-01 done** → **APP-01 done** → **CACHE-01 done** (§8.1).
 5. **ERR-01 done** — actionable error states (§8.2).
 6. **DIAG-01 done** → **DIAG-02 done** (§8.3).
-7. **CODEX-01 blocked** → **CODEX-02** (§8.4): installed Codex 0.159.1 can proactively refresh and persist managed credentials during a limits read. `refreshToken: false` does not disable this path. Resolve the credential contract before implementing or measuring live app-server polling; see `docs/verification/codex-01-preflight.md`.
+7. **CODEX-01 blocked** → **CODEX-02** (§8.4): installed Codex 0.159.1 can proactively refresh and persist managed credentials during a limits read. `refreshToken: false` does not disable this path. Isolated external-token probes on 0.159.1 and 0.160.0 avoid token files but expose account discovery and business cloud configuration/raw-ID persistence; private-stdio secret sharing also needs an explicit §1.2 exception. Resolve these contracts before implementing or measuring live app-server polling; see `docs/verification/codex-01-preflight.md` and `ci/probe-codex-contract.py`.
 8. **PACE-01** → **ROW-01** → **FRESH-01** (§10.1). If the v0.10 tail is blocked, PACE-01 and ROW-01 may start once MODEL-01 is done, and FRESH-01 once APP-01 is done.
 9. **A11Y-02**, **LAYOUT-01**, **LAYOUT-02**, **RENDER-01** (§9).
 10. **ONBOARD-01**, **ONBOARD-02**, **KEY-01**, **UI-TEST-01** (§9).
@@ -534,6 +534,7 @@ Everything in `v0.8` and `v0.9` shipped in the immutable 0.9.1 release, publishe
 
 - [ ] **CODEX-01 — Codex app-server adapter.**
   - Preflight 2026-10-09: the installed 0.159.1 source calls `auth_with_http_client_factory()` → `auth()` → proactive refresh → token persistence during `account/rateLimits/read`. This conflicts with §1.2 and the binding credential gotcha; the managed adapter remains unimplemented. The documented experimental external-token mode requires a separate design decision and isolation proof before use. CODEX-02 cannot measure/promote an unsafe adapter. Evidence and unblock conditions: `docs/verification/codex-01-preflight.md`.
+  - Follow-up 2026-10-09: synthetic external-token probes on both installed versions produce successful normalized limits without access-token persistence. Waiting for login completion also observes `wham/accounts/check` for personal/business profiles and `wham/config/bundle` plus raw account-ID cache for business. A 401 becomes generic JSON-RPC `-32603`, without a refresh request in this tested path. The manual local-only probe and synthetic static model catalog are committed as investigation evidence, not an eligible runtime adapter. CODEX-01/02 remain unchecked.
   - Prefer the documented `codex app-server` JSON-RPC `account/rateLimits/read`. Request account state without forcing a token refresh.
   - Parse dynamic `rateLimitsByLimitId`, plan, reset metadata, spend-control state, and reset-credit availability (display only; never consume credits).
   - Model-specific limits (for example the `additional_rate_limits` entries in the compatibility payload) become `LimitKind::Model` rows using duration-based classification; omit them when absent.
