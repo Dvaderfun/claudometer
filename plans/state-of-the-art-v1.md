@@ -153,14 +153,14 @@ Claude only · Codex only · both · neither installed or signed in · portable 
 | `v0.8` | Trustworthy state and system safety | **Shipped in 0.9.1** |
 | `v0.9` | Authenticated, crash-safe updates | **Shipped in 0.9.1** |
 | R0 | Ship the trust-root release | **Shipped 0.9.1 on 2026-10-09**; signed manifests/provenance verified, Windows signing deferred to v1.0 (ADR 0006) |
-| `v0.10` | State core, diagnostics, Codex documented source | **Implementation complete; preparing 0.10.0**; CODEX-01/02 isolated source and measurement gate; app-server remains opt-in (2.198 s p95) |
+| `v0.10` | State core, diagnostics, Codex documented source | **Shipped in 0.10.0 on 2026-10-10**; CODEX-01/02 isolated source and measurement gate; app-server remains opt-in (2.198 s p95) |
 | `v0.11` | Accessible, adaptive first run | **In progress** (UIA committed; Narrator deferred by owner) |
-| `v0.12` | Glanceable status, tray, and alerts | **In progress**; PACE-01, ROW-01, FRESH-01 and UI-CLARITY-01 complete; preparing 0.10.0 |
+| `v0.12` | Glanceable status, tray, and alerts | **In progress**; PACE-01, ROW-01, FRESH-01 and UI-CLARITY-01 complete and shipped in 0.10.0 |
 | `v1.0` | Signed distribution | Not started |
 | `v1.1` | History-refined pacing | **Gated** on field evidence |
 | `v1.2` | One gated provider | Not started |
 
-`Cargo.toml` says `0.10.0`; release preparation is in progress under owner ADR 0010. R0 is published with all work since `5b735ce`, including the completed state/cache/error/diagnostic slices. v0.9.0 remains an immutable failed/unreleased tag.
+`Cargo.toml` says `0.10.0`, published immutable on 2026-10-10 under owner ADR 0010. All completed slices are on `main`; local/remote working branches were consolidated. Release evidence: `docs/verification/release-0.10.0.md`. R0 is published with all work since `5b735ce`, including the completed state/cache/error/diagnostic slices. v0.9.0 remains an immutable failed/unreleased tag.
 
 ### 2.2 Facts an executor needs now
 
