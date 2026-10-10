@@ -469,3 +469,13 @@ privacy/dependency/workflow policy and local exact-version/PE/hash checks pass.
 Release notes render from these local artifacts for preflight only; the release
 workflow renders publication notes from its exact tested GitHub artifacts.
 No dependency/profile/budget changes; no new runtime-baseline claim.
+
+
+## Published 0.10.0 (2026-10-10)
+
+GitHub windows-2025 exact artifacts: x64 1,160,704 bytes, ARM64 1,015,808.
+Relative to published 0.9.1 (1,145,344 / 1,029,120): +1.34% / -1.30%.
+Sequence 3, same production root. CI artifacts differ from local builds by
+-2,560 bytes on each architecture; publication notes use actual GitHub bytes.
+Downloaded manifests/checksums/signatures, provenance/SBOM attestations and
+x64 demo safety verified. Original gates unchanged. Release run 38007877887.

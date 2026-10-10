@@ -63,6 +63,13 @@ SIZE-01 selects release `opt-level = "z"`: current x64 **947,712 bytes unprovisi
 
 ## Release process
 
+0.10.0 is published immutable (2026-10-10), source `38919c6`, sequence 3,
+under owner ADR 0010. Published x64/ARM64 are 1,160,704 / 1,015,808 bytes.
+Both signed manifests, provenance/SBOM attestations and downloaded x64 demo
+safety pass. Completed work is on main; integrated branches are removed.
+Evidence: `docs/verification/release-0.10.0.md`. Windows signing/Narrator/real
+ARM64/physical lid-close limits remain; no general future release permission.
+
 R0 0.9.1 removes Ed25519's optional `fast` tables after production-key ARM64
 failed the original 10% size gate. Final local provisioned sizes are x64
 1,145,344 bytes and ARM64 1,029,120 bytes; all signature/recovery tests pass.
